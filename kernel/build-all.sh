@@ -1,33 +1,138 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-if [ -z "$1" ]; then
-    KMIS="android12-5.10 android13-5.10 android13-5.15 android14-5.15 android14-6.1 android15-6.6 android16-6.12"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+DEFAULT_KMIS=(
+    android12-5.10
+    android13-5.10
+    android13-5.15
+    android14-5.15
+    android14-6.1
+    android15-6.6
+    android16-6.12
+)
+
+if (( $# > 0 )); then
+    KMIS=("$@")
 else
-    KMIS=$1
+    KMIS=("${DEFAULT_KMIS[@]}")
 fi
 
-# Some patch is required to use separate build dir when building for android16-6.12, see:
-# https://github.com/5ec1cff/ddk#local-%E6%A8%A1%E5%BC%8F%E6%9E%84%E5%BB%BA%E9%80%82%E7%94%A8%E4%BA%8E%E5%A4%9A%E4%B8%AA-target-%E7%89%88%E6%9C%AC%E7%9A%84%E5%86%85%E6%A0%B8%E6%A8%A1%E5%9D%97
+: "${KSU_EXPECTED_SIZE:?Please export KSU_EXPECTED_SIZE}"
+: "${KSU_EXPECTED_HASH:?Please export KSU_EXPECTED_HASH}"
 
-mv .ddk-version .ddk-version.bak 2> /dev/null || true
+DDK_BIN="${DDK_BIN:-ddk}"
+DDK_ROOT="${DDK_ROOT:-/opt/ddk}"
+OUTPUT_DIR="$SCRIPT_DIR/out"
+DIST_DIR="$SCRIPT_DIR/dist"
 
-for kmi in $KMIS; do
+command -v "$DDK_BIN" >/dev/null 2>&1 || {
+    echo "Error: ddk command not found" >&2
+    exit 127
+}
+
+command -v llvm-strip >/dev/null 2>&1 || {
+    echo "Error: llvm-strip command not found" >&2
+    exit 127
+}
+
+mkdir -p "$OUTPUT_DIR" "$DIST_DIR"
+
+success=()
+failed=()
+
+for kmi in "${KMIS[@]}"; do
     echo "========== Building $kmi =========="
-    ODIR="$(realpath .)/out/$kmi"
-    if ddk build "$kmi" "ODIR=$ODIR" -e CONFIG_KSU=m; then
-        if [ -f "$ODIR/kernelsu.ko" ]; then
-            cp "$ODIR/kernelsu.ko" "kernelsu-${kmi}.ko"
-            llvm-strip -d "kernelsu-${kmi}.ko"
-            echo "✓ Built kernelsu-${kmi}.ko"
+
+    # Android 16 / 6.12 Kbuild resolves C prerequisites from $(obj), so its
+    # external module source and output directories cannot be separated using
+    # the src= workaround used by older kernels.
+    if [[ "$kmi" == "android16-6.12" ]]; then
+        kmi_output="$SCRIPT_DIR"
+
+        kdir_config="$DDK_ROOT/kdir/$kmi/.config"
+        expected_pahole_version=""
+        if [[ -f "$kdir_config" ]]; then
+            expected_pahole_version="$({
+                sed -n 's/^CONFIG_PAHOLE_VERSION=//p' "$kdir_config" || true
+            } | head -n 1)"
+        fi
+
+        if [[ -n "$expected_pahole_version" ]]; then
+            if ! command -v pahole >/dev/null 2>&1; then
+                echo "Error: pahole is required for $kmi (expected version $expected_pahole_version)" >&2
+                failed+=("$kmi")
+                echo
+                continue
+            fi
+
+            if ! actual_pahole_version="$(pahole --numeric_version 2>/dev/null)" ||
+                [[ ! "$actual_pahole_version" =~ ^[0-9]+$ ]]; then
+                echo "Error: unable to determine pahole version" >&2
+                failed+=("$kmi")
+                echo
+                continue
+            fi
+
+            if (( actual_pahole_version < expected_pahole_version )); then
+                echo "Error: $kmi KDIR expects pahole $expected_pahole_version, but Host has $actual_pahole_version" >&2
+                failed+=("$kmi")
+                echo
+                continue
+            fi
+
+            echo "Using pahole $actual_pahole_version (KDIR expects $expected_pahole_version)"
         fi
     else
-        echo "✗ Build failed for $kmi"
+        kmi_output="$OUTPUT_DIR/$kmi"
     fi
-    echo ""
+
+    final_module="$DIST_DIR/${kmi}_kernelsu.ko"
+
+    make_args=(
+        "ODIR=$kmi_output"
+        "CONFIG_KSU=m"
+        "KSU_EXPECTED_SIZE=$KSU_EXPECTED_SIZE"
+        "KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
+    )
+
+    if [[ -n "${KSU_MANAGER_PACKAGE:-}" ]]; then
+        make_args+=("KSU_MANAGER_PACKAGE=$KSU_MANAGER_PACKAGE")
+    fi
+
+    if "$DDK_BIN" build --target "$kmi" -- "${make_args[@]}"; then
+        built_module="$kmi_output/kernelsu.ko"
+
+        if [[ ! -f "$built_module" ]]; then
+            echo "Error: expected output not found: $built_module" >&2
+            failed+=("$kmi")
+            continue
+        fi
+
+        cp -f "$built_module" "$final_module"
+        llvm-strip -d "$final_module"
+
+        echo "Built: $final_module"
+        success+=("$kmi")
+    else
+        echo "Build failed: $kmi" >&2
+        failed+=("$kmi")
+    fi
+
+    echo
 done
 
-mv .ddk-version.bak .ddk-version 2> /dev/null || true
+echo "========== Build summary =========="
 
-echo "========== Final output =========="
-ls -l kernelsu-*.ko
+if (( ${#success[@]} > 0 )); then
+    printf 'Successful: %s\n' "${success[*]}"
+fi
+
+if (( ${#failed[@]} > 0 )); then
+    printf 'Failed: %s\n' "${failed[*]}" >&2
+    exit 1
+fi
+
+ls -lh "$DIST_DIR"/*_kernelsu.ko
