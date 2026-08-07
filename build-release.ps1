@@ -30,7 +30,7 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$KeyAlias,
 
-    [string]$PackageName = "me.weishu.kernelsu",
+    [string]$PackageName = "",
     [string]$AndroidSdk = "",
     [string]$NdkRoot = "",
     [string]$OutputApk = ""
@@ -107,6 +107,21 @@ function Read-RepoVersion {
     return $match.Groups[1].Value
 }
 
+function Read-GradleProperty {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $value = $null
+    foreach ($line in Get-Content $Path) {
+        if ($line -match ('^\s*{0}\s*=\s*(.*?)\s*$' -f [regex]::Escape($Name))) {
+            $value = $Matches[1]
+        }
+    }
+    return $value
+}
+
 Write-Host "=== Resolve build environment ==="
 
 Require-Command git | Out-Null
@@ -130,6 +145,21 @@ if (-not [int]::TryParse($gitCommitCountText, [ref]$gitCommitCount)) {
 $KernelSuVersion = 30000 + $gitCommitCount
 Write-Host "Git commits: $gitCommitCount"
 Write-Host "KernelSU version: $KernelSuVersion"
+
+$PackageNameSource = "-PackageName parameter"
+if ([string]::IsNullOrWhiteSpace($PackageName)) {
+    $ManagerGradleProperties = Join-Path $RepoRoot "manager\gradle.properties"
+    $PackageName = Read-GradleProperty `
+        -Path $ManagerGradleProperties `
+        -Name "KSU_PACKAGE_NAME"
+    if ([string]::IsNullOrWhiteSpace($PackageName)) {
+        $PackageName = "me.weishu.kernelsu"
+        $PackageNameSource = "built-in fallback"
+    } else {
+        $PackageName = $PackageName.Trim()
+        $PackageNameSource = "manager\gradle.properties"
+    }
+}
 
 $NdkVersion = Read-RepoVersion `
     -Path "$RepoRoot\manager\gradle\libs.versions.toml" `
@@ -194,7 +224,12 @@ if (-not ($pathEntries -contains $LlvmBin)) {
 Write-Host "Android SDK : $AndroidSdk"
 Write-Host "Android NDK : $NdkRoot"
 Write-Host "Build tools: $BuildTools"
-Write-Host "Package name: $PackageName"
+Write-Host "Package name: $PackageName ($PackageNameSource)"
+
+Write-Host "`n=== Test module static audit ==="
+
+& cargo test --package ksu-module-audit
+Assert-LastExitCode "module static audit tests"
 
 $requiredTargets = @(
     "aarch64-unknown-linux-musl",
