@@ -14,8 +14,10 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(target_os = "android")]
 use std::path::Path;
+#[cfg(any(target_os = "android", test))]
+use std::time::Duration;
 #[cfg(target_os = "android")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "android")]
 const EV_KEY: u16 = 0x01;
@@ -25,8 +27,16 @@ const KEY_VOLUMEDOWN: u16 = 114;
 const KEY_VOLUMEUP: u16 = 115;
 #[cfg(target_os = "android")]
 const KEY_PRESSED: i32 = 1;
-#[cfg(target_os = "android")]
-const CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(target_os = "android", test))]
+const BASE_CONFIRM_TIMEOUT_SECONDS: u64 = 30;
+#[cfg(any(target_os = "android", test))]
+const PER_ADDITIONAL_FINDING_SECONDS: u64 = 4;
+#[cfg(any(target_os = "android", test))]
+const CRITICAL_MIN_TIMEOUT_SECONDS: u64 = 120;
+#[cfg(any(target_os = "android", test))]
+const MAX_CONFIRM_TIMEOUT_SECONDS: u64 = 300;
+#[cfg(any(target_os = "android", test))]
+const TIMEOUT_ROUND_SECONDS: u64 = 30;
 const MAX_PRINTED_FINDINGS: usize = 200;
 
 #[cfg(target_os = "android")]
@@ -49,8 +59,9 @@ pub fn audit_before_install(zip: &str) -> Result<()> {
     }
 
     let required_presses = report.required_confirmation_presses();
-    print_confirmation_prompt(&report, required_presses);
-    let decision = wait_for_volume_decision(CONFIRM_TIMEOUT, required_presses)
+    let timeout = confirmation_timeout(&report);
+    print_confirmation_prompt(&report, required_presses, timeout);
+    let decision = wait_for_volume_decision(timeout, required_presses)
         .context("unable to read a confirmation from the volume keys")?;
     ensure!(
         decision == AuditDecision::Continue,
@@ -95,28 +106,59 @@ fn print_report(report: &AuditReport) {
             println!("  -> {step}");
         }
         println!("  {}", single_line(&finding.evidence));
+        println!();
     }
     if report.findings.len() > MAX_PRINTED_FINDINGS {
         println!(
             "! {} additional findings omitted from console output",
             report.findings.len() - MAX_PRINTED_FINDINGS
         );
+        println!();
     }
-    println!(
-        "Audit result: {} critical, {} high, {} notice, {} info",
-        report.count(Severity::Critical),
-        report.count(Severity::High),
-        report.count(Severity::Notice),
-        report.count(Severity::Info)
-    );
+    println!("======== Audit result ========");
+    print_severity_count(report, Severity::Critical, "critical", "danger");
+    print_severity_count(report, Severity::High, "high", "need review");
+    println!("{} notice", report.count(Severity::Notice));
+    println!("{} info", report.count(Severity::Info));
     println!(
         "Scanned {} files and {} decoded artifacts",
         report.scanned_files, report.derived_artifacts
     );
 }
 
+fn print_severity_count(report: &AuditReport, severity: Severity, label: &str, annotation: &str) {
+    let count = report.count(severity);
+    if count == 0 {
+        println!("0 {label}");
+    } else {
+        println!(">> {count} {label} << {annotation}");
+    }
+}
+
 #[cfg(target_os = "android")]
-fn print_confirmation_prompt(report: &AuditReport, required_presses: usize) {
+fn confirmation_timeout(report: &AuditReport) -> Duration {
+    let displayed_findings = report.findings.len().min(MAX_PRINTED_FINDINGS);
+    confirmation_timeout_for(displayed_findings, report.has_critical())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn confirmation_timeout_for(displayed_findings: usize, has_critical: bool) -> Duration {
+    let additional_findings = displayed_findings.saturating_sub(1);
+    let additional_seconds = u64::try_from(additional_findings)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(PER_ADDITIONAL_FINDING_SECONDS);
+    let mut seconds = BASE_CONFIRM_TIMEOUT_SECONDS.saturating_add(additional_seconds);
+    seconds = seconds
+        .div_ceil(TIMEOUT_ROUND_SECONDS)
+        .saturating_mul(TIMEOUT_ROUND_SECONDS);
+    if has_critical {
+        seconds = seconds.max(CRITICAL_MIN_TIMEOUT_SECONDS);
+    }
+    Duration::from_secs(seconds.min(MAX_CONFIRM_TIMEOUT_SECONDS))
+}
+
+#[cfg(target_os = "android")]
+fn print_confirmation_prompt(report: &AuditReport, required_presses: usize, timeout: Duration) {
     if report.has_critical() {
         println!("! Critical behavior may make the device unbootable or destroy data");
     } else {
@@ -130,7 +172,7 @@ fn print_confirmation_prompt(report: &AuditReport, required_presses: usize) {
     println!("[VOL-] Abort installation");
     println!(
         "Installation will abort after {} seconds",
-        CONFIRM_TIMEOUT.as_secs()
+        timeout.as_secs()
     );
 }
 
@@ -257,4 +299,31 @@ fn read_input_event(input: &mut File) -> Result<Option<(u16, u16, i32)>> {
 
 fn single_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_timeout_scales_with_output_length() {
+        assert_eq!(confirmation_timeout_for(1, false), Duration::from_secs(30));
+        assert_eq!(
+            confirmation_timeout_for(17, false),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            confirmation_timeout_for(67, false),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            confirmation_timeout_for(200, false),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn critical_findings_get_at_least_two_minutes() {
+        assert_eq!(confirmation_timeout_for(1, true), Duration::from_secs(120));
+    }
 }
