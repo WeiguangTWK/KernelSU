@@ -1,7 +1,7 @@
 #[allow(clippy::wildcard_imports)]
 use crate::utils::*;
 use crate::{
-    assets, defs, ksucalls, metamodule,
+    assets, defs, ksucalls, metamodule, module_audit,
     restorecon::{restore_syscon, setsyscon},
     sepolicy,
 };
@@ -618,6 +618,9 @@ fn install_module_to_system(zip: &str) -> Result<()> {
         "- Module size: {}",
         humansize::format_size(zip_uncompressed_size, humansize::DECIMAL)
     );
+
+    // Audit the exact package before extracting or executing any module-controlled content.
+    module_audit::audit_before_install(zip)?;
 
     // Ensure module directory exists and set SELinux context
     ensure_dir_exists(defs::MODULE_UPDATE_DIR)?;

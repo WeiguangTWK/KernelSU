@@ -282,6 +282,15 @@ enum Module {
         zip: String,
     },
 
+    /// Audit a module ZIP without installing it
+    Audit {
+        /// module zip file path
+        zip: String,
+        /// print the structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Undo module uninstall mark <id>
     UndoUninstall {
         /// module id
@@ -520,6 +529,7 @@ pub fn run() -> Result<()> {
             utils::switch_mnt_ns(1)?;
             match command {
                 Module::Install { zip } => module::install_module(&zip),
+                Module::Audit { zip, json } => crate::module_audit::print_zip_report(&zip, json),
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),
                 Module::Uninstall { id } => module::uninstall_module(&id),
                 Module::Enable { id } => module::enable_module(&id),

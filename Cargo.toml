@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "userspace/module-audit",
     "userspace/ksud",
     "userspace/ksuinit",
 ]

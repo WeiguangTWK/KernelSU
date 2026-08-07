@@ -34,6 +34,7 @@ mod magica;
 mod metamodule;
 #[cfg(target_os = "android")]
 mod module;
+mod module_audit;
 #[cfg(target_os = "android")]
 mod module_config;
 #[cfg(target_os = "android")]

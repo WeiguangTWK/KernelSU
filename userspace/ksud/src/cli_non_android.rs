@@ -28,6 +28,15 @@ enum Commands {
 
     /// show supported kmi versions
     SupportedKmis,
+
+    /// Audit a KernelSU module ZIP without installing it
+    ModuleAudit {
+        /// module zip file path
+        zip: String,
+        /// print the structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -55,6 +64,8 @@ pub fn run() -> Result<()> {
             }
             Ok(())
         }
+
+        Commands::ModuleAudit { zip, json } => crate::module_audit::print_zip_report(&zip, json),
     };
 
     if let Err(e) = &result {
