@@ -84,3 +84,19 @@ fn cli_discovers_nested_payload_without_decoder_command() {
                 .all(|layer| layer.starts_with("content-discovered base64 payload"))
     }));
 }
+
+#[test]
+fn cli_audits_persistent_startup_script_body() {
+    let report = run_fixture("persistent-script");
+    assert!(report.findings.iter().any(|finding| {
+        finding.rule_id == "KSU-AUDIT-PERSIST-001"
+            && finding
+                .evidence
+                .contains("/data/adb/bootcompleted.d/persisted.sh")
+    }));
+    assert!(report.findings.iter().any(|finding| {
+        finding.path == "/data/adb/bootcompleted.d/persisted.sh"
+            && finding.rule_id == "KSU-AUDIT-FS-001"
+            && finding.severity == Severity::Critical
+    }));
+}

