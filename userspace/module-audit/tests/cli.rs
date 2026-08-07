@@ -56,3 +56,31 @@ fn cli_keeps_module_owned_cleanup_informational() {
     }));
     assert!(!report.requires_confirmation());
 }
+
+#[test]
+fn cli_recursively_audits_renamed_decoder_fixture() {
+    let report = run_fixture("heuristic-unpack");
+    assert!(report.findings.iter().any(|finding| {
+        finding.rule_id == "KSU-AUDIT-PACK-001"
+            && finding
+                .evidence
+                .contains("OpenSSL-compatible argument grammar")
+    }));
+    assert!(report.findings.iter().any(|finding| {
+        finding.rule_id == "KSU-AUDIT-NET-001"
+            && finding.provenance == ["heuristic base64 payload (layer 1)"]
+    }));
+}
+
+#[test]
+fn cli_discovers_nested_payload_without_decoder_command() {
+    let report = run_fixture("content-discovery");
+    assert!(report.findings.iter().any(|finding| {
+        finding.rule_id == "KSU-AUDIT-FS-010"
+            && finding.provenance.len() == 2
+            && finding
+                .provenance
+                .iter()
+                .all(|layer| layer.starts_with("content-discovered base64 payload"))
+    }));
+}

