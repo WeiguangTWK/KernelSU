@@ -24,6 +24,7 @@ const RULE_UNPACK_LIMIT: &str = "KSU-AUDIT-PACK-002";
 const RULE_UNAUDITABLE_DECODER: &str = "KSU-AUDIT-PACK-003";
 const RULE_PERSISTENT_SCRIPT: &str = "KSU-AUDIT-PERSIST-001";
 const RULE_UNAUDITABLE_PERSISTENT_SCRIPT: &str = "KSU-AUDIT-PERSIST-002";
+const RULE_INVOKED_SCRIPT: &str = "KSU-AUDIT-SCRIPT-001";
 const RULE_ARCHIVE_PATH: &str = "KSU-AUDIT-ZIP-001";
 const RULE_ARCHIVE_LIMIT: &str = "KSU-AUDIT-ZIP-002";
 const MAX_INDEXED_SOURCE_SIZE: usize = 4 * 1024 * 1024;
@@ -132,6 +133,7 @@ struct Artifact {
     bytes: Vec<u8>,
     provenance: Vec<String>,
     depth: usize,
+    force_shell: bool,
 }
 
 #[derive(Clone)]
@@ -159,6 +161,7 @@ struct ScanState {
     binary_profiles: Vec<BinaryProfile>,
     archive_files: BTreeMap<String, Vec<u8>>,
     scripts: Vec<(String, String, Vec<String>)>,
+    audited_scripts: BTreeSet<String>,
 }
 
 pub fn scan_zip_path(path: impl AsRef<Path>, config: &AuditConfig) -> Result<AuditReport> {
@@ -180,6 +183,7 @@ pub fn scan_file_bytes(path: impl Into<String>, bytes: &[u8], config: &AuditConf
             bytes: bytes.to_vec(),
             provenance: Vec::new(),
             depth: 0,
+            force_shell: false,
         },
         None,
         config,
@@ -296,6 +300,7 @@ fn scan_zip_reader<R: Read + Seek>(
                 bytes,
                 provenance: Vec::new(),
                 depth: 0,
+                force_shell: false,
             },
             module_id.as_deref(),
             config,
@@ -399,9 +404,13 @@ fn scan_artifact(
         return;
     }
 
-    let looks_shell = looks_like_shell(&artifact.path, &artifact.bytes);
+    let looks_shell = artifact.force_shell || looks_like_shell(&artifact.path, &artifact.bytes);
     let text = String::from_utf8_lossy(&artifact.bytes).into_owned();
     if looks_shell {
+        let audit_key = format!("{}\0{}", artifact.path, sha256_bytes(&artifact.bytes));
+        if !state.audited_scripts.insert(audit_key) {
+            return;
+        }
         state.scripts.push((
             artifact.path.clone(),
             text.clone(),
@@ -409,6 +418,7 @@ fn scan_artifact(
         ));
         analyze_shell(&artifact, &text, module_id, state);
         analyze_persistent_script_writes(&artifact, &text, module_id, config, state);
+        analyze_invoked_module_scripts(&artifact, &text, module_id, config, state);
     }
 
     let mut candidates = if looks_shell {
@@ -486,6 +496,7 @@ fn scan_artifact(
                 bytes: payload,
                 provenance: artifact.provenance,
                 depth: artifact.depth,
+                force_shell: artifact.force_shell,
             },
             "gzexe/gzip payload",
             module_id,
@@ -589,6 +600,7 @@ fn scan_derived_bytes(
             bytes: decoded,
             provenance,
             depth: artifact.depth + 1,
+            force_shell: artifact.force_shell,
         },
         module_id,
         config,
@@ -1313,6 +1325,154 @@ fn analyze_persistent_script_writes(
     }
 }
 
+fn analyze_invoked_module_scripts(
+    artifact: &Artifact,
+    text: &str,
+    module_id: Option<&str>,
+    config: &AuditConfig,
+    state: &mut ScanState,
+) {
+    let mut variables = predefined_variables(module_id);
+    let mut current_dir = module_id.map_or_else(
+        || "$CWD".to_owned(),
+        |_| variables.get("MODPATH").cloned().unwrap_or_default(),
+    );
+    for (line_index, raw_line) in logical_lines(text).iter().enumerate() {
+        let tokens = shell_tokens(raw_line);
+        collect_assignments(&tokens, &mut variables);
+        for command in split_commands(&tokens) {
+            let (name, args) = normalize_command(command);
+            if name == "cd"
+                && let Some(target) = args.first()
+            {
+                current_dir = resolve_path(target, &variables, &current_dir);
+            }
+            let Some(operand) = invoked_script_operand(command, &variables) else {
+                continue;
+            };
+            let target = resolve_path(&operand, &variables, &current_dir);
+            let Some(content) =
+                lookup_archive_file(&target, &variables, module_id, &state.archive_files)
+            else {
+                continue;
+            };
+            add_finding(
+                state,
+                artifact,
+                RULE_INVOKED_SCRIPT,
+                Severity::Info,
+                Some(line_index + 1),
+                "Module-provided script is invoked",
+                &format!("{} => {target}", raw_line.trim()),
+            );
+            if artifact.depth >= config.max_unpack_depth {
+                add_finding(
+                    state,
+                    artifact,
+                    RULE_UNPACK_LIMIT,
+                    Severity::High,
+                    Some(line_index + 1),
+                    "Script call depth limit reached",
+                    &format!("maximum depth is {}", config.max_unpack_depth),
+                );
+                continue;
+            }
+            let mut provenance = artifact.provenance.clone();
+            provenance.push(format!(
+                "module script invoked by {}:{}",
+                artifact.path,
+                line_index + 1
+            ));
+            scan_artifact(
+                Artifact {
+                    path: archive_relative_path(&target, module_id).unwrap_or(target),
+                    bytes: content,
+                    provenance,
+                    depth: artifact.depth + 1,
+                    force_shell: true,
+                },
+                module_id,
+                config,
+                state,
+            );
+        }
+    }
+}
+
+fn invoked_script_operand(
+    command: &[String],
+    variables: &BTreeMap<String, String>,
+) -> Option<String> {
+    let expanded: Vec<_> = command
+        .iter()
+        .map(|token| expand_variables(token, variables))
+        .collect();
+    let mut index = expanded.iter().position(|token| !is_assignment(token))?;
+    let mut direct_wrapper = false;
+    loop {
+        let wrapper = posix_basename(expanded.get(index)?);
+        if !matches!(wrapper, "command" | "env" | "exec" | "nohup" | "time") {
+            break;
+        }
+        direct_wrapper = true;
+        index += 1;
+        while index < expanded.len()
+            && (expanded[index].starts_with('-') || is_assignment(&expanded[index]))
+        {
+            index += 1;
+        }
+    }
+
+    let executable = expanded.get(index)?;
+    let name = posix_basename(executable);
+    if matches!(name, "sh" | "ash" | "bash") {
+        index += 1;
+        while index < expanded.len() {
+            if expanded[index] == "-c"
+                || expanded[index].starts_with('-')
+                    && !expanded[index].starts_with("--")
+                    && expanded[index][1..].contains('c')
+            {
+                return None;
+            }
+            if expanded[index] == "-o" {
+                index += 2;
+                continue;
+            }
+            if expanded[index] == "--" {
+                index += 1;
+                continue;
+            }
+            if !expanded[index].starts_with('-') {
+                return Some(expanded[index].clone());
+            }
+            index += 1;
+        }
+        return None;
+    }
+    if matches!(name, "." | "source") {
+        return expanded.get(index + 1).cloned();
+    }
+    if direct_wrapper
+        || executable.contains('/')
+        || executable.starts_with("./")
+        || executable.starts_with("../")
+    {
+        return Some(executable.clone());
+    }
+    None
+}
+
+fn archive_relative_path(path: &str, module_id: Option<&str>) -> Option<String> {
+    let id = module_id?;
+    [
+        format!("/data/adb/modules_update/{id}/"),
+        format!("/data/adb/modules/{id}/"),
+    ]
+    .iter()
+    .find_map(|prefix| path.strip_prefix(prefix).map(ToOwned::to_owned))
+}
+
 fn recover_redirected_output(
     command_index: usize,
     commands: &[&[String]],
@@ -1426,6 +1586,7 @@ fn record_persistent_script(
             bytes: Vec::new(),
             provenance,
             depth: artifact.depth,
+            force_shell: true,
         },
         content,
         "persistent startup script",
@@ -2012,6 +2173,9 @@ fn collect_assignments(tokens: &[String], variables: &mut BTreeMap<String, Strin
             continue;
         };
         if is_variable_name(name) {
+            if name == "MODDIR" && (value.contains("$0") || value.contains("${0")) {
+                continue;
+            }
             variables.insert(name.to_owned(), expand_variables(value, variables));
         }
     }
@@ -2034,12 +2198,11 @@ fn is_variable_name(name: &str) -> bool {
 
 fn predefined_variables(module_id: Option<&str>) -> BTreeMap<String, String> {
     let id = module_id.unwrap_or("$MODID");
+    let module_path = format!("/data/adb/modules_update/{id}");
     BTreeMap::from([
         ("MODID".to_owned(), id.to_owned()),
-        (
-            "MODPATH".to_owned(),
-            format!("/data/adb/modules_update/{id}"),
-        ),
+        ("MODPATH".to_owned(), module_path.clone()),
+        ("MODDIR".to_owned(), module_path),
         ("TMPDIR".to_owned(), "/data/adb/ksu/.audit-tmp".to_owned()),
     ])
 }
@@ -2300,6 +2463,7 @@ mod tests {
                 bytes: script.to_vec(),
                 provenance: Vec::new(),
                 depth: 0,
+                force_shell: false,
             },
             Some("example"),
             &AuditConfig::default(),
@@ -2548,6 +2712,68 @@ mod tests {
         assert_eq!(
             persistent_destination("/data/adb/boot-completed.d/legacy", None),
             Some("/data/adb/boot-completed.d/legacy".to_owned())
+        );
+    }
+
+    #[test]
+    fn recursively_audits_invoked_extensionless_scripts() {
+        let zip = module_zip(&[
+            ("module.prop", b"id=script_chain\n"),
+            (
+                "service.sh",
+                b"#!/system/bin/sh\nMODDIR=${0%/*}\nsh $MODDIR/scripts/worker\n",
+            ),
+            ("scripts/worker", b"source $MODPATH/scripts/leaf\n"),
+            ("scripts/leaf", b"rm -rf /vendor\n"),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_id == RULE_INVOKED_SCRIPT)
+                .count(),
+            2
+        );
+        let delete = report
+            .findings
+            .iter()
+            .find(|finding| finding.path == "scripts/leaf" && finding.rule_id == RULE_BROAD_DELETE)
+            .unwrap();
+        assert_eq!(delete.provenance.len(), 2);
+    }
+
+    #[test]
+    fn audits_standard_module_script_names() {
+        let zip = module_zip(&[
+            ("module.prop", b"id=standard_scripts\n"),
+            ("post-fs-data.sh", b"curl https://post-fs.example\n"),
+            ("post-mount.sh", b"curl https://post-mount.example\n"),
+            ("service.sh", b"curl https://service.example\n"),
+            (
+                "boot-completed.sh",
+                b"curl https://boot-completed.example\n",
+            ),
+            ("uninstall.sh", b"curl https://uninstall.example\n"),
+            ("action.sh", b"curl https://action.example\n"),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        let paths: BTreeSet<_> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == RULE_NETWORK)
+            .map(|finding| finding.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            BTreeSet::from([
+                "action.sh",
+                "boot-completed.sh",
+                "post-fs-data.sh",
+                "post-mount.sh",
+                "service.sh",
+                "uninstall.sh",
+            ])
         );
     }
 
