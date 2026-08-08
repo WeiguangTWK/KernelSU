@@ -92,10 +92,10 @@ fn cli_audits_persistent_startup_script_body() {
         finding.rule_id == "KSU-AUDIT-PERSIST-001"
             && finding
                 .evidence
-                .contains("/data/adb/bootcompleted.d/persisted.sh")
+                .contains("/data/adb/boot-completed.d/persisted.sh")
     }));
     assert!(report.findings.iter().any(|finding| {
-        finding.path == "/data/adb/bootcompleted.d/persisted.sh"
+        finding.path == "/data/adb/boot-completed.d/persisted.sh"
             && finding.rule_id == "KSU-AUDIT-FS-001"
             && finding.severity == Severity::Critical
     }));

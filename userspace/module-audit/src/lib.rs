@@ -1349,7 +1349,11 @@ fn recover_redirected_output(
 }
 
 fn persistent_destination(destination: &str, source: Option<&str>) -> Option<String> {
-    const DIRECTORIES: &[&str] = &["/data/adb/service.d", "/data/adb/bootcompleted.d"];
+    const DIRECTORIES: &[&str] = &[
+        "/data/adb/service.d",
+        "/data/adb/boot-completed.d",
+        "/data/adb/bootcompleted.d",
+    ];
     for directory in DIRECTORIES {
         if destination == *directory || destination == format!("{directory}/") {
             let source = source?;
@@ -1370,9 +1374,13 @@ fn persistent_destination(destination: &str, source: Option<&str>) -> Option<Str
 }
 
 fn is_persistent_script_target(path: &str) -> bool {
-    ["/data/adb/service.d/", "/data/adb/bootcompleted.d/"]
-        .iter()
-        .any(|directory| path.starts_with(directory) && path.len() > directory.len())
+    [
+        "/data/adb/service.d/",
+        "/data/adb/boot-completed.d/",
+        "/data/adb/bootcompleted.d/",
+    ]
+    .iter()
+    .any(|directory| path.starts_with(directory) && path.len() > directory.len())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2519,20 +2527,28 @@ mod tests {
     }
 
     #[test]
-    fn audits_base64_output_written_to_bootcompleted_directory() {
+    fn audits_base64_output_written_to_boot_completed_directory() {
         let report = scan_file_bytes(
             "customize.sh",
-            b"#!/system/bin/sh\necho cm0gLXJmIC92ZW5kb3IK | base64 -d > /data/adb/bootcompleted.d/late.sh\n",
+            b"#!/system/bin/sh\necho cm0gLXJmIC92ZW5kb3IK | base64 -d > /data/adb/boot-completed.d/late.sh\n",
             &AuditConfig::default(),
         );
         assert!(report.findings.iter().any(|finding| {
-            finding.path == "/data/adb/bootcompleted.d/late.sh"
+            finding.path == "/data/adb/boot-completed.d/late.sh"
                 && finding.rule_id == RULE_BROAD_DELETE
                 && finding
                     .provenance
                     .iter()
                     .any(|layer| layer.contains("persistent startup script"))
         }));
+    }
+
+    #[test]
+    fn keeps_legacy_bootcompleted_directory_compatibility() {
+        assert_eq!(
+            persistent_destination("/data/adb/boot-completed.d/legacy", None),
+            Some("/data/adb/boot-completed.d/legacy".to_owned())
+        );
     }
 
     #[test]
