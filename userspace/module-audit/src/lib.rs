@@ -28,6 +28,18 @@ const RULE_UNAUDITABLE_PERSISTENT_SCRIPT: &str = "KSU-AUDIT-PERSIST-002";
 const RULE_INVOKED_SCRIPT: &str = "KSU-AUDIT-SCRIPT-001";
 const RULE_ARCHIVE_PATH: &str = "KSU-AUDIT-ZIP-001";
 const RULE_ARCHIVE_LIMIT: &str = "KSU-AUDIT-ZIP-002";
+const RULE_FINANCIAL_SCRIPT_MODIFICATION: &str = "KSU-AUDIT-FIN-001";
+const RULE_FINANCIAL_BINARY_MODIFICATION: &str = "KSU-AUDIT-FIN-002";
+const RULE_FINANCIAL_ACCESSIBILITY_PAYLOAD: &str = "KSU-AUDIT-FIN-003";
+const RULE_APK_PRESENT: &str = "KSU-AUDIT-APK-001";
+const RULE_APK_ACCESSIBILITY_SERVICE: &str = "KSU-AUDIT-APK-002";
+const RULE_APK_INSTALL: &str = "KSU-AUDIT-APK-003";
+const RULE_APK_UNINSPECTABLE: &str = "KSU-AUDIT-APK-004";
+const RULE_PRIVILEGED_PERMISSION_GRANT: &str = "KSU-AUDIT-PRIV-001";
+const RULE_ACCESSIBILITY_HIJACK: &str = "KSU-AUDIT-PRIV-002";
+const RULE_ZYGISK_PAYLOAD: &str = "KSU-AUDIT-ZYGISK-001";
+const RULE_ZYGISK_UNINSPECTABLE: &str = "KSU-AUDIT-ZYGISK-002";
+const RULE_FINANCIAL_ZYGISK_INJECTION: &str = "KSU-AUDIT-FIN-004";
 const MAX_INDEXED_SOURCE_SIZE: usize = 4 * 1024 * 1024;
 const MIN_CONTENT_PAYLOAD_LENGTH: usize = 24;
 const MAX_CONTENT_PAYLOAD_LENGTH: usize = 1024 * 1024;
@@ -153,6 +165,14 @@ struct DecodedCandidate {
 }
 
 #[derive(Default)]
+struct ZygiskContext {
+    native_paths: BTreeSet<String>,
+    dex_paths: BTreeSet<String>,
+    configured_targets: BTreeSet<String>,
+    entrypoint: Option<String>,
+}
+
+#[derive(Default)]
 struct ScanState {
     findings: Vec<Finding>,
     seen_derived: BTreeSet<String>,
@@ -163,6 +183,7 @@ struct ScanState {
     archive_files: BTreeMap<String, Vec<u8>>,
     scripts: Vec<(String, String, Vec<String>)>,
     audited_scripts: BTreeSet<String>,
+    zygisk: ZygiskContext,
 }
 
 pub fn scan_zip_path(path: impl AsRef<Path>, config: &AuditConfig) -> Result<AuditReport> {
@@ -384,6 +405,7 @@ fn scan_entries(
         .find(|(path, _)| path == "module.prop")
         .and_then(|(_, bytes)| parse_module_id(bytes));
     let scanned_files = entries.len();
+    state.zygisk = profile_zygisk_context(&entries);
     for (path, bytes) in &entries {
         if is_elf(bytes) {
             state.binary_profiles.push(profile_binary(path, bytes));
@@ -406,6 +428,182 @@ fn scan_entries(
         );
     }
     finish_report(package_sha256, module_id, scanned_files, state)
+}
+
+fn profile_zygisk_context(entries: &[(String, Vec<u8>)]) -> ZygiskContext {
+    let mut context = ZygiskContext::default();
+    let module_properties = entries
+        .iter()
+        .find(|(path, _)| path == "module.prop")
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes));
+    context.entrypoint = module_properties
+        .as_deref()
+        .and_then(|properties| parse_module_property(properties, "entrypoint"));
+
+    for (path, bytes) in entries {
+        let lower = path.to_ascii_lowercase();
+        if is_zygisk_native_path(&lower) {
+            context.native_paths.insert(path.clone());
+        }
+        if let Some(target) = lower.strip_prefix("packages/")
+            && !target.is_empty()
+            && !target.contains('/')
+        {
+            context.configured_targets.insert(target.to_owned());
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                context.configured_targets.extend(
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                        .map(str::to_ascii_lowercase),
+                );
+            }
+        }
+    }
+    if context.entrypoint.is_some() && !context.native_paths.is_empty() {
+        for (path, _) in entries {
+            let lower = path.to_ascii_lowercase();
+            if !lower.contains('/') && lower.starts_with("classes") && lower.ends_with(".dex") {
+                context.dex_paths.insert(path.clone());
+            }
+        }
+    }
+    context
+}
+
+fn parse_module_property(properties: &str, key: &str) -> Option<String> {
+    properties.lines().find_map(|line| {
+        let (candidate, value) = line.split_once('=')?;
+        (candidate.trim() == key)
+            .then(|| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn is_zygisk_native_path(path: &str) -> bool {
+    path.strip_prefix("zygisk/").is_some_and(|name| {
+        !name.is_empty() && !name.contains('/') && name.to_ascii_lowercase().ends_with(".so")
+    })
+}
+
+fn is_dex(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"dex\n") || bytes.starts_with(b"cdex")
+}
+
+fn analyze_zygisk_payload(artifact: &Artifact, state: &mut ScanState) {
+    let is_native = state.zygisk.native_paths.contains(&artifact.path);
+    let expected_format = if is_native {
+        is_elf(&artifact.bytes)
+    } else {
+        is_dex(&artifact.bytes)
+    };
+    let entrypoint = state.zygisk.entrypoint.clone();
+    let evidence = if is_native {
+        "zygisk/<abi>.so is loaded automatically into app or system-server specialization"
+            .to_owned()
+    } else {
+        format!(
+            "root DEX payload is loaded through ZygoteLoader entrypoint {}",
+            entrypoint.as_deref().unwrap_or("<unknown>")
+        )
+    };
+    add_finding(
+        state,
+        artifact,
+        RULE_ZYGISK_PAYLOAD,
+        Severity::Notice,
+        None,
+        if is_native {
+            "Native Zygisk injection payload"
+        } else {
+            "ZygoteLoader DEX injection payload"
+        },
+        &evidence,
+    );
+    if !expected_format {
+        add_finding(
+            state,
+            artifact,
+            RULE_ZYGISK_UNINSPECTABLE,
+            Severity::High,
+            None,
+            "Zygisk payload format cannot be inspected",
+            if is_native {
+                "zygisk/*.so does not contain a valid ELF header"
+            } else {
+                "ZygoteLoader classes*.dex does not contain a valid DEX header"
+            },
+        );
+        return;
+    }
+
+    let configured_financial =
+        state.zygisk.configured_targets.iter().find_map(|target| {
+            financial_target_marker(target).map(|marker| (target.clone(), marker))
+        });
+    let strings = extract_binary_strings(&artifact.bytes);
+    let embedded_financial = strings
+        .iter()
+        .find_map(|value| financial_package_marker(value).map(|marker| (value.clone(), marker)));
+    let Some((target, marker)) = configured_financial.or(embedded_financial) else {
+        return;
+    };
+    if !is_native
+        && let Some((severity, evidence)) = binary_financial_modification_evidence(&artifact.bytes)
+    {
+        add_finding(
+            state,
+            artifact,
+            RULE_FINANCIAL_BINARY_MODIFICATION,
+            severity,
+            None,
+            if severity == Severity::Critical {
+                "Financial application modification in ZygoteLoader DEX code"
+            } else {
+                "Financial target and modification capability coexist in ZygoteLoader DEX"
+            },
+            &evidence,
+        );
+    }
+    let Some(hook) = strings.iter().find_map(|value| {
+        zygisk_hook_marker(value).map(|hook| (abbreviated_evidence(value), hook))
+    }) else {
+        return;
+    };
+    add_finding(
+        state,
+        artifact,
+        RULE_FINANCIAL_ZYGISK_INJECTION,
+        Severity::Critical,
+        None,
+        "Zygisk payload can hook a financial application process",
+        &format!(
+            "financial target {target} ({marker}); hook capability {} ({})",
+            hook.0, hook.1
+        ),
+    );
+}
+
+fn zygisk_hook_marker(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    [
+        ("dobbyhook", "Dobby inline hook"),
+        ("shadowhook_hook", "ShadowHook inline hook"),
+        ("xhook_register", "xHook PLT hook"),
+        ("hookjninativemethods", "Zygisk JNI native hook"),
+        ("hook_jni_native_methods", "Zygisk JNI native hook"),
+        ("plthookregister", "Zygisk PLT hook"),
+        ("plt_hook_register", "Zygisk PLT hook"),
+        ("xposedbridge", "Xposed method hook"),
+        ("hookmethod", "Java method hook"),
+        ("lsplant", "LSPlant ART hook"),
+        ("mshookfunction", "Substrate inline hook"),
+        ("a64hookfunction", "ARM64 inline hook"),
+        ("inlinehook", "inline hook"),
+        ("replacehookedmethod", "method replacement"),
+    ]
+    .iter()
+    .find_map(|(needle, label)| lower.contains(needle).then_some(*label))
 }
 
 fn finish_report(
@@ -458,6 +656,16 @@ fn scan_artifact(
     config: &AuditConfig,
     state: &mut ScanState,
 ) {
+    if state.zygisk.native_paths.contains(&artifact.path)
+        || state.zygisk.dex_paths.contains(&artifact.path)
+    {
+        analyze_zygisk_payload(&artifact, state);
+    }
+    if is_apk(&artifact.path, &artifact.bytes) {
+        scan_apk_artifact(&artifact, module_id, config, state);
+        return;
+    }
+
     if is_elf(&artifact.bytes) {
         state.binaries.push(artifact.path.clone());
         add_finding(
@@ -469,15 +677,31 @@ fn scan_artifact(
             "Precompiled ELF content",
             &describe_elf(&artifact.bytes),
         );
-        if binary_has_network_indicators(&artifact.bytes) {
+        if let Some(evidence) = binary_network_evidence(&artifact.bytes) {
             add_finding(
                 state,
                 &artifact,
                 RULE_BINARY_NETWORK,
                 Severity::Notice,
                 None,
-                "Precompiled binary contains network indicators",
-                "found a network API or URL marker; runtime behavior cannot be proven statically",
+                "Precompiled binary contains network-client capability",
+                &evidence,
+            );
+        }
+        if let Some((severity, evidence)) = binary_financial_modification_evidence(&artifact.bytes)
+        {
+            add_finding(
+                state,
+                &artifact,
+                RULE_FINANCIAL_BINARY_MODIFICATION,
+                severity,
+                None,
+                if severity == Severity::Critical {
+                    "Financial application modification in precompiled binary"
+                } else {
+                    "Financial target and modification capability coexist in binary"
+                },
+                &evidence,
             );
         }
         return;
@@ -597,6 +821,234 @@ fn scan_artifact(
             state,
         );
     }
+}
+
+fn scan_apk_artifact(
+    artifact: &Artifact,
+    module_id: Option<&str>,
+    config: &AuditConfig,
+    state: &mut ScanState,
+) {
+    add_finding(
+        state,
+        artifact,
+        RULE_APK_PRESENT,
+        Severity::Notice,
+        None,
+        "Android application package embedded in module",
+        "APK contents are being inspected without executing or installing them",
+    );
+    if artifact.depth >= config.max_unpack_depth {
+        add_finding(
+            state,
+            artifact,
+            RULE_UNPACK_LIMIT,
+            Severity::High,
+            None,
+            "APK inspection depth limit reached",
+            &format!("maximum depth is {}", config.max_unpack_depth),
+        );
+        return;
+    }
+
+    let mut archive = match zip::ZipArchive::new(Cursor::new(&artifact.bytes)) {
+        Ok(archive) => archive,
+        Err(error) => {
+            add_finding(
+                state,
+                artifact,
+                RULE_APK_UNINSPECTABLE,
+                Severity::High,
+                None,
+                "Embedded APK cannot be inspected",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    if archive.len() > config.max_entries {
+        add_finding(
+            state,
+            artifact,
+            RULE_APK_UNINSPECTABLE,
+            Severity::High,
+            None,
+            "Embedded APK exceeds entry limit",
+            &format!(
+                "APK contains {} entries, limit is {}",
+                archive.len(),
+                config.max_entries
+            ),
+        );
+        return;
+    }
+
+    let apk_declares_accessibility = archive
+        .by_name("AndroidManifest.xml")
+        .ok()
+        .and_then(|mut manifest| {
+            let size = usize::try_from(manifest.size()).ok()?;
+            (size <= config.max_file_size).then_some(())?;
+            let mut bytes = Vec::with_capacity(size);
+            manifest.read_to_end(&mut bytes).ok()?;
+            Some(contains_accessibility_service_declaration(&bytes))
+        })
+        .unwrap_or(false);
+
+    let mut apk_total_size = 0_usize;
+    for index in 0..archive.len() {
+        let mut entry = match archive.by_index(index) {
+            Ok(entry) => entry,
+            Err(error) => {
+                add_finding(
+                    state,
+                    artifact,
+                    RULE_APK_UNINSPECTABLE,
+                    Severity::High,
+                    None,
+                    "Embedded APK entry cannot be opened",
+                    &error.to_string(),
+                );
+                continue;
+            }
+        };
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        if !is_safe_zip_path(&name) {
+            add_finding(
+                state,
+                artifact,
+                RULE_APK_UNINSPECTABLE,
+                Severity::High,
+                None,
+                "Embedded APK contains an unsafe path",
+                &name,
+            );
+            continue;
+        }
+        let declared_size = usize::try_from(entry.size()).unwrap_or(usize::MAX);
+        apk_total_size = apk_total_size.saturating_add(declared_size);
+        let remaining = config.max_derived_size.saturating_sub(state.derived_bytes);
+        if declared_size > config.max_file_size
+            || apk_total_size > config.max_total_size
+            || declared_size > remaining
+        {
+            add_finding(
+                state,
+                artifact,
+                RULE_APK_UNINSPECTABLE,
+                Severity::High,
+                None,
+                "Embedded APK analysis limit reached",
+                &format!("{name}: declared size {declared_size} bytes"),
+            );
+            continue;
+        }
+
+        let mut bytes = Vec::with_capacity(declared_size.min(config.max_file_size));
+        if let Err(error) = entry
+            .by_ref()
+            .take(u64::try_from(declared_size).unwrap_or(u64::MAX) + 1)
+            .read_to_end(&mut bytes)
+        {
+            add_finding(
+                state,
+                artifact,
+                RULE_APK_UNINSPECTABLE,
+                Severity::High,
+                None,
+                "Embedded APK entry cannot be decoded",
+                &format!("{name}: {error}"),
+            );
+            continue;
+        }
+        if bytes.len() > declared_size || bytes.len() > remaining {
+            add_unpack_size_limit(state, artifact, config);
+            continue;
+        }
+        if !is_relevant_apk_entry(&name, &bytes) {
+            continue;
+        }
+
+        let nested_path = format!("{}!/{name}", artifact.path);
+        let mut provenance = artifact.provenance.clone();
+        provenance.push(format!(
+            "APK entry extracted from {} (layer {})",
+            artifact.path,
+            artifact.depth.saturating_add(1)
+        ));
+        let nested = Artifact {
+            path: nested_path,
+            bytes,
+            provenance,
+            depth: artifact.depth + 1,
+            force_shell: false,
+        };
+        state.derived_bytes += nested.bytes.len();
+        state.derived_artifacts += 1;
+        analyze_apk_entry(&nested, apk_declares_accessibility, state);
+        scan_artifact(nested, module_id, config, state);
+    }
+}
+
+fn analyze_apk_entry(artifact: &Artifact, apk_declares_accessibility: bool, state: &mut ScanState) {
+    let inner_path = artifact.path.rsplit("!/").next().unwrap_or(&artifact.path);
+    if inner_path == "AndroidManifest.xml"
+        && contains_accessibility_service_declaration(&artifact.bytes)
+    {
+        add_finding(
+            state,
+            artifact,
+            RULE_APK_ACCESSIBILITY_SERVICE,
+            Severity::High,
+            None,
+            "Embedded APK declares an accessibility service",
+            "manifest string pool contains an AccessibilityService/BIND_ACCESSIBILITY_SERVICE declaration",
+        );
+    }
+    if apk_declares_accessibility
+        && let Some(evidence) = compiled_financial_accessibility_evidence(&artifact.bytes)
+    {
+        add_finding(
+            state,
+            artifact,
+            RULE_FINANCIAL_ACCESSIBILITY_PAYLOAD,
+            Severity::High,
+            None,
+            "Accessibility APK references a financial app and control APIs",
+            &evidence,
+        );
+    }
+    if !is_elf(&artifact.bytes)
+        && inner_path.ends_with(".dex")
+        && let Some((severity, evidence)) = binary_financial_modification_evidence(&artifact.bytes)
+    {
+        add_finding(
+            state,
+            artifact,
+            RULE_FINANCIAL_BINARY_MODIFICATION,
+            severity,
+            None,
+            if severity == Severity::Critical {
+                "Financial application modification in compiled APK code"
+            } else {
+                "Financial target and modification capability coexist in APK code"
+            },
+            &evidence,
+        );
+    }
+}
+
+fn is_relevant_apk_entry(path: &str, bytes: &[u8]) -> bool {
+    path == "AndroidManifest.xml"
+        || path.ends_with(".dex")
+        || path.ends_with(".so")
+        || path.ends_with(".sh")
+        || path.ends_with(".apk")
+        || is_elf(bytes)
+        || bytes.starts_with(b"#!")
 }
 
 fn decode_gzip_artifact(
@@ -946,7 +1398,11 @@ fn is_high_confidence_content_payload(bytes: &[u8], depth: usize) -> bool {
 }
 
 fn looks_like_content_payload(bytes: &[u8]) -> bool {
-    if is_elf(bytes) || bytes.starts_with(&[0x1f, 0x8b]) || bytes.starts_with(b"#!") {
+    if is_elf(bytes)
+        || is_apk("", bytes)
+        || bytes.starts_with(&[0x1f, 0x8b])
+        || bytes.starts_with(b"#!")
+    {
         return true;
     }
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -1246,7 +1702,11 @@ fn analyze_shell(artifact: &Artifact, text: &str, module_id: Option<&str>, state
             if command.is_empty() {
                 continue;
             }
-            let (name, args) = normalize_command(command);
+            let expanded: Vec<_> = command
+                .iter()
+                .map(|token| expand_variables(token, &variables))
+                .collect();
+            let (name, args) = normalize_command(&expanded);
             if name.is_empty() {
                 continue;
             }
@@ -1255,7 +1715,17 @@ fn analyze_shell(artifact: &Artifact, text: &str, module_id: Option<&str>, state
             {
                 current_dir = resolve_path(target, &variables, &current_dir);
             }
-            analyze_network(artifact, line_number, raw_line, &name, state);
+            analyze_network(artifact, line_number, raw_line, &name, &args, state);
+            analyze_financial_modification(
+                artifact,
+                line_number,
+                &name,
+                &args,
+                &variables,
+                &current_dir,
+                state,
+            );
+            analyze_privileged_package_actions(artifact, line_number, &name, &args, state);
             analyze_delete(
                 artifact,
                 line_number,
@@ -1779,13 +2249,10 @@ fn analyze_network(
     line: usize,
     raw_line: &str,
     name: &str,
+    args: &[String],
     state: &mut ScanState,
 ) {
-    const NETWORK_COMMANDS: &[&str] = &[
-        "curl", "wget", "aria2c", "nc", "ncat", "netcat", "socat", "ssh", "scp", "sftp", "ftp",
-        "tftp", "git", "ping", "nslookup", "dig",
-    ];
-    if NETWORK_COMMANDS.contains(&name) || raw_line.contains("/dev/tcp/") {
+    if let Some(evidence) = shell_network_evidence(name, args, raw_line) {
         add_finding(
             state,
             artifact,
@@ -1793,9 +2260,442 @@ fn analyze_network(
             Severity::Notice,
             Some(line),
             "Outbound network behavior",
-            raw_line.trim(),
+            &evidence,
         );
     }
+}
+
+fn shell_network_evidence(name: &str, args: &[String], raw_line: &str) -> Option<String> {
+    if raw_line.contains("/dev/tcp/") || raw_line.contains("/dev/udp/") {
+        return Some(raw_line.trim().to_owned());
+    }
+    let explicit_remote = args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        [
+            "http://", "https://", "ftp://", "ftps://", "sftp://", "ssh://", "git://",
+        ]
+        .iter()
+        .any(|scheme| lower.contains(scheme))
+    });
+    if explicit_remote {
+        return Some(raw_line.trim().to_owned());
+    }
+    if matches!(name, "curl" | "wget" | "aria2c") {
+        let local_only = args.iter().any(|arg| arg.starts_with("file://"));
+        let has_operand = args
+            .iter()
+            .any(|arg| !arg.starts_with('-') && !arg.is_empty());
+        return (has_operand && !local_only).then(|| raw_line.trim().to_owned());
+    }
+    if name == "git" {
+        return args
+            .first()
+            .is_some_and(|subcommand| {
+                matches!(
+                    subcommand.as_str(),
+                    "clone" | "fetch" | "pull" | "push" | "ls-remote"
+                ) || subcommand == "submodule" && args.get(1).is_some_and(|arg| arg == "update")
+            })
+            .then(|| raw_line.trim().to_owned());
+    }
+    if matches!(
+        name,
+        "nc" | "ncat"
+            | "netcat"
+            | "socat"
+            | "ssh"
+            | "scp"
+            | "sftp"
+            | "ftp"
+            | "tftp"
+            | "ping"
+            | "nslookup"
+            | "dig"
+    ) && args.iter().any(|arg| !arg.starts_with('-'))
+    {
+        return Some(raw_line.trim().to_owned());
+    }
+    None
+}
+
+fn analyze_financial_modification(
+    artifact: &Artifact,
+    line: usize,
+    name: &str,
+    args: &[String],
+    variables: &BTreeMap<String, String>,
+    current_dir: &str,
+    state: &mut ScanState,
+) {
+    let operands: Vec<_> = operands_before_redirection(args)
+        .into_iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .cloned()
+        .collect();
+    let mut targets = Vec::new();
+
+    match name {
+        "rm" | "unlink" | "rmdir" | "shred" | "touch" | "mkdir" | "truncate" | "fallocate"
+        | "chmod" | "chown" | "chgrp" | "chcon" | "setfattr" | "patch" | "tee" => {
+            targets.extend(operands)
+        }
+        "cp" | "install" => targets.extend(operands.last().cloned()),
+        // mv removes the source as well as replacing the destination.
+        "mv" => targets.extend(operands),
+        "dd" => targets.extend(
+            args.iter()
+                .filter_map(|arg| arg.strip_prefix("of="))
+                .map(ToOwned::to_owned),
+        ),
+        "sed" if args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")) => {
+            targets.extend(operands)
+        }
+        "perl"
+            if args.iter().any(|arg| {
+                arg.starts_with('-') && arg[1..].contains('i') && arg[1..].contains('p')
+            }) =>
+        {
+            targets.extend(operands)
+        }
+        "sqlite3" if contains_sql_mutation(args) => targets.extend(args.iter().cloned()),
+        "pm" if args.first().is_some_and(|arg| {
+            matches!(
+                arg.as_str(),
+                "clear" | "uninstall" | "disable" | "disable-user" | "enable" | "install-existing"
+            )
+        }) =>
+        {
+            targets.extend(args.iter().skip(1).cloned())
+        }
+        "cmd"
+            if args.first().is_some_and(|arg| arg == "package")
+                && args.get(1).is_some_and(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "clear"
+                            | "uninstall"
+                            | "disable"
+                            | "disable-user"
+                            | "enable"
+                            | "install-existing"
+                    )
+                }) =>
+        {
+            targets.extend(args.iter().skip(2).cloned())
+        }
+        "appops"
+            if args
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "set" | "reset")) =>
+        {
+            targets.extend(args.iter().skip(1).cloned())
+        }
+        "mount"
+            if args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--bind" | "-o")) =>
+        {
+            targets.extend(operands.last().cloned())
+        }
+        _ => {
+            let bundled_binary = state
+                .binary_profiles
+                .iter()
+                .any(|profile| profile.basename == name);
+            if bundled_binary && args.iter().any(|arg| is_binary_mutation_argument(arg)) {
+                targets.extend(args.iter().cloned());
+            }
+        }
+    }
+
+    for window in args.windows(2) {
+        if matches!(window[0].as_str(), ">" | ">>") {
+            targets.push(window[1].clone());
+        }
+    }
+
+    let Some((target, marker)) = targets.into_iter().find_map(|target| {
+        let expanded = expand_variables(&target, variables);
+        let resolved = if expanded.contains('/') {
+            resolve_path(&expanded, variables, current_dir)
+        } else {
+            expanded
+        };
+        financial_target_marker(&resolved).map(|marker| (resolved, marker))
+    }) else {
+        return;
+    };
+
+    add_finding(
+        state,
+        artifact,
+        RULE_FINANCIAL_SCRIPT_MODIFICATION,
+        Severity::Critical,
+        Some(line),
+        "Financial application data or state modification",
+        &format!("{name} targets {target} ({marker})"),
+    );
+}
+
+fn analyze_privileged_package_actions(
+    artifact: &Artifact,
+    line: usize,
+    name: &str,
+    args: &[String],
+    state: &mut ScanState,
+) {
+    let command = std::iter::once(name)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = command.to_ascii_lowercase();
+
+    let installs_apk = name == "pm"
+        && args.first().is_some_and(|arg| {
+            arg == "install" || arg.starts_with("install-") && arg != "install-existing"
+        })
+        || name == "cmd"
+            && args.first().is_some_and(|arg| arg == "package")
+            && args.get(1).is_some_and(|arg| {
+                arg == "install" || arg.starts_with("install-") && arg != "install-existing"
+            });
+    if installs_apk {
+        add_finding(
+            state,
+            artifact,
+            RULE_APK_INSTALL,
+            Severity::High,
+            Some(line),
+            "Module installs an Android application",
+            &abbreviated_evidence(&command),
+        );
+    }
+
+    let grants_permission = name == "pm" && args.first().is_some_and(|arg| arg == "grant")
+        || name == "cmd"
+            && args.first().is_some_and(|arg| arg == "package")
+            && args
+                .get(1)
+                .is_some_and(|arg| matches!(arg.as_str(), "grant-runtime-permission" | "grant"));
+    if grants_permission && contains_sensitive_android_permission(&lower) {
+        add_finding(
+            state,
+            artifact,
+            RULE_PRIVILEGED_PERMISSION_GRANT,
+            Severity::Critical,
+            Some(line),
+            "Module grants a highly sensitive Android permission",
+            &abbreviated_evidence(&command),
+        );
+    }
+
+    if let Some(severity) = accessibility_settings_mutation_severity(name, args, &lower) {
+        add_finding(
+            state,
+            artifact,
+            RULE_ACCESSIBILITY_HIJACK,
+            severity,
+            Some(line),
+            if severity == Severity::Critical {
+                "Module selects enabled accessibility services"
+            } else {
+                "Module changes the accessibility master switch"
+            },
+            &abbreviated_evidence(&command),
+        );
+    }
+}
+
+fn contains_sensitive_android_permission(command: &str) -> bool {
+    [
+        "android.permission.write_secure_settings",
+        "android.permission.read_sms",
+        "android.permission.receive_sms",
+        "android.permission.read_call_log",
+        "android.permission.read_contacts",
+    ]
+    .iter()
+    .any(|permission| command.contains(permission))
+}
+
+fn accessibility_settings_mutation_severity(
+    name: &str,
+    args: &[String],
+    lower: &str,
+) -> Option<Severity> {
+    let mut settings_args = args;
+    if name == "cmd" && args.first().is_some_and(|arg| arg == "settings") {
+        settings_args = &args[1..];
+    } else if name != "settings" {
+        settings_args = &[];
+    }
+    let settings_mutation = if settings_args.iter().any(|arg| arg == "put")
+        && settings_args.iter().any(|arg| arg == "secure")
+    {
+        settings_args.iter().enumerate().find_map(|(index, arg)| {
+            let key = arg.to_ascii_lowercase();
+            let value = settings_args
+                .get(index + 1)
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            match key.as_str() {
+                "enabled_accessibility_services"
+                    if !value.is_empty() && !matches!(value.as_str(), "null" | "none") =>
+                {
+                    Some(Severity::Critical)
+                }
+                "accessibility_enabled" if !matches!(value.as_str(), "" | "0" | "false") => {
+                    Some(Severity::High)
+                }
+                _ => None,
+            }
+        })
+    } else {
+        None
+    };
+    if settings_mutation.is_some() {
+        return settings_mutation;
+    }
+
+    let content_provider_mutation = name == "content"
+        && args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "insert" | "update"))
+        && lower.contains("settings/secure");
+    if content_provider_mutation && lower.contains("enabled_accessibility_services") {
+        return Some(Severity::Critical);
+    }
+    if content_provider_mutation
+        && lower.contains("accessibility_enabled")
+        && !content_binding_is_false(lower)
+    {
+        return Some(Severity::High);
+    }
+
+    let direct_database_mutation = matches!(name, "sqlite3" | "sed" | "perl")
+        && (lower.contains("enabled_accessibility_services")
+            || lower.contains("accessibility_enabled"))
+        && (contains_sql_mutation(args)
+            || name == "sed" && args.iter().any(|arg| arg == "-i" || arg.starts_with("-i"))
+            || name == "perl"
+                && args.iter().any(|arg| {
+                    arg.starts_with('-') && arg[1..].contains('i') && arg[1..].contains('p')
+                }));
+    if direct_database_mutation && lower.contains("enabled_accessibility_services") {
+        Some(Severity::Critical)
+    } else if direct_database_mutation {
+        Some(Severity::High)
+    } else {
+        None
+    }
+}
+
+fn content_binding_is_false(command: &str) -> bool {
+    ["value:s:0", "value:i:0", "value:s:false", "value:b:false"]
+        .iter()
+        .any(|binding| command.contains(binding))
+}
+
+fn contains_sql_mutation(args: &[String]) -> bool {
+    let sql = args.join(" ").to_ascii_lowercase();
+    [
+        "update ", "insert ", "delete ", "replace ", "drop ", "alter ",
+    ]
+    .iter()
+    .any(|keyword| sql.contains(keyword))
+}
+
+fn is_binary_mutation_argument(argument: &str) -> bool {
+    let argument = argument
+        .trim_start_matches('-')
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    [
+        "patch", "write", "delete", "remove", "inject", "hook", "replace", "disable", "clear",
+        "modify", "tamper",
+    ]
+    .iter()
+    .any(|verb| argument == *verb || argument.starts_with(&format!("{verb}=")))
+}
+
+fn financial_target_marker(value: &str) -> Option<String> {
+    if let Some(marker) = financial_package_marker(value) {
+        return Some(marker);
+    }
+    let lower = value.to_ascii_lowercase();
+    for (brand, label) in [
+        ("alipay", "Alipay"),
+        ("wechat", "WeChat"),
+        ("weixin", "WeChat"),
+        ("phonepe", "PhonePe"),
+        ("paytm", "Paytm"),
+        ("googlepay", "Google Pay"),
+        ("gpay", "Google Pay"),
+        ("mobikwik", "MobiKwik"),
+        ("freecharge", "Freecharge"),
+    ] {
+        if contains_word(&lower, brand) {
+            return Some(label.to_owned());
+        }
+    }
+    lower.contains("upi://").then(|| "UPI".to_owned())
+}
+
+fn financial_package_marker(value: &str) -> Option<String> {
+    const KNOWN_PACKAGES: &[(&str, &str)] = &[
+        ("com.eg.android.alipaygphone", "Alipay"),
+        ("com.tencent.mm", "WeChat"),
+        ("in.org.npci.upiapp", "BHIM/UPI"),
+        ("com.google.android.apps.nbu.paisa.user", "Google Pay India"),
+        ("com.phonepe.app", "PhonePe"),
+        ("net.one97.paytm", "Paytm"),
+        ("com.mobikwik_new", "MobiKwik"),
+        ("com.freecharge.android", "Freecharge"),
+    ];
+    let lower = value.to_ascii_lowercase();
+    if let Some((_, label)) = KNOWN_PACKAGES
+        .iter()
+        .find(|(package, _)| contains_word(&lower, package))
+    {
+        return Some((*label).to_owned());
+    }
+    for token in lower.split(|character: char| {
+        !character.is_ascii_alphanumeric() && character != '.' && character != '_'
+    }) {
+        let token = token.trim_matches('.');
+        if token.matches('.').count() < 2 {
+            continue;
+        }
+        if token.split('.').any(|segment| {
+            matches!(
+                segment,
+                "bank"
+                    | "banking"
+                    | "mobilebank"
+                    | "mobilebanking"
+                    | "wallet"
+                    | "payment"
+                    | "payments"
+                    | "finance"
+                    | "financial"
+                    | "upi"
+                    | "bhim"
+                    | "npci"
+            )
+        }) {
+            return Some(format!("financial package {token}"));
+        }
+    }
+    None
+}
+
+fn contains_word(text: &str, needle: &str) -> bool {
+    text.match_indices(needle).any(|(index, _)| {
+        let before = text[..index].chars().next_back();
+        let after = text[index + needle.len()..].chars().next();
+        before.is_none_or(|value| !value.is_ascii_alphanumeric())
+            && after.is_none_or(|value| !value.is_ascii_alphanumeric())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1941,25 +2841,31 @@ fn correlate_binary_execution(state: &mut ScanState) {
         let basename = posix_basename(&binary);
         for (script_path, text, provenance) in &scripts {
             for (index, line) in text.lines().enumerate() {
-                if line.contains(&binary)
-                    || line.contains(&format!("$MODPATH/{binary}"))
-                    || line.contains(&format!("./{binary}"))
-                    || (basename.len() > 2
-                        && shell_tokens(line).iter().any(|token| token == basename))
-                {
+                if line_executes_binary(line, basename) {
                     state.findings.push(Finding {
                         rule_id: RULE_BINARY_EXECUTED.to_owned(),
                         severity: Severity::Notice,
                         path: script_path.clone(),
                         line: Some(index + 1),
                         title: "Precompiled binary is executed or loaded".to_owned(),
-                        evidence: format!("{} references {binary}", line.trim()),
+                        evidence: format!("{} executes {binary}", line.trim()),
                         provenance: provenance.clone(),
                     });
                 }
             }
         }
     }
+}
+
+fn line_executes_binary(line: &str, basename: &str) -> bool {
+    if basename.len() <= 2 {
+        return false;
+    }
+    let tokens = shell_tokens(line);
+    split_commands(&tokens).into_iter().any(|command| {
+        let (name, _) = normalize_command(command);
+        name == basename
+    })
 }
 
 fn add_finding(
@@ -2031,6 +2937,37 @@ fn looks_like_shell(path: &str, bytes: &[u8]) -> bool {
             .is_some_and(|head| head.windows(7).any(|window| window == b"#!/bin/"))
 }
 
+fn is_apk(path: &str, bytes: &[u8]) -> bool {
+    if path.to_ascii_lowercase().ends_with(".apk") {
+        return true;
+    }
+    if !bytes.starts_with(b"PK\x03\x04")
+        && !bytes.starts_with(b"PK\x05\x06")
+        && !bytes.starts_with(b"PK\x07\x08")
+    {
+        return false;
+    }
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(bytes)) else {
+        return false;
+    };
+    let mut has_manifest = false;
+    let mut has_apk_payload = false;
+    for index in 0..archive.len() {
+        let Ok(entry) = archive.by_index(index) else {
+            continue;
+        };
+        match entry.name() {
+            "AndroidManifest.xml" => has_manifest = true,
+            "resources.arsc" | "classes.dex" => has_apk_payload = true,
+            _ => {}
+        }
+        if has_manifest && has_apk_payload {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_elf(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x7fELF")
 }
@@ -2061,19 +2998,276 @@ fn describe_elf(bytes: &[u8]) -> String {
     format!("{class} {kind}")
 }
 
-fn binary_has_network_indicators(bytes: &[u8]) -> bool {
-    const INDICATORS: &[&[u8]] = &[
-        b"http://",
-        b"https://",
-        b"connect",
-        b"getaddrinfo",
-        b"libcurl",
-    ];
-    INDICATORS.iter().any(|indicator| {
-        bytes
-            .windows(indicator.len())
-            .any(|window| window == *indicator)
-    })
+fn binary_network_evidence(bytes: &[u8]) -> Option<String> {
+    use goblin::elf::{Elf, header::ET_REL};
+
+    let elf = Elf::parse(bytes).ok()?;
+    // Kernel modules and ordinary object files use the same ELF container, but
+    // their undefined symbols belong to the kernel/linker namespace. Applying
+    // userspace libc semantics to them produces false positives such as BPF
+    // connect hooks and connector infrastructure.
+    if elf.header.e_type == ET_REL {
+        return None;
+    }
+
+    let imports: BTreeSet<_> = elf
+        .dynsyms
+        .iter()
+        .filter(|symbol| symbol.is_import())
+        .filter_map(|symbol| elf.dynstrtab.get_at(symbol.st_name))
+        .map(strip_elf_symbol_version)
+        .collect();
+    let libraries: BTreeSet<_> = elf
+        .libraries
+        .iter()
+        .map(|library| library.to_ascii_lowercase())
+        .collect();
+
+    network_evidence_from_elf_metadata(&imports, &libraries)
+}
+
+fn network_evidence_from_elf_metadata(
+    imports: &BTreeSet<&str>,
+    libraries: &BTreeSet<String>,
+) -> Option<String> {
+    if let Some(symbol) = [
+        "curl_easy_perform",
+        "curl_multi_perform",
+        "wget_main",
+        "SSL_connect",
+        "BIO_do_connect",
+        "nghttp2_session_client_new",
+    ]
+    .into_iter()
+    .find(|symbol| imports.contains(symbol))
+    {
+        return Some(format!(
+            "imports network-client API {symbol}; static analysis cannot prove when or where it connects"
+        ));
+    }
+    if libraries
+        .iter()
+        .any(|library| library == "libcurl.so" || library.starts_with("libcurl.so."))
+    {
+        return Some(
+            "declares a dynamic dependency on libcurl; static analysis cannot prove when or where it connects"
+                .to_owned(),
+        );
+    }
+
+    let transport = ["connect", "sendto"]
+        .into_iter()
+        .find(|symbol| imports.contains(symbol));
+    let addressing = [
+        "getaddrinfo",
+        "gethostbyname",
+        "gethostbyname2",
+        "inet_aton",
+        "inet_pton",
+    ]
+    .into_iter()
+    .find(|symbol| imports.contains(symbol));
+    match (transport, addressing) {
+        (Some(transport), Some(addressing)) => Some(format!(
+            "imports {transport} together with Internet address resolver/conversion API {addressing}; static analysis cannot prove when or where it connects"
+        )),
+        _ => None,
+    }
+}
+
+fn strip_elf_symbol_version(symbol: &str) -> &str {
+    symbol.split_once('@').map_or(symbol, |(name, _)| name)
+}
+
+fn contains_accessibility_service_declaration(bytes: &[u8]) -> bool {
+    let strings = extract_binary_strings(bytes);
+    let has_binding_permission = strings.iter().any(|value| {
+        value
+            .to_ascii_lowercase()
+            .contains("android.permission.bind_accessibility_service")
+    });
+    let has_service_action = strings.iter().any(|value| {
+        value
+            .to_ascii_lowercase()
+            .contains("android.accessibilityservice.accessibilityservice")
+    });
+    has_binding_permission && has_service_action
+}
+
+fn compiled_financial_accessibility_evidence(bytes: &[u8]) -> Option<String> {
+    let strings = extract_binary_strings(bytes);
+    let (_, financial_marker) = strings
+        .iter()
+        .find_map(|value| financial_package_marker(value).map(|marker| (value, marker)))?;
+    let accessibility = strings.iter().find(|value| {
+        let lower = value.to_ascii_lowercase();
+        lower.contains("accessibilityservice") || lower.contains("accessibilitynodeinfo")
+    })?;
+    let control = strings.iter().find(|value| {
+        let lower = value.to_ascii_lowercase();
+        [
+            "dispatchgesture",
+            "performaction",
+            "performglobalaction",
+            "action_click",
+            "action_set_text",
+            "findaccessibilitynodeinfosbytext",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    })?;
+    Some(format!(
+        "targets {financial_marker}; accessibility API {}; control primitive {}",
+        abbreviated_evidence(accessibility),
+        abbreviated_evidence(control)
+    ))
+}
+
+fn binary_financial_modification_evidence(bytes: &[u8]) -> Option<(Severity, String)> {
+    let strings = extract_binary_strings(bytes);
+    if let Some((value, marker)) = strings.iter().find_map(|value| {
+        let marker = financial_target_marker(value)?;
+        contains_strong_binary_mutation(value).then_some((value, marker))
+    }) {
+        return Some((
+            Severity::Critical,
+            format!(
+                "embedded command combines {} with modification semantics: {}",
+                marker,
+                abbreviated_evidence(value)
+            ),
+        ));
+    }
+
+    let financial = strings.iter().find_map(|value| {
+        if !is_sensitive_financial_data_path(value) {
+            return None;
+        }
+        financial_target_marker(value).map(|marker| (value, marker))
+    })?;
+    let mutation = strings
+        .iter()
+        .find(|value| contains_strong_binary_mutation(value))?;
+    Some((
+        Severity::High,
+        format!(
+            "contains target {} ({}) and a separate modification-capability marker {}; no static call relationship was proven",
+            abbreviated_evidence(financial.0),
+            financial.1,
+            abbreviated_evidence(mutation)
+        ),
+    ))
+}
+
+fn contains_strong_binary_mutation(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "process_vm_writev",
+        "unlinkat",
+        "unlink",
+        "renameat",
+        "rename",
+        "setxattr",
+        "chmod",
+        "chown",
+        "pm clear",
+        "pm uninstall",
+        "sed -i",
+        " update ",
+        " insert ",
+        " delete ",
+        " replace ",
+        "--patch",
+        "--inject",
+        "--hook",
+        "--delete",
+        "--remove",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn is_sensitive_financial_data_path(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("/data/")
+        || lower.contains("/data_mirror/")
+        || lower.contains("/storage/emulated/")
+}
+
+fn extract_binary_strings(bytes: &[u8]) -> Vec<String> {
+    const MIN_LENGTH: usize = 4;
+    const MAX_STRING_LENGTH: usize = 4096;
+    const MAX_STRINGS: usize = 65_536;
+    let mut output = Vec::new();
+    let mut current = Vec::new();
+    for &byte in bytes {
+        if byte.is_ascii_graphic() || byte == b' ' {
+            current.push(byte);
+            if current.len() >= MAX_STRING_LENGTH {
+                push_binary_string(&mut output, &mut current, MIN_LENGTH, MAX_STRINGS);
+            }
+        } else {
+            push_binary_string(&mut output, &mut current, MIN_LENGTH, MAX_STRINGS);
+        }
+        if output.len() >= MAX_STRINGS {
+            return output;
+        }
+    }
+    push_binary_string(&mut output, &mut current, MIN_LENGTH, MAX_STRINGS);
+
+    for offset in 0..=1 {
+        let mut utf16 = Vec::new();
+        for pair in bytes[offset..].chunks_exact(2) {
+            if pair[1] == 0 && (pair[0].is_ascii_graphic() || pair[0] == b' ') {
+                utf16.push(pair[0]);
+                if utf16.len() >= MAX_STRING_LENGTH {
+                    push_binary_string(&mut output, &mut utf16, MIN_LENGTH, MAX_STRINGS);
+                }
+            } else {
+                push_binary_string(&mut output, &mut utf16, MIN_LENGTH, MAX_STRINGS);
+            }
+            if output.len() >= MAX_STRINGS {
+                break;
+            }
+        }
+        push_binary_string(&mut output, &mut utf16, MIN_LENGTH, MAX_STRINGS);
+    }
+    output
+}
+
+fn push_binary_string(
+    output: &mut Vec<String>,
+    current: &mut Vec<u8>,
+    min_length: usize,
+    max_strings: usize,
+) {
+    if current.len() >= min_length
+        && output.len() < max_strings
+        && let Ok(value) = String::from_utf8(std::mem::take(current))
+    {
+        output.push(value);
+    } else {
+        current.clear();
+    }
+}
+
+fn abbreviated_evidence(value: &str) -> String {
+    const LIMIT: usize = 160;
+    let clean: String = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if clean.chars().count() <= LIMIT {
+        clean
+    } else {
+        format!("{}...", clean.chars().take(LIMIT).collect::<String>())
+    }
 }
 
 fn profile_binary(path: &str, bytes: &[u8]) -> BinaryProfile {
@@ -2536,6 +3730,18 @@ mod tests {
         elf
     }
 
+    fn utf16le_markers(markers: &[&str]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for marker in markers {
+            output.extend_from_slice(&[0, 0]);
+            for byte in marker.bytes() {
+                output.extend_from_slice(&[byte, 0]);
+            }
+            output.extend_from_slice(&[0, 0]);
+        }
+        output
+    }
+
     #[test]
     fn detects_partition_writes_and_broad_delete() {
         let script = b"#!/system/bin/sh\nBLOCK=/dev/block/by-name/boot\nbusybox dd if=boot.img of=$BLOCK\nrm -rf /data\n";
@@ -2544,6 +3750,348 @@ mod tests {
         assert!(rules(&report).contains(&RULE_BROAD_DELETE));
         assert!(report.has_critical());
         assert_eq!(report.required_confirmation_presses(), 2);
+    }
+
+    #[test]
+    fn detects_financial_application_script_modifications() {
+        let script = br#"#!/system/bin/sh
+ALIPAY=com.eg.android.alipaygphone
+rm -rf /data/user/0/$ALIPAY/databases
+sqlite3 /data/user/0/com.tencent.mm/MicroMsg.db "UPDATE account SET token=''"
+sed -i 's/enabled/disabled/' /data/user/0/com.example.mobilebanking/config.xml
+pm clear in.org.npci.upiapp
+"#;
+        let report = scan_file_bytes("customize.sh", script, &AuditConfig::default());
+        let findings: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|finding| finding.rule_id == RULE_FINANCIAL_SCRIPT_MODIFICATION)
+            .collect();
+        assert_eq!(findings.len(), 4);
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.severity == Severity::Critical)
+        );
+    }
+
+    #[test]
+    fn detects_financial_modification_by_renamed_bundled_binary() {
+        let tool = elf_with_markers(b"private utility");
+        let zip = module_zip(&[
+            ("module.prop", b"id=finance_patch\n"),
+            (
+                "customize.sh",
+                b"#!/system/bin/sh\n$MODPATH/bin/helper --patch com.phonepe.app\n",
+            ),
+            ("bin/helper", &tool),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        assert!(rules(&report).contains(&RULE_FINANCIAL_SCRIPT_MODIFICATION));
+    }
+
+    #[test]
+    fn detects_financial_modification_in_binary_strings() {
+        let binary = elf_with_markers(
+            b"/data/user/0/com.eg.android.alipaygphone/databases/account.db\0unlink\0",
+        );
+        let report = scan_file_bytes("bin/helper", &binary, &AuditConfig::default());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_FINANCIAL_BINARY_MODIFICATION)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::High);
+
+        let binary = elf_with_markers(
+            b"--inject /data/user/0/com.eg.android.alipaygphone/databases/account.db\0",
+        );
+        let report = scan_file_bytes("bin/helper", &binary, &AuditConfig::default());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_FINANCIAL_BINARY_MODIFICATION)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+    }
+
+    #[test]
+    fn detects_utf16_financial_modification_in_binary_strings() {
+        let mut markers = Vec::new();
+        for byte in b"com.tencent.mm --inject" {
+            markers.extend_from_slice(&[*byte, 0]);
+        }
+        let binary = elf_with_markers(&markers);
+        let report = scan_file_bytes("lib/arm64/libhelper.so", &binary, &AuditConfig::default());
+        assert!(rules(&report).contains(&RULE_FINANCIAL_BINARY_MODIFICATION));
+    }
+
+    #[test]
+    fn recursively_detects_packed_financial_modification() {
+        let packed = gzip(
+            b"#!/system/bin/sh\nrm -rf /data/user/0/com.google.android.apps.nbu.paisa.user/files\n",
+        );
+        let report = scan_file_bytes("payload.gz", &packed, &AuditConfig::default());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_FINANCIAL_SCRIPT_MODIFICATION)
+            .unwrap();
+        assert!(!finding.provenance.is_empty());
+    }
+
+    #[test]
+    fn ignores_financial_mentions_without_modification() {
+        let script = br#"#!/system/bin/sh
+echo "Supports Alipay, WeChat, and UPI"
+pm path com.eg.android.alipaygphone
+dumpsys package com.tencent.mm
+cp /data/user/0/com.phonepe.app/cache/export $MODPATH/backup
+curl https://alipay.example/documentation
+"#;
+        let report = scan_file_bytes("service.sh", script, &AuditConfig::default());
+        assert!(!rules(&report).contains(&RULE_FINANCIAL_SCRIPT_MODIFICATION));
+        assert!(rules(&report).contains(&RULE_NETWORK));
+
+        let binary = elf_with_markers(b"com.tencent.mm\0read-only package lookup\0unlink\0");
+        let report = scan_file_bytes("bin/query", &binary, &AuditConfig::default());
+        assert!(!rules(&report).contains(&RULE_FINANCIAL_BINARY_MODIFICATION));
+    }
+
+    #[test]
+    fn recursively_audits_apk_accessibility_financial_payloads() {
+        let manifest = utf16le_markers(&[
+            "android.permission.BIND_ACCESSIBILITY_SERVICE",
+            "android.accessibilityservice.AccessibilityService",
+        ]);
+        let dex = b"dex\n035\0com.eg.android.alipaygphone\0Landroid/accessibilityservice/AccessibilityService;\0Landroid/view/accessibility/AccessibilityNodeInfo;\0performAction\0";
+        let native =
+            elf_with_markers(b"--inject /data/user/0/com.tencent.mm/databases/EnMicroMsg.db\0");
+        let apk = module_zip(&[
+            ("AndroidManifest.xml", &manifest),
+            ("classes.dex", dex),
+            ("lib/arm64-v8a/libpayload.so", &native),
+        ]);
+        let module = module_zip(&[("module.prop", b"id=embedded_apk\n"), ("payload.bin", &apk)]);
+
+        let report = scan_zip_bytes(&module, &AuditConfig::default()).unwrap();
+        assert!(rules(&report).contains(&RULE_APK_PRESENT));
+        assert!(rules(&report).contains(&RULE_APK_ACCESSIBILITY_SERVICE));
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_FINANCIAL_ACCESSIBILITY_PAYLOAD
+                && finding.severity == Severity::High
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_FINANCIAL_BINARY_MODIFICATION
+                && finding.path == "payload.bin!/lib/arm64-v8a/libpayload.so"
+                && !finding.provenance.is_empty()
+        }));
+        assert!(report.has_critical());
+    }
+
+    #[test]
+    fn detects_root_accessibility_hijack_install_chain() {
+        let script = br#"#!/system/bin/sh
+PAYLOAD=$MODPATH/payload.apk
+TARGET=com.example.payload
+pm install -r "$PAYLOAD"
+pm grant "$TARGET" android.permission.WRITE_SECURE_SETTINGS
+settings --user 0 put secure enabled_accessibility_services "$TARGET/.ControlService"
+cmd settings put secure accessibility_enabled 1
+"#;
+        let report = scan_file_bytes("customize.sh", script, &AuditConfig::default());
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_APK_INSTALL && finding.severity == Severity::High
+        }));
+        assert!(rules(&report).contains(&RULE_PRIVILEGED_PERMISSION_GRANT));
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_id == RULE_ACCESSIBILITY_HIJACK)
+                .count(),
+            2
+        );
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_ACCESSIBILITY_HIJACK
+                && finding.severity == Severity::Critical
+                && finding.evidence.contains("enabled_accessibility_services")
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_ACCESSIBILITY_HIJACK
+                && finding.severity == Severity::High
+                && finding.evidence.contains("accessibility_enabled")
+        }));
+        assert!(report.has_critical());
+    }
+
+    #[test]
+    fn detects_settings_provider_accessibility_hijack() {
+        let script = b"#!/system/bin/sh\ncontent update --uri content://settings/secure --bind name:s:enabled_accessibility_services --bind value:s:evil/.Service\n";
+        let report = scan_file_bytes("service.sh", script, &AuditConfig::default());
+        assert!(rules(&report).contains(&RULE_ACCESSIBILITY_HIJACK));
+    }
+
+    #[test]
+    fn pm_grant_does_not_claim_ungrantable_signature_permissions() {
+        let script = b"#!/system/bin/sh\npm grant example.app android.permission.BIND_ACCESSIBILITY_SERVICE\npm grant example.app android.permission.MANAGE_DEVICE_ADMINS\npm grant example.app android.permission.GRANT_RUNTIME_PERMISSIONS\n";
+        let report = scan_file_bytes("service.sh", script, &AuditConfig::default());
+        assert!(!rules(&report).contains(&RULE_PRIVILEGED_PERMISSION_GRANT));
+    }
+
+    #[test]
+    fn harmless_apk_and_accessibility_queries_are_not_critical() {
+        let apk = module_zip(&[
+            (
+                "AndroidManifest.xml",
+                b"manifest package=com.example.reader",
+            ),
+            (
+                "classes.dex",
+                b"dex\n035\0AccessibilityService\0performAction\0",
+            ),
+        ]);
+        let module = module_zip(&[
+            ("module.prop", b"id=harmless_apk\n"),
+            (
+                "customize.sh",
+                b"#!/system/bin/sh\npm path com.example.reader\nsettings get secure enabled_accessibility_services\nsettings put secure accessibility_enabled 0\n",
+            ),
+            ("reader.apk", &apk),
+        ]);
+        let report = scan_zip_bytes(&module, &AuditConfig::default()).unwrap();
+        assert!(rules(&report).contains(&RULE_APK_PRESENT));
+        assert!(!rules(&report).contains(&RULE_FINANCIAL_ACCESSIBILITY_PAYLOAD));
+        assert!(!rules(&report).contains(&RULE_ACCESSIBILITY_HIJACK));
+        assert!(!report.has_critical());
+    }
+
+    #[test]
+    fn apk_financial_accessibility_requires_service_and_package_target() {
+        let dex = b"dex\n035\0com.eg.android.alipaygphone\0AccessibilityNodeInfo\0ACTION_CLICK\0";
+        let apk = module_zip(&[
+            (
+                "AndroidManifest.xml",
+                b"manifest package=com.example.regular",
+            ),
+            ("classes.dex", dex),
+        ]);
+        let report = scan_file_bytes("regular.apk", &apk, &AuditConfig::default());
+        assert!(!rules(&report).contains(&RULE_FINANCIAL_ACCESSIBILITY_PAYLOAD));
+
+        let permission_only_manifest =
+            utf16le_markers(&["android.permission.BIND_ACCESSIBILITY_SERVICE"]);
+        let apk = module_zip(&[
+            ("AndroidManifest.xml", &permission_only_manifest),
+            ("classes.dex", dex),
+        ]);
+        let report = scan_file_bytes("permission-only.apk", &apk, &AuditConfig::default());
+        assert!(!rules(&report).contains(&RULE_APK_ACCESSIBILITY_SERVICE));
+        assert!(!rules(&report).contains(&RULE_FINANCIAL_ACCESSIBILITY_PAYLOAD));
+
+        let manifest = utf16le_markers(&[
+            "android.permission.BIND_ACCESSIBILITY_SERVICE",
+            "android.accessibilityservice.AccessibilityService",
+        ]);
+        let donation_dex = b"dex\n035\0Alipay donation\0AccessibilityNodeInfo\0ACTION_CLICK\0";
+        let apk = module_zip(&[
+            ("AndroidManifest.xml", &manifest),
+            ("classes.dex", donation_dex),
+        ]);
+        let report = scan_file_bytes("donation.apk", &apk, &AuditConfig::default());
+        assert!(!rules(&report).contains(&RULE_FINANCIAL_ACCESSIBILITY_PAYLOAD));
+    }
+
+    #[test]
+    fn malformed_embedded_apk_fails_closed() {
+        let report = scan_file_bytes(
+            "payload.apk",
+            b"not an Android application package",
+            &AuditConfig::default(),
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_APK_UNINSPECTABLE)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::High);
+    }
+
+    #[test]
+    fn detects_native_zygisk_hook_targeting_financial_app() {
+        let native =
+            elf_with_markers(b"zygisk_module_entry\0com.eg.android.alipaygphone\0DobbyHook\0");
+        let module = module_zip(&[
+            ("module.prop", b"id=native_zygisk\n"),
+            ("zygisk/arm64-v8a.so", &native),
+        ]);
+        let report = scan_zip_bytes(&module, &AuditConfig::default()).unwrap();
+        assert!(rules(&report).contains(&RULE_ZYGISK_PAYLOAD));
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_FINANCIAL_ZYGISK_INJECTION)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        assert_eq!(finding.path, "zygisk/arm64-v8a.so");
+    }
+
+    #[test]
+    fn detects_zygoteloader_dex_and_packages_financial_target() {
+        let bridge = elf_with_markers(b"zygisk_module_entry\0InMemoryDexClassLoader\0");
+        let dex = b"dex\n035\0Lcom/example/Entry;\0XposedBridge\0hookMethod\0";
+        let module = module_zip(&[
+            (
+                "module.prop",
+                b"id=java_zygisk\nentrypoint=com.example.Entry\nattachNativeLibs=false\n",
+            ),
+            ("classes.dex", dex),
+            ("packages/com.tencent.mm", b""),
+            ("zygisk/arm64-v8a.so", &bridge),
+        ]);
+        let report = scan_zip_bytes(&module, &AuditConfig::default()).unwrap();
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_ZYGISK_PAYLOAD && finding.path == "classes.dex"
+        }));
+        assert!(report.findings.iter().any(|finding| {
+            finding.rule_id == RULE_FINANCIAL_ZYGISK_INJECTION
+                && finding.path == "classes.dex"
+                && finding.evidence.contains("com.tencent.mm")
+        }));
+    }
+
+    #[test]
+    fn benign_zygisk_capability_without_financial_target_is_not_critical() {
+        let bridge = elf_with_markers(b"zygisk_module_entry\0InMemoryDexClassLoader\0");
+        let dex = b"dex\n035\0AccessibilityHook\0XposedBridge\0hookMethod\0";
+        let module = module_zip(&[
+            (
+                "module.prop",
+                b"id=java_zygisk\nentrypoint=com.example.Entry\n",
+            ),
+            ("classes.dex", dex),
+            ("packages/android", b""),
+            ("zygisk/arm64-v8a.so", &bridge),
+        ]);
+        let report = scan_zip_bytes(&module, &AuditConfig::default()).unwrap();
+        assert!(rules(&report).contains(&RULE_ZYGISK_PAYLOAD));
+        assert!(!rules(&report).contains(&RULE_FINANCIAL_ZYGISK_INJECTION));
+        assert!(!report.has_critical());
+    }
+
+    #[test]
+    fn invalid_zygisk_library_is_reported_as_uninspectable() {
+        let module = module_zip(&[
+            ("module.prop", b"id=packed_zygisk\n"),
+            ("zygisk/arm64-v8a.so", b"protected payload"),
+        ]);
+        let report = scan_zip_bytes(&module, &AuditConfig::default()).unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_ZYGISK_UNINSPECTABLE)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::High);
     }
 
     #[test]
@@ -3013,6 +4561,22 @@ mod tests {
     }
 
     #[test]
+    fn binary_verification_and_cleanup_are_not_execution() {
+        let elf = elf_with_markers(b"zygisk_module_entry");
+        let zip = module_zip(&[
+            ("module.prop", b"id=verify_binary\n"),
+            (
+                "customize.sh",
+                b"#!/system/bin/sh\ndo_verify zygisk/arm64-v8a.so deadbeef\nrm -f $MODPATH/zygisk/arm64-v8a.so\n",
+            ),
+            ("zygisk/arm64-v8a.so", &elf),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        assert!(rules(&report).contains(&RULE_BINARY_PRESENT));
+        assert!(!rules(&report).contains(&RULE_BINARY_EXECUTED));
+    }
+
+    #[test]
     fn audits_an_installed_module_directory() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("module.prop"), b"id=installed_scan\n").unwrap();
@@ -3066,5 +4630,59 @@ mod tests {
         );
         assert!(!rules(&report).contains(&RULE_NETWORK));
         assert_eq!(report.required_confirmation_presses(), 0);
+    }
+
+    #[test]
+    fn local_network_tool_operations_are_not_outbound_behavior() {
+        let report = scan_file_bytes(
+            "service.sh",
+            b"#!/system/bin/sh\ngit status\ngit apply local.patch\ncurl --version\ncurl -o copy file:///data/local/tmp/source\n",
+            &AuditConfig::default(),
+        );
+        assert!(!rules(&report).contains(&RULE_NETWORK));
+
+        let report = scan_file_bytes(
+            "service.sh",
+            b"#!/system/bin/sh\ngit fetch origin\ncurl https://example.invalid/payload\n",
+            &AuditConfig::default(),
+        );
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|finding| finding.rule_id == RULE_NETWORK)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn binary_network_requires_structural_client_evidence() {
+        let imports = BTreeSet::from(["connect"]);
+        assert!(network_evidence_from_elf_metadata(&imports, &BTreeSet::new()).is_none());
+
+        let imports = BTreeSet::from(["connect", "getaddrinfo"]);
+        let evidence = network_evidence_from_elf_metadata(&imports, &BTreeSet::new()).unwrap();
+        assert!(evidence.contains("connect"));
+        assert!(evidence.contains("getaddrinfo"));
+
+        let imports = BTreeSet::from(["curl_easy_perform"]);
+        assert!(network_evidence_from_elf_metadata(&imports, &BTreeSet::new()).is_some());
+
+        let libraries = BTreeSet::from(["libcurl.so.4".to_owned()]);
+        assert!(network_evidence_from_elf_metadata(&BTreeSet::new(), &libraries).is_some());
+    }
+
+    #[test]
+    fn binary_network_ignores_incidental_strings_and_relocatable_elf() {
+        let binary = elf_with_markers(
+            b"https://android.googlesource.com/toolchain/llvm-project\0connector connected\0",
+        );
+        let report = scan_file_bytes("bin/tool", &binary, &AuditConfig::default());
+        assert!(!rules(&report).contains(&RULE_BINARY_NETWORK));
+
+        let mut relocatable = binary;
+        relocatable[16..18].copy_from_slice(&goblin::elf::header::ET_REL.to_le_bytes());
+        assert!(binary_network_evidence(&relocatable).is_none());
     }
 }

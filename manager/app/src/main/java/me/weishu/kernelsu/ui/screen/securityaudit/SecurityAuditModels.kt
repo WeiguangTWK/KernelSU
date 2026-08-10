@@ -148,6 +148,10 @@ fun AuditHistory.hasCategory(category: AuditCategory): Boolean =
     }
 
 fun AuditFinding.auditCategory(): AuditCategory = when {
+    ruleId.startsWith("KSU-AUDIT-FIN-") -> AuditCategory.CriticalRisk
+    ruleId.startsWith("KSU-AUDIT-PRIV-") -> AuditCategory.CriticalRisk
+    ruleId.startsWith("KSU-AUDIT-APK-") -> AuditCategory.PrebuiltBinaries
+    ruleId.startsWith("KSU-AUDIT-ZYGISK-") -> AuditCategory.PrebuiltBinaries
     ruleId.startsWith("KSU-AUDIT-PERSIST-") -> AuditCategory.PersistentScripts
     ruleId == "KSU-AUDIT-FS-001" || ruleId == "KSU-AUDIT-FS-003" -> AuditCategory.PartitionWrites
     ruleId == "KSU-AUDIT-FS-002" -> AuditCategory.ExternalFilesystem

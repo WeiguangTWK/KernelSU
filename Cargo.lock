@@ -996,6 +996,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flate2",
+ "goblin",
  "serde",
  "serde_json",
  "sha2 0.10.9",

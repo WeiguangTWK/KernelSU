@@ -100,3 +100,24 @@ fn cli_audits_persistent_startup_script_body() {
             && finding.severity == Severity::Critical
     }));
 }
+
+#[test]
+fn cli_reports_financial_application_modification_as_critical() {
+    let report = run_fixture("financial-modification");
+    assert!(report.findings.iter().any(|finding| {
+        finding.rule_id == "KSU-AUDIT-FIN-001" && finding.severity == Severity::Critical
+    }));
+    assert_eq!(report.required_confirmation_presses(), 2);
+}
+
+#[test]
+fn cli_reports_root_accessibility_hijack_as_critical() {
+    let report = run_fixture("accessibility-hijack");
+    assert!(report.findings.iter().any(|finding| {
+        finding.rule_id == "KSU-AUDIT-PRIV-001" && finding.severity == Severity::Critical
+    }));
+    assert!(report.findings.iter().any(|finding| {
+        finding.rule_id == "KSU-AUDIT-PRIV-002" && finding.severity == Severity::Critical
+    }));
+    assert_eq!(report.required_confirmation_presses(), 2);
+}
