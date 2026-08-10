@@ -11,6 +11,9 @@ serde_json = "1"
 sha2 = "0.10"
 zip = { version = "8", features = ["deflate", "deflate64", "time", "lzma", "xz"], default-features = false }
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "ksu-module-audit"
 path = "src/main.rs"

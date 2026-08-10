@@ -999,6 +999,84 @@ pub fn list_modules() -> Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct InstalledAuditScanResult {
+    module_id: String,
+    success: bool,
+    finding_count: usize,
+    error: Option<String>,
+}
+
+pub fn audit_installed_modules(json: bool) -> Result<()> {
+    let modules_root = Path::new(defs::MODULE_DIR);
+    let mut entries = match std::fs::read_dir(modules_root) {
+        Ok(entries) => entries.flatten().collect::<Vec<_>>(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error).context("read installed module directory"),
+    };
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut results = Vec::new();
+    for entry in entries {
+        if !entry.file_type()?.is_dir() || !entry.path().join("module.prop").is_file() {
+            continue;
+        }
+        let Some(module_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Err(error) = validate_module_id(&module_id) {
+            results.push(InstalledAuditScanResult {
+                module_id,
+                success: false,
+                finding_count: 0,
+                error: Some(format!("{error:#}")),
+            });
+            continue;
+        }
+        if !json {
+            println!("- Auditing installed module {module_id}");
+        }
+        let scan = ksu_module_audit::scan_directory_path(
+            entry.path(),
+            &ksu_module_audit::AuditConfig::default(),
+        );
+        let (finding_count, record) = match scan {
+            Ok(report) if report.module_id.as_deref() == Some(module_id.as_str()) => {
+                (report.findings.len(), Ok(report))
+            }
+            Ok(_) => (
+                0,
+                Err("installed module directory does not match module.prop id".to_owned()),
+            ),
+            Err(error) => (0, Err(format!("{error:#}"))),
+        };
+        let record_error = record.as_ref().err().cloned();
+        let persisted = module_audit_log::record_installed_rescan(
+            Path::new(defs::MODULE_AUDIT_DIR),
+            &module_id,
+            record,
+        );
+        let error = persisted.err().map_or(record_error, |error| {
+            Some(format!("failed to persist rescan: {error:#}"))
+        });
+        results.push(InstalledAuditScanResult {
+            module_id,
+            success: error.is_none(),
+            finding_count,
+            error,
+        });
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        let failed = results.iter().filter(|result| !result.success).count();
+        println!(
+            "- Audited {} installed modules; {failed} failed",
+            results.len()
+        );
+    }
+    Ok(())
+}
+
 /// Get all managed features from active modules
 /// Modules declare managed features via config system (manage.<feature>=true)
 /// Returns: HashMap<ModuleId, Vec<ManagedFeature>>

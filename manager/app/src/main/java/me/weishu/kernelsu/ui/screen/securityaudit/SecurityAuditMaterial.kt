@@ -18,18 +18,25 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Computer
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Language
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -38,6 +45,7 @@ import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -58,18 +66,143 @@ import me.weishu.kernelsu.ui.component.material.TopBarBackButton
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SecurityAuditScreenMaterial(
+fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAuditActions) {
+    AuditScaffoldMaterial(
+        title = stringResource(R.string.security_audit_center),
+        state = state,
+        actions = actions,
+        showRescan = true,
+    ) {
+        item { AuditOverviewMaterial(state, actions.onOpenCategory) }
+        if (state.interruptedInstalls > 0) {
+            item { AuditErrorMaterial(stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls)) }
+        }
+        state.errorMessage?.let { item { AuditErrorMaterial(it) } }
+        if (state.histories.isEmpty() && !state.isLoading) {
+            item { AuditEmptyMaterial() }
+        } else if (state.histories.isNotEmpty()) {
+            item { SectionTitleMaterial(stringResource(R.string.security_audit_modules)) }
+            items(state.histories, key = { it.status.moduleId }) { history ->
+                AuditModuleCardMaterial(history) { actions.onOpenModule(history.status.moduleId) }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SecurityAuditCategoryMaterial(
+    category: AuditCategory,
     state: SecurityAuditUiState,
     actions: SecurityAuditActions,
 ) {
-    val pullState = rememberPullToRefreshState()
-    var expandedModule by remember { mutableStateOf<String?>(null) }
+    val matches = state.histories.filter { it.hasCategory(category) }
+    AuditScaffoldMaterial(
+        title = auditCategoryLabel(category),
+        state = state,
+        actions = actions,
+    ) {
+        state.errorMessage?.let { item { AuditErrorMaterial(it) } }
+        if (matches.isEmpty() && !state.isLoading) {
+            item { AuditEmptyResultMaterial() }
+        } else {
+            item { SectionTitleMaterial(stringResource(R.string.security_audit_hit_modules, matches.size)) }
+            items(matches, key = { it.status.moduleId }) { history ->
+                AuditModuleLinkMaterial(history.status.moduleId) {
+                    actions.onOpenModule(history.status.moduleId)
+                }
+            }
+        }
+    }
+}
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SecurityAuditModuleMaterial(
+    moduleId: String,
+    focusCategory: AuditCategory?,
+    state: SecurityAuditUiState,
+    actions: SecurityAuditActions,
+) {
+    val history = state.histories.firstOrNull { it.status.moduleId == moduleId }
+    val groups = history?.categoryGroups().orEmpty()
+    val focusedFindingCategory = when (focusCategory) {
+        AuditCategory.CriticalRisk -> groups.firstOrNull { group ->
+            group.findings.any { it.severity == "critical" }
+        }?.category
+        else -> focusCategory
+    }
+    val listState = rememberLazyListState()
+    val focusedGroupIndex = groups.indexOfFirst { it.category == focusedFindingCategory }
+    val focusIntegrity = history != null && focusCategory == AuditCategory.CriticalRisk && focusedGroupIndex < 0
+    val targetItemIndex = when {
+        focusIntegrity -> if (state.errorMessage == null) 0 else 1
+        focusedGroupIndex >= 0 -> (if (state.errorMessage == null) 2 else 3) + focusedGroupIndex
+        else -> -1
+    }
+    LaunchedEffect(targetItemIndex, state.isLoading) {
+        if (!state.isLoading && targetItemIndex >= 0) {
+            listState.animateScrollToItem(targetItemIndex)
+        }
+    }
+    AuditScaffoldMaterial(
+        title = history?.displayName() ?: moduleId,
+        state = state,
+        actions = actions,
+        listState = listState,
+    ) {
+        state.errorMessage?.let { item { AuditErrorMaterial(it) } }
+        when {
+            history == null && !state.isLoading -> item { AuditEmptyResultMaterial() }
+            history != null -> {
+                item { AuditIntegrityMaterial(history) }
+                if (groups.isEmpty()) {
+                    item { AuditEmptyResultMaterial() }
+                } else {
+                    item { SectionTitleMaterial(stringResource(R.string.security_audit_findings)) }
+                    items(groups, key = { it.category.key }) { group ->
+                        AuditCategoryDetailsMaterial(
+                            group = group,
+                            initiallyExpanded = focusCategory == null || group.category == focusedFindingCategory,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AuditScaffoldMaterial(
+    title: String,
+    state: SecurityAuditUiState,
+    actions: SecurityAuditActions,
+    showRescan: Boolean = false,
+    listState: LazyListState? = null,
+    content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit,
+) {
+    val pullState = rememberPullToRefreshState()
+    val resolvedListState = listState ?: rememberLazyListState()
     ExpressiveScaffold(
         topBar = {
             TopAppBar(
-                title = { Text(stringResource(R.string.security_audit_center)) },
+                title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { TopBarBackButton(onClick = actions.onBack) },
+                actions = {
+                    if (showRescan) {
+                        IconButton(onClick = actions.onRescan, enabled = !state.isRescanning) {
+                            if (state.isRescanning) {
+                                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(
+                                    Icons.Outlined.Refresh,
+                                    contentDescription = stringResource(R.string.security_audit_rescan),
+                                )
+                            }
+                        }
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
             )
         },
@@ -88,91 +221,40 @@ fun SecurityAuditScreenMaterial(
                 )
             },
         ) {
-            when {
-                state.isLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
-                }
-
-                state.errorMessage != null && state.histories.isEmpty() -> AuditErrorMaterial(
-                    message = state.errorMessage,
-                    modifier = Modifier.align(Alignment.Center),
-                )
-
-                else -> LazyColumn(
+            if (state.isLoading) {
+                CircularProgressIndicator(Modifier.align(Alignment.Center))
+            } else {
+                LazyColumn(
                     modifier = Modifier.fillMaxSize(),
+                    state = resolvedListState,
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, bottom = 24.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    item { AuditOverviewMaterial(state) }
-                    if (state.interruptedInstalls > 0) {
-                        item {
-                            AuditErrorMaterial(
-                                stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls)
-                            )
-                        }
-                    }
-                    state.errorMessage?.let { message ->
-                        item { AuditErrorMaterial(message) }
-                    }
-                    if (state.histories.isEmpty()) {
-                        item { AuditEmptyMaterial() }
-                    } else {
-                        item {
-                            Text(
-                                text = stringResource(R.string.security_audit_modules),
-                                style = MaterialTheme.typography.titleMedium,
-                                modifier = Modifier.padding(top = 4.dp),
-                            )
-                        }
-                        items(state.histories, key = { it.status.moduleId }) { history ->
-                            AuditModuleCardMaterial(
-                                history = history,
-                                expanded = expandedModule == history.status.moduleId,
-                                onClick = {
-                                    expandedModule = if (expandedModule == history.status.moduleId) null
-                                    else history.status.moduleId
-                                },
-                            )
-                        }
-                    }
-                }
+                    content = content,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun AuditOverviewMaterial(state: SecurityAuditUiState) {
+private fun AuditOverviewMaterial(state: SecurityAuditUiState, onOpenCategory: (AuditCategory) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(stringResource(R.string.security_audit_overview), style = MaterialTheme.typography.titleMedium)
+        SectionTitleMaterial(stringResource(R.string.security_audit_overview))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            AuditMetricMaterial(
-                value = state.highRiskModules,
-                label = stringResource(R.string.security_audit_high_risk),
-                icon = Icons.Outlined.Security,
-                alert = state.highRiskModules > 0,
-                modifier = Modifier.weight(1f),
-            )
-            AuditMetricMaterial(
-                value = state.networkModules,
-                label = stringResource(R.string.security_audit_network),
-                icon = Icons.Outlined.Language,
-                modifier = Modifier.weight(1f),
-            )
+            AuditMetricMaterial(state.highRiskModules, stringResource(R.string.security_audit_high_risk), Icons.Outlined.Security, Modifier.weight(1f), state.highRiskModules > 0) {
+                onOpenCategory(AuditCategory.CriticalRisk)
+            }
+            AuditMetricMaterial(state.networkModules, stringResource(R.string.security_audit_network), Icons.Outlined.Language, Modifier.weight(1f)) {
+                onOpenCategory(AuditCategory.Network)
+            }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            AuditMetricMaterial(
-                value = state.binaryModules,
-                label = stringResource(R.string.security_audit_binaries),
-                icon = Icons.Outlined.Computer,
-                modifier = Modifier.weight(1f),
-            )
-            AuditMetricMaterial(
-                value = state.persistentScriptModules,
-                label = stringResource(R.string.security_audit_persistent),
-                icon = Icons.Outlined.Schedule,
-                modifier = Modifier.weight(1f),
-            )
+            AuditMetricMaterial(state.binaryModules, stringResource(R.string.security_audit_binaries), Icons.Outlined.Computer, Modifier.weight(1f)) {
+                onOpenCategory(AuditCategory.PrebuiltBinaries)
+            }
+            AuditMetricMaterial(state.persistentScriptModules, stringResource(R.string.security_audit_persistent), Icons.Outlined.Schedule, Modifier.weight(1f)) {
+                onOpenCategory(AuditCategory.PersistentScripts)
+            }
         }
     }
 }
@@ -182,13 +264,14 @@ private fun AuditMetricMaterial(
     value: Int,
     label: String,
     icon: ImageVector,
-    modifier: Modifier = Modifier,
+    modifier: Modifier,
     alert: Boolean = false,
+    onClick: () -> Unit,
 ) {
     val tint = if (alert) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-    TonalCard(modifier = modifier) {
+    TonalCard(modifier = modifier, onClick = onClick) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(22.dp))
+            Icon(icon, null, tint = tint, modifier = Modifier.size(22.dp))
             Text(value.toString(), style = MaterialTheme.typography.headlineMedium, color = tint)
             Text(label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -196,107 +279,142 @@ private fun AuditMetricMaterial(
 }
 
 @Composable
-private fun AuditModuleCardMaterial(
-    history: AuditHistory,
-    expanded: Boolean,
-    onClick: () -> Unit,
-) {
-    val alert = history.isHighRisk() || history.hasInterruptedInstall()
+private fun AuditModuleCardMaterial(history: AuditHistory, onClick: () -> Unit) {
+    val alert = history.isHighRisk()
+    var expanded by remember(history.status.moduleId) { mutableStateOf(false) }
     TonalCard(
         modifier = Modifier.fillMaxWidth().animateContentSize(),
-        onClick = onClick,
+        onClick = { expanded = !expanded },
         containerColor = if (alert) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.surfaceBright,
     ) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = if (alert) Icons.Filled.Error else Icons.Outlined.Shield,
-                    contentDescription = null,
+                    if (alert) Icons.Filled.Error else Icons.Outlined.Shield,
+                    null,
                     tint = if (alert) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                 )
-                Column(Modifier.padding(start = 12.dp).weight(1f)) {
-                    Text(history.displayName(), style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(
-                        history.packageFingerprint()?.let {
-                            stringResource(R.string.security_audit_package_hash, it)
-                        } ?: history.status.moduleId,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                Icon(Icons.Outlined.ChevronRight, contentDescription = null)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    stringResource(R.string.security_audit_event_count, history.status.eventCount),
-                    style = MaterialTheme.typography.labelMedium,
+                    history.status.moduleId,
+                    modifier = Modifier.padding(start = 12.dp).weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
-                if (history.latestTimestamp() > 0) {
+                Icon(if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null)
+            }
+            AnimatedVisibility(expanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    AuditCategorySummaryMaterial(history)
                     Text(
-                        formatAuditTime(history.latestTimestamp()),
+                        "${stringResource(R.string.security_audit_event_count, history.status.eventCount)} · ${formatAuditTime(history.latestTimestamp())}",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    IconButton(onClick = onClick, modifier = Modifier.align(Alignment.Start)) {
+                        Icon(
+                            Icons.Outlined.Info,
+                            contentDescription = stringResource(R.string.security_audit_view_details),
+                        )
+                    }
                 }
-            }
-            AnimatedVisibility(expanded) {
-                AuditModuleDetailsMaterial(history)
             }
         }
     }
 }
 
 @Composable
-private fun AuditModuleDetailsMaterial(history: AuditHistory) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+private fun AuditModuleLinkMaterial(moduleId: String, onClick: () -> Unit) {
+    TonalCard(Modifier.fillMaxWidth(), onClick = onClick) {
+        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                moduleId,
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Icon(Icons.Outlined.ChevronRight, null)
+        }
+    }
+}
+
+@Composable
+private fun AuditCategorySummaryMaterial(history: AuditHistory) {
+    val groups = history.categoryGroups()
+    if (groups.isEmpty()) {
         Text(
-            stringResource(
-                if (history.status.hmacVerified) R.string.security_audit_hmac_verified
-                else R.string.security_audit_hmac_unverified
-            ),
-            style = MaterialTheme.typography.labelLarge,
-            color = if (history.status.hmacVerified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-        )
-        Text(
-            if (history.status.managerCheckpoint == "not_configured") {
-                stringResource(R.string.security_audit_checkpoint_unavailable)
-            } else {
-                history.status.managerCheckpoint.replace('_', ' ')
-            },
+            stringResource(R.string.security_audit_no_findings),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
-        history.events.asReversed().forEach { event ->
-            Column {
-                Text(auditEventTitle(event), style = MaterialTheme.typography.titleSmall)
-                Text(
-                    "#${event.sequence} · ${formatAuditTime(event.timestampUnixSeconds)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                event.kind.error?.takeIf { it.isNotBlank() }?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                }
-                val findings = event.kind.report?.findings.orEmpty()
-                findings.take(4).forEach { finding ->
-                    Text(
-                        "[${finding.severity.uppercase()}] ${finding.title} · ${finding.path}${finding.line?.let { ":$it" }.orEmpty()}",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                }
-                if (findings.size > 4) {
-                    Text(
-                        stringResource(R.string.security_audit_more_findings, findings.size - 4),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                event.kind.reason?.let {
-                    Text(it, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
-                }
+    } else {
+        groups.forEach { group ->
+            Text(
+                stringResource(R.string.security_audit_category_count, auditCategoryLabel(group.category), group.findings.size),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AuditIntegrityMaterial(history: AuditHistory) {
+    TonalCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                stringResource(if (history.status.hmacVerified) R.string.security_audit_hmac_verified else R.string.security_audit_hmac_unverified),
+                style = MaterialTheme.typography.titleSmall,
+                color = if (history.status.hmacVerified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+            )
+            Text(
+                if (history.status.managerCheckpoint == "not_configured") stringResource(R.string.security_audit_checkpoint_unavailable)
+                else history.status.managerCheckpoint.replace('_', ' '),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            history.packageFingerprint()?.let {
+                Text(stringResource(R.string.security_audit_package_hash, it), style = MaterialTheme.typography.bodySmall)
             }
+        }
+    }
+}
+
+@Composable
+private fun AuditCategoryDetailsMaterial(
+    group: AuditCategoryGroup,
+    initiallyExpanded: Boolean,
+) {
+    var expanded by remember(group.category, initiallyExpanded) { mutableStateOf(initiallyExpanded) }
+    TonalCard(Modifier.fillMaxWidth(), onClick = { expanded = !expanded }) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    stringResource(R.string.security_audit_category_count, auditCategoryLabel(group.category), group.findings.size),
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Icon(if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, null)
+            }
+            if (expanded) group.findings.forEach { AuditFindingMaterial(it) }
+        }
+    }
+}
+
+@Composable
+private fun AuditFindingMaterial(finding: AuditFinding) {
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(finding.title, style = MaterialTheme.typography.titleSmall)
+        Text(
+            finding.path + finding.line?.let { ":$it" }.orEmpty(),
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        if (finding.evidence.isNotBlank()) Text(finding.evidence, style = MaterialTheme.typography.bodySmall)
+        if (finding.provenance.isNotEmpty()) {
+            Text(finding.provenance.joinToString(" → "), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -304,30 +422,39 @@ private fun AuditModuleDetailsMaterial(history: AuditHistory) {
 @Composable
 fun auditEventTitle(event: AuditEvent): String = when (event.kind.type) {
     "install_accepted" -> stringResource(R.string.security_audit_event_accepted)
-    "install_result" -> if (event.kind.outcome == "installed") {
-        stringResource(R.string.security_audit_event_installed)
-    } else {
-        stringResource(R.string.security_audit_event_failed)
-    }
+    "install_result" -> stringResource(if (event.kind.outcome == "installed") R.string.security_audit_event_installed else R.string.security_audit_event_failed)
+    "installed_rescan" -> stringResource(R.string.security_audit_event_rescan)
+    "installed_rescan_failed" -> stringResource(R.string.security_audit_event_rescan_failed)
     "integrity_incident" -> stringResource(R.string.security_audit_event_integrity)
     else -> event.kind.type.replace('_', ' ')
 }
 
 @Composable
-private fun AuditErrorMaterial(message: String, modifier: Modifier = Modifier) {
-    TonalCard(modifier = modifier.fillMaxWidth(), containerColor = MaterialTheme.colorScheme.errorContainer) {
-        Text(message, modifier = Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onErrorContainer)
+private fun SectionTitleMaterial(title: String) {
+    Text(title, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 4.dp))
+}
+
+@Composable
+private fun AuditErrorMaterial(message: String) {
+    TonalCard(Modifier.fillMaxWidth(), containerColor = MaterialTheme.colorScheme.errorContainer) {
+        Text(message, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.onErrorContainer)
     }
 }
 
 @Composable
-private fun AuditEmptyMaterial() {
+private fun AuditEmptyMaterial() = AuditEmptyStateMaterial(stringResource(R.string.security_audit_empty))
+
+@Composable
+private fun AuditEmptyResultMaterial() = AuditEmptyStateMaterial(stringResource(R.string.security_audit_empty_result))
+
+@Composable
+private fun AuditEmptyStateMaterial(message: String) {
     Column(
         modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Icon(Icons.Outlined.Shield, contentDescription = null, modifier = Modifier.size(48.dp))
+        Icon(Icons.Outlined.Shield, null, modifier = Modifier.size(48.dp))
         Spacer(Modifier.height(12.dp))
-        Text(stringResource(R.string.security_audit_empty), style = MaterialTheme.typography.bodyLarge)
+        Text(message, style = MaterialTheme.typography.bodyLarge)
     }
 }

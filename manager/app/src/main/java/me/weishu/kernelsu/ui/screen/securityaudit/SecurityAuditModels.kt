@@ -60,6 +60,7 @@ data class AuditFinding(
 data class SecurityAuditUiState(
     val isLoading: Boolean = true,
     val isRefreshing: Boolean = false,
+    val isRescanning: Boolean = false,
     val histories: List<AuditHistory> = emptyList(),
     val errorMessage: String? = null,
 ) {
@@ -94,6 +95,30 @@ data class SecurityAuditUiState(
         }
 }
 
+enum class AuditCategory(val key: String) {
+    CriticalRisk("critical_risk"),
+    PersistentScripts("persistent_scripts"),
+    ExternalFilesystem("external_filesystem"),
+    PartitionWrites("partition_writes"),
+    DestructiveDeletes("destructive_deletes"),
+    Network("network"),
+    PrebuiltBinaries("prebuilt_binaries"),
+    PackedContent("packed_content"),
+    ModuleScripts("module_scripts"),
+    ArchiveSafety("archive_safety"),
+    ModuleCleanup("module_cleanup"),
+    Other("other");
+
+    companion object {
+        fun fromKey(key: String): AuditCategory = entries.firstOrNull { it.key == key } ?: Other
+    }
+}
+
+data class AuditCategoryGroup(
+    val category: AuditCategory,
+    val findings: List<AuditFinding>,
+)
+
 private fun List<AuditHistory>.countRules(prefix: String): Int = count { history ->
     history.latestReport()?.findings?.any { finding -> finding.ruleId.startsWith(prefix) } == true
 }
@@ -107,7 +132,33 @@ fun AuditHistory.displayName(): String = latestReport()?.moduleId ?: status.modu
 fun AuditHistory.packageFingerprint(): String? = latestReport()?.packageSha256?.take(12)
 
 fun AuditHistory.isHighRisk(): Boolean = status.highRisk || latestFindings().any {
-    it.severity == "high" || it.severity == "critical"
+    it.severity == "critical"
+}
+
+fun AuditHistory.categoryGroups(): List<AuditCategoryGroup> = latestFindings()
+    .groupBy { it.auditCategory() }
+    .map { (category, findings) -> AuditCategoryGroup(category, findings) }
+    .sortedBy { it.category.ordinal }
+
+fun AuditHistory.hasCategory(category: AuditCategory): Boolean =
+    if (category == AuditCategory.CriticalRisk) {
+        isHighRisk()
+    } else {
+        latestFindings().any { it.auditCategory() == category }
+    }
+
+fun AuditFinding.auditCategory(): AuditCategory = when {
+    ruleId.startsWith("KSU-AUDIT-PERSIST-") -> AuditCategory.PersistentScripts
+    ruleId == "KSU-AUDIT-FS-001" || ruleId == "KSU-AUDIT-FS-003" -> AuditCategory.PartitionWrites
+    ruleId == "KSU-AUDIT-FS-002" -> AuditCategory.ExternalFilesystem
+    ruleId == "KSU-AUDIT-FS-010" || ruleId == "KSU-AUDIT-FS-012" -> AuditCategory.DestructiveDeletes
+    ruleId == "KSU-AUDIT-FS-011" -> AuditCategory.ModuleCleanup
+    ruleId.startsWith("KSU-AUDIT-NET-") -> AuditCategory.Network
+    ruleId.startsWith("KSU-AUDIT-BIN-") -> AuditCategory.PrebuiltBinaries
+    ruleId.startsWith("KSU-AUDIT-PACK-") -> AuditCategory.PackedContent
+    ruleId.startsWith("KSU-AUDIT-SCRIPT-") -> AuditCategory.ModuleScripts
+    ruleId.startsWith("KSU-AUDIT-ZIP-") -> AuditCategory.ArchiveSafety
+    else -> AuditCategory.Other
 }
 
 fun parseAuditHistories(raw: String): List<AuditHistory> = JSONArray(raw).mapObjects { history ->

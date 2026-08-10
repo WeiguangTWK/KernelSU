@@ -15,6 +15,7 @@ import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditUiState
 import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
+import me.weishu.kernelsu.ui.util.rescanInstalledModules
 
 class SecurityAuditViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(SecurityAuditUiState())
@@ -28,6 +29,7 @@ class SecurityAuditViewModel : ViewModel() {
                 state.copy(
                     isLoading = state.histories.isEmpty(),
                     isRefreshing = state.histories.isNotEmpty(),
+                    isRescanning = state.isRescanning,
                     errorMessage = null,
                 )
             }
@@ -42,6 +44,7 @@ class SecurityAuditViewModel : ViewModel() {
             }.onSuccess { histories ->
                 _uiState.value = SecurityAuditUiState(
                     isLoading = false,
+                    isRescanning = _uiState.value.isRescanning,
                     histories = histories,
                 )
             }.onFailure { error ->
@@ -54,6 +57,23 @@ class SecurityAuditViewModel : ViewModel() {
                     )
                 }
             }
+        }
+    }
+
+    fun rescanInstalledModules() {
+        if (_uiState.value.isRescanning) return
+        viewModelScope.launch(Dispatchers.IO) {
+            _uiState.update { it.copy(isRescanning = true, errorMessage = null) }
+            runCatching {
+                rescanInstalledModules()
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                _uiState.update {
+                    it.copy(errorMessage = error.message ?: error::class.java.simpleName)
+                }
+            }
+            _uiState.update { it.copy(isRescanning = false) }
+            refresh()
         }
     }
 }

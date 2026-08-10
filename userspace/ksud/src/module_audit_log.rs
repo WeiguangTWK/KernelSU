@@ -32,6 +32,12 @@ pub enum AuditEventKind {
         outcome: InstallOutcome,
         error: Option<String>,
     },
+    InstalledRescan {
+        report: AuditReport,
+    },
+    InstalledRescanFailed {
+        error: String,
+    },
     IntegrityIncident {
         corrupted_from_sequence: u64,
         reason: String,
@@ -237,6 +243,28 @@ pub fn finish_install(
         },
     )?;
     verify_module_unlocked(root, &receipt.module_id, true)
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn record_installed_rescan(
+    root: &Path,
+    module_id: &str,
+    result: std::result::Result<AuditReport, String>,
+) -> Result<ModuleAuditStatus> {
+    let _lock = AuditLock::acquire(root, true)?;
+    validate_module_id(module_id)?;
+    let kind = match result {
+        Ok(report) => {
+            ensure!(
+                report.module_id.as_deref() == Some(module_id),
+                "installed module id does not match module.prop"
+            );
+            AuditEventKind::InstalledRescan { report }
+        }
+        Err(error) => AuditEventKind::InstalledRescanFailed { error },
+    };
+    append_event(root, module_id, kind)?;
+    verify_module_unlocked(root, module_id, true)
 }
 
 pub fn verify_module(root: &Path, module_id: &str, repair: bool) -> Result<ModuleAuditStatus> {
@@ -1115,6 +1143,32 @@ mod tests {
         assert_eq!(payload.modules[0].module_id, "module.alpha");
         assert_eq!(payload.modules[1].module_id, "module.beta");
         assert_eq!(payload.hmac_key_id.len(), 64);
+    }
+
+    #[test]
+    fn installed_rescans_are_appended_to_the_authenticated_history() {
+        let temp = TempDir::new().unwrap();
+        let status =
+            record_installed_rescan(temp.path(), "test.module", Ok(report("test.module", "ab")))
+                .unwrap();
+        assert_eq!(status.event_count, 1);
+
+        let status = record_installed_rescan(
+            temp.path(),
+            "test.module",
+            Err("unable to read service.sh".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(status.event_count, 2);
+        let history = read_module_history(temp.path(), "test.module", false).unwrap();
+        assert!(matches!(
+            history.events[0].kind,
+            AuditEventKind::InstalledRescan { .. }
+        ));
+        assert!(matches!(
+            history.events[1].kind,
+            AuditEventKind::InstalledRescanFailed { .. }
+        ));
     }
 
     #[test]

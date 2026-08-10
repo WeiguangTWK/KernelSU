@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +22,7 @@ const RULE_BINARY_EXECUTED: &str = "KSU-AUDIT-BIN-002";
 const RULE_PACKED_SHELL: &str = "KSU-AUDIT-PACK-001";
 const RULE_UNPACK_LIMIT: &str = "KSU-AUDIT-PACK-002";
 const RULE_UNAUDITABLE_DECODER: &str = "KSU-AUDIT-PACK-003";
+const RULE_UNINSPECTABLE_SYMLINK: &str = "KSU-AUDIT-PACK-004";
 const RULE_PERSISTENT_SCRIPT: &str = "KSU-AUDIT-PERSIST-001";
 const RULE_UNAUDITABLE_PERSISTENT_SCRIPT: &str = "KSU-AUDIT-PERSIST-002";
 const RULE_INVOKED_SCRIPT: &str = "KSU-AUDIT-SCRIPT-001";
@@ -192,6 +193,94 @@ pub fn scan_file_bytes(path: impl Into<String>, bytes: &[u8], config: &AuditConf
     finish_report(sha256_bytes(bytes), None, 1, state)
 }
 
+pub fn scan_directory_path(path: impl AsRef<Path>, config: &AuditConfig) -> Result<AuditReport> {
+    let root = path.as_ref();
+    ensure!(
+        root.is_dir(),
+        "module directory does not exist: {}",
+        root.display()
+    );
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    let mut state = ScanState::default();
+    while let Some(directory) = pending.pop() {
+        let mut entries = std::fs::read_dir(&directory)
+            .with_context(|| format!("read module directory {}", directory.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries.into_iter().rev() {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let target = std::fs::read_link(entry.path())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|error| format!("unreadable target: {error}"));
+                state.findings.push(Finding {
+                    rule_id: RULE_UNINSPECTABLE_SYMLINK.to_owned(),
+                    severity: Severity::High,
+                    path: relative,
+                    line: None,
+                    title: "Symbolic link was not followed".to_owned(),
+                    evidence: target,
+                    provenance: Vec::new(),
+                });
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    files.sort();
+    ensure!(
+        files.len() <= config.max_entries,
+        "module directory contains {} files, limit is {}",
+        files.len(),
+        config.max_entries
+    );
+
+    let mut entries = Vec::new();
+    let mut total_size = 0_usize;
+    let mut snapshot = Sha256::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let declared_size = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+        snapshot.update(relative.as_bytes());
+        snapshot.update([0]);
+        snapshot.update(declared_size.to_le_bytes());
+        total_size = total_size.saturating_add(declared_size);
+        if declared_size > config.max_file_size || total_size > config.max_total_size {
+            state.findings.push(Finding {
+                rule_id: RULE_ARCHIVE_LIMIT.to_owned(),
+                severity: Severity::High,
+                path: relative,
+                line: None,
+                title: "Installed-module analysis limit exceeded".to_owned(),
+                evidence: format!(
+                    "file size {declared_size} bytes; cumulative size {total_size} bytes"
+                ),
+                provenance: Vec::new(),
+            });
+            continue;
+        }
+        let bytes = std::fs::read(&file)
+            .with_context(|| format!("read installed module file {}", file.display()))?;
+        snapshot.update(&bytes);
+        entries.push((relative, bytes));
+    }
+    let package_sha256 = hex_digest(snapshot.finalize().as_slice());
+    Ok(scan_entries(entries, package_sha256, state, config))
+}
+
 pub fn sha256_path(path: impl AsRef<Path>) -> Result<String> {
     let mut file = File::open(path.as_ref())
         .with_context(|| format!("open {} for hashing", path.as_ref().display()))?;
@@ -223,7 +312,6 @@ fn scan_zip_reader<R: Read + Seek>(
 
     let mut entries = Vec::new();
     let mut total_size = 0_usize;
-    let mut module_id = None;
     let mut state = ScanState::default();
 
     for index in 0..archive.len() {
@@ -279,12 +367,22 @@ fn scan_zip_reader<R: Read + Seek>(
             });
             continue;
         }
-        if name == "module.prop" {
-            module_id = parse_module_id(&bytes);
-        }
         entries.push((name, bytes));
     }
 
+    Ok(scan_entries(entries, package_sha256, state, config))
+}
+
+fn scan_entries(
+    entries: Vec<(String, Vec<u8>)>,
+    package_sha256: String,
+    mut state: ScanState,
+    config: &AuditConfig,
+) -> AuditReport {
+    let module_id = entries
+        .iter()
+        .find(|(path, _)| path == "module.prop")
+        .and_then(|(_, bytes)| parse_module_id(bytes));
     let scanned_files = entries.len();
     for (path, bytes) in &entries {
         if is_elf(bytes) {
@@ -307,12 +405,7 @@ fn scan_zip_reader<R: Read + Seek>(
             &mut state,
         );
     }
-    Ok(finish_report(
-        package_sha256,
-        module_id,
-        scanned_files,
-        state,
-    ))
+    finish_report(package_sha256, module_id, scanned_files, state)
 }
 
 fn finish_report(
@@ -2917,6 +3010,51 @@ mod tests {
         let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
         assert!(rules(&report).contains(&RULE_BINARY_PRESENT));
         assert!(rules(&report).contains(&RULE_BINARY_EXECUTED));
+    }
+
+    #[test]
+    fn audits_an_installed_module_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("module.prop"), b"id=installed_scan\n").unwrap();
+        std::fs::create_dir(temp.path().join("scripts")).unwrap();
+        std::fs::write(
+            temp.path().join("service.sh"),
+            b"#!/system/bin/sh\n$MODDIR/scripts/worker\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("scripts/worker"),
+            b"#!/system/bin/sh\ncurl https://example.invalid/ping\n",
+        )
+        .unwrap();
+
+        let report = scan_directory_path(temp.path(), &AuditConfig::default()).unwrap();
+        assert_eq!(report.module_id.as_deref(), Some("installed_scan"));
+        assert_eq!(report.scanned_files, 3);
+        assert!(rules(&report).contains(&RULE_NETWORK));
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.path == "scripts/worker")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_directory_scan_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path().join("module.prop"), b"id=symlink_scan\n").unwrap();
+        std::fs::write(outside.path(), b"curl https://outside.invalid\n").unwrap();
+        symlink(outside.path(), temp.path().join("service.sh")).unwrap();
+
+        let report = scan_directory_path(temp.path(), &AuditConfig::default()).unwrap();
+        assert!(!rules(&report).contains(&RULE_NETWORK));
+        assert!(rules(&report).contains(&RULE_UNINSPECTABLE_SYMLINK));
+        assert_eq!(report.scanned_files, 1);
     }
 
     #[test]

@@ -81,6 +81,17 @@ sealed interface Route : NavKey, Parcelable {
 
     @Parcelize
     @Serializable
+    data class SecurityAuditCategory(val category: String) : Route
+
+    @Parcelize
+    @Serializable
+    data class SecurityAuditModule(
+        val moduleId: String,
+        val focusCategory: String? = null,
+    ) : Route
+
+    @Parcelize
+    @Serializable
     data class Flash(@Serializable(with = FlashItSerializer::class) val flashIt: FlashIt) : Route
 
     @Parcelize

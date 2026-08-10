@@ -304,6 +304,13 @@ enum Module {
     /// Export the canonical payload for a Manager Keystore checkpoint
     AuditCheckpoint,
 
+    /// Rescan every installed module and append authenticated audit events
+    AuditRescan {
+        /// print structured JSON results
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Undo module uninstall mark <id>
     UndoUninstall {
         /// module id
@@ -577,6 +584,7 @@ pub fn run() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&payload)?);
                     Ok(())
                 }
+                Module::AuditRescan { json } => module::audit_installed_modules(json),
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),
                 Module::Uninstall { id } => module::uninstall_module(&id),
                 Module::Enable { id } => module::enable_module(&id),
