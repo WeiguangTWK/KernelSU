@@ -35,6 +35,7 @@ import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -81,7 +82,13 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
             item { AuditErrorMaterial(stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls)) }
         }
         state.checkpointIncident?.let {
-            item { AuditErrorMaterial(stringResource(R.string.security_audit_checkpoint_incident, it)) }
+            item {
+                if (state.recoverableModuleIds.isNotEmpty()) {
+                    AuditRecoveryMaterial(state, actions.onRecover)
+                } else {
+                    AuditErrorMaterial(stringResource(R.string.security_audit_checkpoint_incident, it))
+                }
+            }
         }
         state.errorMessage?.let { item { AuditErrorMaterial(it) } }
         if (state.histories.isEmpty() && !state.isLoading) {
@@ -90,6 +97,38 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
             item { SectionTitleMaterial(stringResource(R.string.security_audit_modules)) }
             items(state.histories, key = { it.status.moduleId }) { history ->
                 AuditModuleCardMaterial(history) { actions.onOpenModule(history.status.moduleId) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuditRecoveryMaterial(state: SecurityAuditUiState, onRecover: () -> Unit) {
+    TonalCard(Modifier.fillMaxWidth(), containerColor = MaterialTheme.colorScheme.errorContainer) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                stringResource(
+                    R.string.security_audit_recovery_available,
+                    state.recoverableModuleIds.joinToString(),
+                ),
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
+            if (!state.recoverySafeMode) {
+                Text(
+                    stringResource(R.string.security_audit_recovery_safe_mode),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onErrorContainer,
+                )
+            }
+            Button(
+                onClick = onRecover,
+                enabled = state.recoverySafeMode && !state.isRecovering,
+            ) {
+                if (state.isRecovering) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                } else {
+                    Text(stringResource(R.string.security_audit_recovery_action))
+                }
             }
         }
     }

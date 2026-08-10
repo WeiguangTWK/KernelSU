@@ -23,6 +23,7 @@ data class SecurityAuditActions(
     val onRefresh: () -> Unit,
     val onRescan: () -> Unit,
     val onPrune: () -> Unit,
+    val onRecover: () -> Unit,
     val onOpenCategory: (AuditCategory) -> Unit,
     val onOpenModule: (String) -> Unit,
 )
@@ -45,6 +46,15 @@ fun SecurityAuditScreen() {
         state.staleModuleIds.joinToString("\n") { "• $it" },
     )
     val pruneConfirm = stringResource(R.string.security_audit_prune_confirm)
+    val recoveryDialog = rememberConfirmDialog(
+        onConfirm = viewModel::recoverCheckpointAfterChainRebuild
+    )
+    val recoveryTitle = stringResource(R.string.security_audit_recovery_title)
+    val recoveryMessage = stringResource(
+        R.string.security_audit_recovery_message,
+        state.recoverableModuleIds.joinToString("\n") { "• $it" },
+    )
+    val recoveryConfirm = stringResource(R.string.security_audit_recovery_confirm)
 
     val actions = SecurityAuditActions(
         onBack = dropUnlessResumed { navigator.pop() },
@@ -55,6 +65,13 @@ fun SecurityAuditScreen() {
                 title = pruneTitle,
                 content = pruneMessage,
                 confirm = pruneConfirm,
+            )
+        },
+        onRecover = {
+            recoveryDialog.showConfirm(
+                title = recoveryTitle,
+                content = recoveryMessage,
+                confirm = recoveryConfirm,
             )
         },
         onOpenCategory = { navigator.push(Route.SecurityAuditCategory(it.key)) },
@@ -78,6 +95,7 @@ fun SecurityAuditCategoryScreen(categoryKey: String) {
         onRefresh = viewModel::refresh,
         onRescan = viewModel::rescanInstalledModules,
         onPrune = {},
+        onRecover = viewModel::recoverCheckpointAfterChainRebuild,
         onOpenCategory = {},
         onOpenModule = { navigator.push(Route.SecurityAuditModule(it, category.key)) },
     )
@@ -99,6 +117,7 @@ fun SecurityAuditModuleScreen(moduleId: String, focusCategoryKey: String? = null
         onRefresh = viewModel::refresh,
         onRescan = viewModel::rescanInstalledModules,
         onPrune = {},
+        onRecover = viewModel::recoverCheckpointAfterChainRebuild,
         onOpenCategory = {},
         onOpenModule = {},
     )

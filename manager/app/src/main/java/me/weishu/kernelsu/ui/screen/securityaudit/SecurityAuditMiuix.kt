@@ -67,6 +67,7 @@ import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.PullToRefresh
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.basic.rememberPullToRefreshState
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -89,7 +90,13 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
             item { AuditMessageCardMiuix(stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls), true) }
         }
         state.checkpointIncident?.let {
-            item { AuditMessageCardMiuix(stringResource(R.string.security_audit_checkpoint_incident, it), true) }
+            item {
+                if (state.recoverableModuleIds.isNotEmpty()) {
+                    AuditRecoveryMiuix(state, actions.onRecover)
+                } else {
+                    AuditMessageCardMiuix(stringResource(R.string.security_audit_checkpoint_incident, it), true)
+                }
+            }
         }
         state.errorMessage?.let { item { AuditMessageCardMiuix(it, true) } }
         if (state.histories.isEmpty() && !state.isLoading) {
@@ -99,6 +106,45 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
             items(state.histories, key = { it.status.moduleId }) { history ->
                 AuditModuleCardMiuix(history) { actions.onOpenModule(history.status.moduleId) }
             }
+        }
+    }
+}
+
+@Composable
+private fun AuditRecoveryMiuix(state: SecurityAuditUiState, onRecover: () -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+        colors = CardDefaults.defaultColors(
+            color = colorScheme.errorContainer,
+            contentColor = colorScheme.onErrorContainer,
+        ),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                stringResource(
+                    R.string.security_audit_recovery_available,
+                    state.recoverableModuleIds.joinToString(),
+                ),
+                fontSize = 14.sp,
+                color = colorScheme.onErrorContainer,
+            )
+            if (!state.recoverySafeMode) {
+                Text(
+                    stringResource(R.string.security_audit_recovery_safe_mode),
+                    fontSize = 12.sp,
+                    color = colorScheme.onErrorContainer,
+                )
+            }
+            TextButton(
+                text = if (state.isRecovering) {
+                    stringResource(R.string.security_audit_recovery_working)
+                } else {
+                    stringResource(R.string.security_audit_recovery_action)
+                },
+                onClick = onRecover,
+                enabled = state.recoverySafeMode && !state.isRecovering,
+            )
         }
     }
 }

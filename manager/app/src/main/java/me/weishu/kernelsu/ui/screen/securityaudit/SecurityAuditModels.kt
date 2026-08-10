@@ -63,17 +63,21 @@ data class SecurityAuditUiState(
     val isRefreshing: Boolean = false,
     val isRescanning: Boolean = false,
     val isPruning: Boolean = false,
+    val isRecovering: Boolean = false,
     val histories: List<AuditHistory> = emptyList(),
     val staleModuleIds: List<String> = emptyList(),
     val checkpointCompromised: Boolean = false,
     val checkpointIncident: String? = null,
+    val recoverableModuleIds: List<String> = emptyList(),
+    val recoverySafeMode: Boolean = false,
     val keyProtection: AuditKeyProtection = AuditKeyProtection.Unavailable,
     val auditAuthorizationReady: Boolean = false,
     val errorMessage: String? = null,
 ) {
     val auditMutationBlocked: Boolean
         get() =
-            checkpointCompromised || !auditAuthorizationReady || isLoading || isRefreshing
+            checkpointCompromised || !auditAuthorizationReady || isLoading || isRefreshing ||
+                isRecovering
 
     val highRiskModules: Int
         get() = histories.count { it.isHighRisk() }

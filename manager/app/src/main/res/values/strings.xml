@@ -81,6 +81,13 @@
     <string name="security_audit_checkpoint_verified">Manager Keystore checkpoint verified</string>
     <string name="security_audit_checkpoint_compromised">Manager Keystore checkpoint verification failed</string>
     <string name="security_audit_checkpoint_incident">Manager checkpoint detected audit record loss or rollback. Rescan and cleanup are disabled until the original records are restored and verified: %1$s</string>
+    <string name="security_audit_recovery_available">An authenticated integrity incident rebuilt the following module audit chains: %1$s</string>
+    <string name="security_audit_recovery_safe_mode">Reboot into KernelSU safe mode before accepting the rebuilt chain.</string>
+    <string name="security_audit_recovery_action">Review and rebuild checkpoint</string>
+    <string name="security_audit_recovery_working">Rebuilding checkpoint…</string>
+    <string name="security_audit_recovery_title">Accept rebuilt audit chain?</string>
+    <string name="security_audit_recovery_message">Only the verified prefix is retained. The damaged suffix remains quarantined, and the module stays permanently marked high risk. This cannot restore lost audit events.\n\n%1$s</string>
+    <string name="security_audit_recovery_confirm">Accept rebuild</string>
     <string name="security_audit_authorization_unavailable">Manager audit authorization is unavailable. Reboot into KernelSU safe mode and reopen Security &amp; Audit Center to recover it.</string>
     <string name="security_audit_authorization_changed">Manager audit authorization key changed. Reboot into KernelSU safe mode and reopen Security &amp; Audit Center to recover it.</string>
     <string name="security_audit_event_accepted">Installation accepted</string>

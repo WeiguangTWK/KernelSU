@@ -42,6 +42,7 @@ data class AuditCheckpointVerification(
     val trust: AuditCheckpointTrust,
     val detail: String? = null,
     val protection: AuditKeyProtection = AuditKeyProtection.Unavailable,
+    val recoverableModules: List<String> = emptyList(),
 )
 
 internal fun validateAuditKeyProtectionTransition(
@@ -64,6 +65,42 @@ internal fun validateAuditKeyProtectionTransition(
     )
 }
 
+internal fun isAuthenticatedAuditChainRebuild(
+    previousHashes: List<String>,
+    currentHashes: List<String>,
+    currentHighRisk: Boolean,
+    hmacVerified: Boolean,
+    eventCount: Long,
+    lastSequence: Long,
+    lastPreviousHash: String,
+    lastKind: String,
+    corruptedFromSequence: Long,
+    reason: String?,
+    quarantine: String?,
+): Boolean {
+    if (!currentHighRisk || !hmacVerified) return false
+    if (eventCount != currentHashes.size.toLong() || lastSequence != eventCount) return false
+    if (lastKind != "integrity_incident" || reason.isNullOrBlank()) return false
+    if (quarantine.isNullOrBlank()) return false
+    val prefixLength = previousHashes
+        .zip(currentHashes)
+        .takeWhile { (oldHash, newHash) -> oldHash == newHash }
+        .size
+    if (prefixLength >= previousHashes.size) return false
+    if (currentHashes.size != prefixLength + 1) return false
+    val expectedSequence = prefixLength.toLong() + 1L
+    if (corruptedFromSequence != 0L && corruptedFromSequence != expectedSequence) return false
+    val expectedPreviousHash = if (prefixLength == 0) {
+        AUDIT_GENESIS_HASH
+    } else {
+        previousHashes[prefixLength - 1]
+    }
+    return lastPreviousHash == expectedPreviousHash
+}
+
+private const val AUDIT_GENESIS_HASH =
+    "0000000000000000000000000000000000000000000000000000000000000000"
+
 class ModuleAuditCheckpointStore(context: Context) {
     private val checkpointFile = AtomicFile(File(context.noBackupFilesDir, CHECKPOINT_FILE_NAME))
     private val softwareKeyFile = AtomicFile(File(context.noBackupFilesDir, SOFTWARE_KEY_FILE_NAME))
@@ -72,7 +109,10 @@ class ModuleAuditCheckpointStore(context: Context) {
     @Volatile
     private var activeProtection = AuditKeyProtection.Unavailable
 
-    fun reconcile(rawPayload: String): AuditCheckpointVerification =
+    fun reconcile(
+        rawPayload: String,
+        rawHistories: String? = null,
+    ): AuditCheckpointVerification =
         runCatching {
             val current = parsePayload(rawPayload)
             check(current.schemaVersion == CHECKPOINT_SCHEMA_VERSION) {
@@ -128,8 +168,13 @@ class ModuleAuditCheckpointStore(context: Context) {
                         return@runCatching compromised("Manager checkpoint signature is invalid")
                     }
                     val previous = parsePayload(envelope.payload)
-                    comparePayloads(previous, current)?.let {
-                        return@runCatching compromised(it)
+                    val transition = analyzePayloadTransition(
+                        previous,
+                        current,
+                        rawHistories?.let(::parseRecoveryEvidence).orEmpty(),
+                    )
+                    transition.error?.let {
+                        return@runCatching compromised(it, transition.recoverableModules)
                     }
                     if (
                         previous != current ||
@@ -167,29 +212,88 @@ class ModuleAuditCheckpointStore(context: Context) {
         }
     }.getOrElse { compromised("Unable to inspect Manager checkpoint: ${it.message ?: detail}") }
 
-    private fun comparePayloads(
+    fun acceptRecoveredChain(
+        rawPayload: String,
+        rawHistories: String,
+    ): AuditCheckpointVerification = runCatching {
+        val current = parsePayload(rawPayload)
+        check(current.schemaVersion == CHECKPOINT_SCHEMA_VERSION) {
+            "Unsupported current audit checkpoint payload schema"
+        }
+        check(current.inventoryHash?.isSha256Hex() == true) {
+            "Current audit checkpoint has no valid inventory hash"
+        }
+        val envelope = parseEnvelope(readEnvelope() ?: error("Manager checkpoint data is missing"))
+        val hasAndroidKey = runCatching {
+            loadKeyStore().containsAlias(KEY_ALIAS)
+        }.getOrDefault(false)
+        check(!(envelope.backend == AuditKeyBackend.SoftwareFile && hasAndroidKey)) {
+            "Manager checkpoint key backend changed while its Keystore key remains"
+        }
+        val signingKey = loadSigningKey(envelope.backend)
+        activeProtection = signingKey.protection
+        envelope.keyId?.let {
+            check(it == signingKey.publicKey.keyId()) {
+                "Manager checkpoint key identity changed"
+            }
+        }
+        validateAuditKeyProtectionTransition(envelope.protection, signingKey.protection)
+        check(verifyEnvelope(envelope, signingKey.publicKey)) {
+            "Manager checkpoint signature is invalid"
+        }
+        val previous = parsePayload(envelope.payload)
+        val transition = analyzePayloadTransition(
+            previous,
+            current,
+            parseRecoveryEvidence(rawHistories),
+        )
+        check(transition.recoverableModules.isNotEmpty()) {
+            transition.error ?: "No authenticated chain rebuild is available"
+        }
+
+        persist(
+            rawPayload,
+            Math.addExact(envelope.generation, 1L),
+            signingKey,
+        )
+        trustedInventoryHash = current.inventoryHash
+        AuditCheckpointVerification(
+            trust = AuditCheckpointTrust.Verified,
+            detail = "Accepted rebuilt audit chains: " +
+                transition.recoverableModules.joinToString(),
+            protection = signingKey.protection,
+        )
+    }.getOrElse { error ->
+        compromised(error.message ?: error::class.java.simpleName)
+    }
+
+    private fun analyzePayloadTransition(
         previous: CheckpointPayload,
         current: CheckpointPayload,
-    ): String? {
+        evidence: Map<String, RecoveryEvidence>,
+    ): PayloadTransition {
         if (
             previous.schemaVersion != current.schemaVersion &&
             !(previous.schemaVersion == LEGACY_CHECKPOINT_SCHEMA_VERSION &&
                 current.schemaVersion == CHECKPOINT_SCHEMA_VERSION)
         ) {
-            return "Audit checkpoint schema changed unexpectedly"
+            return PayloadTransition("Audit checkpoint schema changed unexpectedly")
         }
         if (previous.hmacKeyId != current.hmacKeyId) {
-            return "Audit HMAC key identity changed"
+            return PayloadTransition("Audit HMAC key identity changed")
         }
 
         val currentTombstones = current.tombstones.toSet()
         val missingTombstones = previous.tombstones.filterNot(currentTombstones::contains)
         if (missingTombstones.isNotEmpty()) {
-            return "Authenticated cleanup records disappeared: " +
-                missingTombstones.joinToString { it.moduleId }
+            return PayloadTransition(
+                "Authenticated cleanup records disappeared: " +
+                    missingTombstones.joinToString { it.moduleId }
+            )
         }
 
         val currentModules = current.modules.associateBy(CheckpointModule::moduleId)
+        val recoverableModules = mutableListOf<String>()
         for (oldModule in previous.modules) {
             val newModule = currentModules[oldModule.moduleId]
             if (newModule == null) {
@@ -205,28 +309,78 @@ class ModuleAuditCheckpointStore(context: Context) {
                     }
                 }
                 if (!authorizedCleanup) {
-                    return "Module audit history disappeared: ${oldModule.moduleId}"
+                    return PayloadTransition(
+                        "Module audit history disappeared: ${oldModule.moduleId}"
+                    )
                 }
                 continue
             }
-            if (newModule.sequence < oldModule.sequence) {
-                return "Module audit history was rolled back: ${oldModule.moduleId}"
-            }
             if (oldModule.highRisk && !newModule.highRisk) {
-                return "Module integrity-risk marker disappeared: ${oldModule.moduleId}"
+                return PayloadTransition(
+                    "Module integrity-risk marker disappeared: ${oldModule.moduleId}"
+                )
             }
             if (newModule.sequence == oldModule.sequence) {
                 if (newModule.headHash != oldModule.headHash) {
-                    return "Module audit history was replaced: ${oldModule.moduleId}"
+                    if (isRecoverableRollback(oldModule, newModule, evidence[oldModule.moduleId])) {
+                        recoverableModules += oldModule.moduleId
+                        continue
+                    }
+                    return PayloadTransition(
+                        "Module audit history was replaced: ${oldModule.moduleId}"
+                    )
                 }
                 continue
             }
 
-            if (newModule.eventHashes.hashAt(oldModule.sequence) != oldModule.headHash) {
-                return "Module audit history no longer extends its checkpoint: ${oldModule.moduleId}"
+            if (
+                newModule.sequence > oldModule.sequence &&
+                newModule.eventHashes.hashAt(oldModule.sequence) == oldModule.headHash
+            ) {
+                continue
             }
+            if (isRecoverableRollback(oldModule, newModule, evidence[oldModule.moduleId])) {
+                recoverableModules += oldModule.moduleId
+                continue
+            }
+            return PayloadTransition(
+                if (newModule.sequence < oldModule.sequence) {
+                    "Module audit history was rolled back: ${oldModule.moduleId}"
+                } else {
+                    "Module audit history no longer extends its checkpoint: ${oldModule.moduleId}"
+                }
+            )
         }
-        return null
+        return if (recoverableModules.isEmpty()) {
+            PayloadTransition()
+        } else {
+            PayloadTransition(
+                error = "Module audit history was rebuilt after an integrity failure: " +
+                    recoverableModules.joinToString(),
+                recoverableModules = recoverableModules.sorted(),
+            )
+        }
+    }
+
+    private fun isRecoverableRollback(
+        previous: CheckpointModule,
+        current: CheckpointModule,
+        evidence: RecoveryEvidence?,
+    ): Boolean {
+        if (evidence == null) return false
+        return isAuthenticatedAuditChainRebuild(
+            previousHashes = previous.eventHashes,
+            currentHashes = current.eventHashes,
+            currentHighRisk = current.highRisk,
+            hmacVerified = evidence.hmacVerified,
+            eventCount = evidence.eventCount,
+            lastSequence = evidence.lastSequence,
+            lastPreviousHash = evidence.previousHash,
+            lastKind = evidence.lastKind,
+            corruptedFromSequence = evidence.corruptedFromSequence,
+            reason = evidence.reason,
+            quarantine = evidence.quarantine,
+        )
     }
 
     fun authorizationPublicKeyHex(): String {
@@ -590,6 +744,28 @@ class ModuleAuditCheckpointStore(context: Context) {
         )
     }
 
+    private fun parseRecoveryEvidence(raw: String): Map<String, RecoveryEvidence> {
+        val histories = JSONArray(raw)
+        return (0 until histories.length()).associate { index ->
+            val history = histories.getJSONObject(index)
+            val status = history.getJSONObject("status")
+            val moduleId = status.getString("module_id")
+            val events = history.optJSONArray("events") ?: JSONArray()
+            val lastEvent = events.optJSONObject(events.length() - 1)
+            val kind = lastEvent?.optJSONObject("kind")
+            moduleId to RecoveryEvidence(
+                hmacVerified = status.optBoolean("hmac_verified", false),
+                eventCount = status.optLong("event_count", -1L),
+                lastSequence = lastEvent?.optLong("sequence", -1L) ?: -1L,
+                previousHash = lastEvent?.optString("previous_hash").orEmpty(),
+                lastKind = kind?.optString("type").orEmpty(),
+                corruptedFromSequence = kind?.optLong("corrupted_from_sequence", -1L) ?: -1L,
+                reason = kind?.optString("reason")?.takeIf(String::isNotBlank),
+                quarantine = kind?.optString("quarantine")?.takeIf(String::isNotBlank),
+            )
+        }
+    }
+
     private fun signableBytes(
         schemaVersion: Int,
         generation: Long,
@@ -605,14 +781,34 @@ class ModuleAuditCheckpointStore(context: Context) {
             .toByteArray(StandardCharsets.UTF_8)
     }
 
-    private fun compromised(detail: String): AuditCheckpointVerification {
+    private fun compromised(
+        detail: String,
+        recoverableModules: List<String> = emptyList(),
+    ): AuditCheckpointVerification {
         trustedInventoryHash = null
         return AuditCheckpointVerification(
             trust = AuditCheckpointTrust.Compromised,
             detail = detail,
             protection = activeProtection,
+            recoverableModules = recoverableModules,
         )
     }
+
+    private data class PayloadTransition(
+        val error: String? = null,
+        val recoverableModules: List<String> = emptyList(),
+    )
+
+    private data class RecoveryEvidence(
+        val hmacVerified: Boolean,
+        val eventCount: Long,
+        val lastSequence: Long,
+        val previousHash: String,
+        val lastKind: String,
+        val corruptedFromSequence: Long,
+        val reason: String?,
+        val quarantine: String?,
+    )
 
     private data class CheckpointEnvelope(
         val schemaVersion: Int,

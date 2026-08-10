@@ -63,6 +63,13 @@
     <string name="security_audit_checkpoint_verified">Manager Keystore 检查点验证通过</string>
     <string name="security_audit_checkpoint_compromised">Manager Keystore 检查点验证失败</string>
     <string name="security_audit_checkpoint_incident">Manager 检查点发现审计记录丢失或回滚。恢复原始记录并验证通过前，重新扫描与清理功能已停用：%1$s</string>
+    <string name="security_audit_recovery_available">检测到经过认证的完整性事件已重建以下模块的审计链：%1$s</string>
+    <string name="security_audit_recovery_safe_mode">接受重建链前，请先重启进入 KernelSU 安全模式。</string>
+    <string name="security_audit_recovery_action">检查并重建检查点</string>
+    <string name="security_audit_recovery_working">正在重建检查点…</string>
+    <string name="security_audit_recovery_title">接受重建后的审计链？</string>
+    <string name="security_audit_recovery_message">只会保留验证通过的链前缀；损坏后缀仍留在隔离目录中，模块也会永久保持高风险标记。此操作无法恢复已经丢失的审计事件。\n\n%1$s</string>
+    <string name="security_audit_recovery_confirm">接受重建</string>
     <string name="security_audit_authorization_unavailable">Manager 审计授权暂不可用。请重启进入 KernelSU 安全模式，然后重新打开“安全与审计中心”进行恢复。</string>
     <string name="security_audit_authorization_changed">Manager 审计授权密钥已变化。请重启进入 KernelSU 安全模式，然后重新打开“安全与审计中心”进行恢复。</string>
     <string name="security_audit_event_accepted">用户已允许安装</string>

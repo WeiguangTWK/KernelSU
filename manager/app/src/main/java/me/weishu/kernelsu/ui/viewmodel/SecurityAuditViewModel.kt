@@ -58,11 +58,14 @@ class SecurityAuditViewModel : ViewModel() {
         refreshJob = viewModelScope.launch(Dispatchers.IO) {
             runCatching {
                 val checkpointResult = runCatching { getModuleAuditCheckpoint() }
-                val historyResult = runCatching { parseAuditHistories(getModuleAuditHistories()) }
+                val rawHistoryResult = runCatching { getModuleAuditHistories() }
+                val historyResult = rawHistoryResult.mapCatching(::parseAuditHistories)
                 checkpointResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
                 historyResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
                 val checkpoint = checkpointResult.fold(
-                    onSuccess = checkpointStore::reconcile,
+                    onSuccess = { payload ->
+                        checkpointStore.reconcile(payload, rawHistoryResult.getOrNull())
+                    },
                     onFailure = { error ->
                         checkpointStore.checkpointUnavailable(
                             error.message ?: error::class.java.simpleName
@@ -112,6 +115,7 @@ class SecurityAuditViewModel : ViewModel() {
                     isLoading = false,
                     isRescanning = _uiState.value.isRescanning,
                     isPruning = _uiState.value.isPruning,
+                    isRecovering = _uiState.value.isRecovering,
                     histories = result.histories,
                     staleModuleIds = result.staleModuleIds,
                     checkpointCompromised =
@@ -119,6 +123,8 @@ class SecurityAuditViewModel : ViewModel() {
                     checkpointIncident = result.checkpoint
                         .takeIf { it.trust == AuditCheckpointTrust.Compromised }
                         ?.detail,
+                    recoverableModuleIds = result.checkpoint.recoverableModules,
+                    recoverySafeMode = Natives.isSafeMode,
                     keyProtection = result.checkpoint.protection,
                     auditAuthorizationReady = result.authorizationReady,
                     errorMessage = result.error?.let {
@@ -190,6 +196,53 @@ class SecurityAuditViewModel : ViewModel() {
         checkpointStore.signAuditAuthorization(
             getModuleAuditAuthorizationChallenge(action)
         )
+
+    fun recoverCheckpointAfterChainRebuild() {
+        while (true) {
+            val state = _uiState.value
+            if (
+                state.isRecovering ||
+                state.isRescanning ||
+                state.isPruning ||
+                !state.checkpointCompromised ||
+                state.recoverableModuleIds.isEmpty()
+            ) {
+                return
+            }
+            if (!Natives.isSafeMode) {
+                _uiState.update {
+                    it.copy(errorMessage = ksuApp.getString(R.string.security_audit_recovery_safe_mode))
+                }
+                return
+            }
+            if (
+                _uiState.compareAndSet(
+                    state,
+                    state.copy(isRecovering = true, errorMessage = null),
+                )
+            ) {
+                break
+            }
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val recovery = checkpointStore.acceptRecoveredChain(
+                    getModuleAuditCheckpoint(),
+                    getModuleAuditHistories(),
+                )
+                check(recovery.trust == AuditCheckpointTrust.Verified) {
+                    recovery.detail ?: "Unable to accept rebuilt audit chain"
+                }
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                _uiState.update {
+                    it.copy(errorMessage = error.message ?: error::class.java.simpleName)
+                }
+            }
+            _uiState.update { it.copy(isRecovering = false) }
+            refresh()
+        }
+    }
 
     fun rescanInstalledModules() {
         while (true) {
