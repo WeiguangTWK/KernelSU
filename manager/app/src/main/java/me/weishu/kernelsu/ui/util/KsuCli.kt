@@ -157,11 +157,49 @@ suspend fun getModuleAuditCheckpoint(): String = withContext(Dispatchers.IO) {
     stdout.joinToString("\n").also { check(it.isNotBlank()) }
 }
 
-suspend fun rescanInstalledModules(): String = withContext(Dispatchers.IO) {
+suspend fun getModuleAuditAuthorizationStatus(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-auth status",
+        "Unable to read Manager audit authorization status",
+    )
+}
+
+suspend fun registerModuleAuditAuthorizationKey(
+    publicKeyHex: String,
+    recover: Boolean,
+): String = withContext(Dispatchers.IO) {
+    check(publicKeyHex.length == 130 && publicKeyHex.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization public key"
+    }
+    val operation = if (recover) "recover" else "register"
+    runModuleAuditCommand(
+        "audit-auth $operation --public-key $publicKeyHex",
+        "Unable to register Manager audit authorization key",
+    )
+}
+
+suspend fun getModuleAuditAuthorizationChallenge(action: String): String =
+    withContext(Dispatchers.IO) {
+        check(action == "rescan" || action == "prune") {
+            "Unsupported audit authorization action"
+        }
+        runModuleAuditCommand(
+            "audit-auth challenge $action",
+            "Unable to obtain Manager audit authorization challenge",
+        )
+    }
+
+suspend fun rescanInstalledModules(authorization: String): String = withContext(Dispatchers.IO) {
+    check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization token"
+    }
     val stdout = ArrayList<String>()
     val stderr = ArrayList<String>()
     val result = getRootShell().newJob()
-        .add("${getKsuDaemonPath()} module audit-rescan --json")
+        .add(
+            "${getKsuDaemonPath()} module audit-rescan --json " +
+                "--authorization $authorization"
+        )
         .to(stdout, stderr)
         .exec()
     check(result.isSuccess) {
@@ -183,18 +221,38 @@ suspend fun getStaleModuleAuditHistories(): String = withContext(Dispatchers.IO)
     stdout.joinToString("\n").ifBlank { "[]" }
 }
 
-suspend fun pruneStaleModuleAuditHistories(): String = withContext(Dispatchers.IO) {
+suspend fun pruneStaleModuleAuditHistories(authorization: String): String =
+    withContext(Dispatchers.IO) {
+        check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+            "Invalid Manager audit authorization token"
+        }
+        val stdout = ArrayList<String>()
+        val stderr = ArrayList<String>()
+        val result = getRootShell().newJob()
+            .add(
+                "${getKsuDaemonPath()} module audit-prune --json " +
+                    "--authorization $authorization"
+            )
+            .to(stdout, stderr)
+            .exec()
+        check(result.isSuccess) {
+            stderr.joinToString("\n").ifBlank { "Unable to clear stale module audit histories" }
+        }
+        stdout.joinToString("\n").ifBlank { "[]" }
+    }
+
+private fun runModuleAuditCommand(command: String, fallbackError: String): String {
     val stdout = ArrayList<String>()
     val stderr = ArrayList<String>()
     val result = getRootShell().newJob()
-        .add("${getKsuDaemonPath()} module audit-prune --json")
+        .add("${getKsuDaemonPath()} module $command")
         .to(stdout, stderr)
         .exec()
-    check(result.isSuccess) {
-        stderr.joinToString("\n").ifBlank { "Unable to clear stale module audit histories" }
-    }
-    stdout.joinToString("\n").ifBlank { "[]" }
+    check(result.isSuccess) { stderr.joinToString("\n").ifBlank { fallbackError } }
+    return stdout.joinToString("\n").also { check(it.isNotBlank()) }
 }
+
+private fun Char.isLowerHexDigit(): Boolean = this in '0'..'9' || this in 'a'..'f'
 
 fun getModuleCount(): Int {
     val result = listModules()

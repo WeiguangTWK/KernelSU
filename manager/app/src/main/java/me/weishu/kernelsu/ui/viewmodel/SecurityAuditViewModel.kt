@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import me.weishu.kernelsu.Natives
+import me.weishu.kernelsu.R
 import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.AuditCheckpointTrust
 import me.weishu.kernelsu.security.AuditCheckpointVerification
@@ -21,9 +23,13 @@ import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
 import me.weishu.kernelsu.ui.screen.securityaudit.parseStaleAuditModuleIds
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
 import me.weishu.kernelsu.ui.util.getModuleAuditCheckpoint
+import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationChallenge
+import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationStatus
 import me.weishu.kernelsu.ui.util.getStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
+import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
+import org.json.JSONObject
 
 class SecurityAuditViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(SecurityAuditUiState())
@@ -81,11 +87,25 @@ class SecurityAuditViewModel : ViewModel() {
                     parseStaleAuditModuleIds(getStaleModuleAuditHistories())
                 }
                 staleResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+                val authorizationResult = if (
+                    checkpoint.trust == AuditCheckpointTrust.Initialized ||
+                    checkpoint.trust == AuditCheckpointTrust.Verified
+                ) {
+                    runCatching { ensureAuditAuthorization() }
+                } else {
+                    Result.success(false)
+                }
+                authorizationResult.exceptionOrNull()?.let {
+                    if (it is CancellationException) throw it
+                }
                 AuditLoadResult(
                     histories = histories,
                     staleModuleIds = staleResult.getOrDefault(emptyList()),
                     checkpoint = checkpoint,
-                    error = historyResult.exceptionOrNull() ?: staleResult.exceptionOrNull(),
+                    authorizationReady = authorizationResult.getOrDefault(false),
+                    error = historyResult.exceptionOrNull()
+                        ?: staleResult.exceptionOrNull()
+                        ?: authorizationResult.exceptionOrNull(),
                 )
             }.onSuccess { result ->
                 _uiState.value = SecurityAuditUiState(
@@ -99,6 +119,8 @@ class SecurityAuditViewModel : ViewModel() {
                     checkpointIncident = result.checkpoint
                         .takeIf { it.trust == AuditCheckpointTrust.Compromised }
                         ?.detail,
+                    keyProtection = result.checkpoint.protection,
+                    auditAuthorizationReady = result.authorizationReady,
                     errorMessage = result.error?.let {
                         it.message ?: it::class.java.simpleName
                     },
@@ -120,8 +142,54 @@ class SecurityAuditViewModel : ViewModel() {
         val histories: List<AuditHistory>,
         val staleModuleIds: List<String>,
         val checkpoint: AuditCheckpointVerification,
+        val authorizationReady: Boolean,
         val error: Throwable?,
     )
+
+    private suspend fun ensureAuditAuthorization(): Boolean {
+        val publicKey = checkpointStore.authorizationPublicKeyHex()
+        val ownKeyId = checkpointStore.authorizationKeyId()
+        val statusResult = runCatching {
+            JSONObject(getModuleAuditAuthorizationStatus())
+        }
+        val status = statusResult.getOrNull()
+        val configured = status?.optBoolean("configured", false) == true
+        val registeredKeyId = status?.optString("key_id")?.takeIf(String::isNotBlank)
+
+        if (status != null && !configured) {
+            val registered = JSONObject(
+                registerModuleAuditAuthorizationKey(publicKey, recover = false)
+            )
+            check(registered.optString("key_id") == ownKeyId) {
+                "ksud registered an unexpected Manager audit authorization key"
+            }
+            return true
+        }
+        if (configured && registeredKeyId == ownKeyId) return true
+
+        if (Natives.isSafeMode) {
+            val recovered = JSONObject(
+                registerModuleAuditAuthorizationKey(publicKey, recover = true)
+            )
+            check(recovered.optString("key_id") == ownKeyId) {
+                "ksud recovered an unexpected Manager audit authorization key"
+            }
+            return true
+        }
+
+        statusResult.exceptionOrNull()?.let { cause ->
+            throw IllegalStateException(
+                ksuApp.getString(R.string.security_audit_authorization_unavailable),
+                cause,
+            )
+        }
+        error(ksuApp.getString(R.string.security_audit_authorization_changed))
+    }
+
+    private suspend fun createAuthorization(action: String): String =
+        checkpointStore.signAuditAuthorization(
+            getModuleAuditAuthorizationChallenge(action)
+        )
 
     fun rescanInstalledModules() {
         while (true) {
@@ -144,7 +212,7 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                runInstalledModuleRescan()
+                runInstalledModuleRescan(createAuthorization("rescan"))
             }.onFailure { error ->
                 if (error is CancellationException) throw error
                 _uiState.update {
@@ -178,7 +246,7 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             val result = runCatching {
-                pruneStaleModuleAuditHistories()
+                pruneStaleModuleAuditHistories(createAuthorization("prune"))
             }
             result.onFailure { error ->
                 if (error is CancellationException) throw error

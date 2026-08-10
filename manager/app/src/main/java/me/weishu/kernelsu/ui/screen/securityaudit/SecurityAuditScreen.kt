@@ -8,6 +8,7 @@ import androidx.lifecycle.compose.dropUnlessResumed
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.res.stringResource
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.security.AuditKeyProtection
 import me.weishu.kernelsu.ui.LocalUiMode
 import me.weishu.kernelsu.ui.UiMode
 import me.weishu.kernelsu.ui.component.dialog.rememberConfirmDialog
@@ -132,6 +133,26 @@ fun managerCheckpointLabel(state: String): String = when (state) {
     "keystore_compromised" -> stringResource(R.string.security_audit_checkpoint_compromised)
     else -> stringResource(R.string.security_audit_checkpoint_unavailable)
 }
+
+@Composable
+fun auditKeyProtectionTitle(protection: AuditKeyProtection): String = stringResource(
+    when (protection) {
+        AuditKeyProtection.Hardware -> R.string.security_audit_key_hardware
+        AuditKeyProtection.Degraded -> R.string.security_audit_key_degraded
+        AuditKeyProtection.Emergency -> R.string.security_audit_key_emergency
+        AuditKeyProtection.Unavailable -> R.string.security_audit_key_unavailable
+    }
+)
+
+@Composable
+fun auditKeyProtectionDescription(protection: AuditKeyProtection): String = stringResource(
+    when (protection) {
+        AuditKeyProtection.Hardware -> R.string.security_audit_key_hardware_desc
+        AuditKeyProtection.Degraded -> R.string.security_audit_key_degraded_desc
+        AuditKeyProtection.Emergency -> R.string.security_audit_key_emergency_desc
+        AuditKeyProtection.Unavailable -> R.string.security_audit_key_unavailable_desc
+    }
+)
 
 fun formatAuditTime(timestampUnixSeconds: Long): String = DateFormat
     .getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM)

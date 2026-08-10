@@ -304,11 +304,20 @@ enum Module {
     /// Export the canonical payload for a Manager Keystore checkpoint
     AuditCheckpoint,
 
+    /// Manage Manager-signed authorization for audit mutations
+    AuditAuth {
+        #[command(subcommand)]
+        command: AuditAuth,
+    },
+
     /// Rescan every installed module and append authenticated audit events
     AuditRescan {
         /// print structured JSON results
         #[arg(long)]
         json: bool,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
     },
 
     /// List or clear audit histories whose modules are no longer installed
@@ -322,6 +331,9 @@ enum Module {
         /// print structured JSON results
         #[arg(long)]
         json: bool,
+        /// one-shot Manager authorization token (required unless --dry-run)
+        #[arg(long)]
+        authorization: Option<String>,
     },
 
     /// Undo module uninstall mark <id>
@@ -364,6 +376,32 @@ enum Module {
         internal: Option<String>,
         #[command(subcommand)]
         command: ModuleConfigCmd,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuditAuth {
+    /// Show the registered Manager key and current audit inventory
+    Status,
+    /// Trust the first Manager key for audit mutations
+    Register {
+        /// uncompressed P-256 public key encoded as hexadecimal
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Replace a missing or mismatched Manager key in kernel safe mode
+    Recover {
+        /// uncompressed P-256 public key encoded as hexadecimal
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Create a state-bound challenge for one audit mutation
+    Challenge {
+        /// supported action: rescan or prune
+        action: String,
+        /// optional stale module id for a targeted prune
+        #[arg(long)]
+        id: Option<String>,
     },
 }
 
@@ -597,10 +635,70 @@ pub fn run() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&payload)?);
                     Ok(())
                 }
-                Module::AuditRescan { json } => module::audit_installed_modules(json),
-                Module::AuditPrune { id, dry_run, json } => {
-                    module::prune_module_audit_histories(id.as_deref(), dry_run, json)
+                Module::AuditAuth { command } => {
+                    let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
+                    match command {
+                        AuditAuth::Status => {
+                            let status = crate::module_audit_log::manager_audit_auth_status(root)?;
+                            println!("{}", serde_json::to_string_pretty(&status)?);
+                            Ok(())
+                        }
+                        AuditAuth::Register { public_key } => {
+                            let status = crate::module_audit_log::register_manager_audit_auth_key(
+                                root,
+                                &public_key,
+                                false,
+                            )?;
+                            println!("{}", serde_json::to_string_pretty(&status)?);
+                            Ok(())
+                        }
+                        AuditAuth::Recover { public_key } => {
+                            anyhow::ensure!(
+                                ksucalls::check_kernel_safemode(),
+                                "Manager audit authorization recovery requires KernelSU safe mode"
+                            );
+                            let status = crate::module_audit_log::register_manager_audit_auth_key(
+                                root,
+                                &public_key,
+                                true,
+                            )?;
+                            println!("{}", serde_json::to_string_pretty(&status)?);
+                            Ok(())
+                        }
+                        AuditAuth::Challenge { action, id } => {
+                            let arguments_hash = match action.as_str() {
+                                "rescan" => {
+                                    anyhow::ensure!(id.is_none(), "rescan does not accept --id");
+                                    module::audit_rescan_arguments_hash()?
+                                }
+                                "prune" => module::audit_prune_arguments_hash(id.as_deref())?,
+                                _ => anyhow::bail!("unsupported audit authorization action"),
+                            };
+                            let challenge = crate::module_audit_log::manager_audit_auth_challenge(
+                                root,
+                                &action,
+                                &arguments_hash,
+                            )?;
+                            println!("{}", serde_json::to_string_pretty(&challenge)?);
+                            Ok(())
+                        }
+                    }
                 }
+                Module::AuditRescan {
+                    json,
+                    authorization,
+                } => module::audit_installed_modules(json, &authorization),
+                Module::AuditPrune {
+                    id,
+                    dry_run,
+                    json,
+                    authorization,
+                } => module::prune_module_audit_histories(
+                    id.as_deref(),
+                    dry_run,
+                    json,
+                    authorization.as_deref(),
+                ),
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),
                 Module::Uninstall { id } => module::uninstall_module(&id),
                 Module::Enable { id } => module::enable_module(&id),

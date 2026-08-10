@@ -167,6 +167,8 @@ base {
 }
 
 dependencies {
+    testImplementation(kotlin("test"))
+
     implementation(libs.androidx.activity.compose)
 
     implementation(platform(libs.androidx.compose.bom))

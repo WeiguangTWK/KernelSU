@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail, ensure};
 use ksu_module_audit::AuditReport;
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
@@ -9,8 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: u32 = 1;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+const MANAGER_AUTH_SCHEMA_VERSION: u32 = 1;
 const KEY_FILE: &str = ".hmac-key";
+const MANAGER_AUTH_FILE: &str = "manager-auth.json";
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -179,8 +182,42 @@ pub struct CheckpointPayload {
     pub schema_version: u32,
     pub created_at_unix_seconds: u64,
     pub hmac_key_id: String,
+    pub inventory_hash: String,
     pub modules: Vec<CheckpointModuleHead>,
     pub tombstones: Vec<CheckpointTombstone>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagerAuditAuthStatus {
+    pub configured: bool,
+    pub key_id: Option<String>,
+    pub inventory_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagerAuditAuthChallenge {
+    pub schema_version: u32,
+    pub action: String,
+    pub inventory_hash: String,
+    pub arguments_hash: String,
+    pub key_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ManagerAuditAuthRegistry {
+    schema_version: u32,
+    public_key_hex: String,
+    key_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SignedAuditAuthorization {
+    schema_version: u32,
+    action: String,
+    inventory_hash: String,
+    arguments_hash: String,
+    nonce_hex: String,
+    signature_der_hex: String,
 }
 
 struct VerifiedChain {
@@ -425,7 +462,7 @@ pub fn read_module_history(
         .events
         .into_iter()
         .map(|entry| entry.event)
-        .collect();
+        .collect::<Vec<_>>();
     Ok(ModuleAuditHistory { status, events })
 }
 
@@ -623,7 +660,7 @@ pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
             previous_event_hashes: tombstone.previous_event_hashes,
             had_integrity_incident: tombstone.had_integrity_incident,
         })
-        .collect();
+        .collect::<Vec<CheckpointTombstone>>();
     let modules_dir = root.join("modules");
     let modules = if modules_dir.exists() {
         audit_module_ids(&modules_dir)?
@@ -649,13 +686,247 @@ pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
     } else {
         Vec::new()
     };
+    let hmac_key_id = hex(&Sha256::digest(key));
+    let inventory_hash = checkpoint_inventory_hash(&hmac_key_id, &modules, &tombstones)?;
     Ok(CheckpointPayload {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
         created_at_unix_seconds: now(),
-        hmac_key_id: hex(&Sha256::digest(key)),
+        hmac_key_id,
+        inventory_hash,
         modules,
         tombstones,
     })
+}
+
+fn checkpoint_inventory_hash(
+    hmac_key_id: &str,
+    modules: &[CheckpointModuleHead],
+    tombstones: &[CheckpointTombstone],
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct Inventory<'a> {
+        schema_version: u32,
+        hmac_key_id: &'a str,
+        modules: &'a [CheckpointModuleHead],
+        tombstones: &'a [CheckpointTombstone],
+    }
+
+    let bytes = serde_json::to_vec(&Inventory {
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
+        hmac_key_id,
+        modules,
+        tombstones,
+    })?;
+    Ok(hex(&Sha256::digest(bytes)))
+}
+
+pub fn manager_audit_auth_status(root: &Path) -> Result<ManagerAuditAuthStatus> {
+    let checkpoint = checkpoint_payload(root)?;
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?;
+    Ok(ManagerAuditAuthStatus {
+        configured: registry.is_some(),
+        key_id: registry.map(|registry| registry.key_id),
+        inventory_hash: checkpoint.inventory_hash,
+    })
+}
+
+pub fn register_manager_audit_auth_key(
+    root: &Path,
+    public_key_hex: &str,
+    allow_recovery: bool,
+) -> Result<ManagerAuditAuthStatus> {
+    let public_key = decode_hex(public_key_hex)?;
+    ensure!(
+        public_key.len() == 65 && public_key.first() == Some(&4),
+        "Manager audit authorization key must be an uncompressed P-256 point"
+    );
+    VerifyingKey::from_sec1_bytes(&public_key).context("invalid Manager audit public key")?;
+    let key_id = hex(&Sha256::digest(&public_key));
+
+    let lock = AuditLock::acquire(root, true)?;
+    let hmac_key = load_key(root, true)?;
+    let current = read_manager_auth_registry(root, &hmac_key);
+    match current {
+        Ok(Some(current)) if current.key_id == key_id => {}
+        Ok(Some(_)) | Err(_) => {
+            ensure!(
+                allow_recovery,
+                "Manager audit authorization key mismatch; boot KernelSU safe mode to recover"
+            );
+            write_record(
+                &manager_auth_path(root),
+                ManagerAuditAuthRegistry {
+                    schema_version: MANAGER_AUTH_SCHEMA_VERSION,
+                    public_key_hex: public_key_hex.to_owned(),
+                    key_id,
+                },
+                &hmac_key,
+            )?;
+        }
+        Ok(None) => {
+            write_record(
+                &manager_auth_path(root),
+                ManagerAuditAuthRegistry {
+                    schema_version: MANAGER_AUTH_SCHEMA_VERSION,
+                    public_key_hex: public_key_hex.to_owned(),
+                    key_id,
+                },
+                &hmac_key,
+            )?;
+        }
+    }
+    drop(lock);
+    manager_audit_auth_status(root)
+}
+
+pub fn manager_audit_auth_challenge(
+    root: &Path,
+    action: &str,
+    arguments_hash: &str,
+) -> Result<ManagerAuditAuthChallenge> {
+    validate_authorization_field(action, "action")?;
+    validate_sha256_hex(arguments_hash, "arguments hash")?;
+    let status = manager_audit_auth_status(root)?;
+    let key_id = status
+        .key_id
+        .context("Manager audit authorization key is not configured")?;
+    Ok(ManagerAuditAuthChallenge {
+        schema_version: MANAGER_AUTH_SCHEMA_VERSION,
+        action: action.to_owned(),
+        inventory_hash: status.inventory_hash,
+        arguments_hash: arguments_hash.to_owned(),
+        key_id,
+    })
+}
+
+pub fn verify_manager_audit_authorization(
+    root: &Path,
+    encoded_authorization: &str,
+    expected_action: &str,
+    expected_arguments_hash: &str,
+) -> Result<()> {
+    let token_bytes = decode_hex(encoded_authorization)?;
+    let token: SignedAuditAuthorization =
+        serde_json::from_slice(&token_bytes).context("parse Manager audit authorization")?;
+    ensure!(
+        token.schema_version == MANAGER_AUTH_SCHEMA_VERSION,
+        "unsupported Manager audit authorization schema"
+    );
+    ensure!(
+        token.action == expected_action,
+        "audit authorization action mismatch"
+    );
+    ensure!(
+        token.arguments_hash == expected_arguments_hash,
+        "audit authorization arguments mismatch"
+    );
+    validate_sha256_hex(&token.inventory_hash, "inventory hash")?;
+    validate_sha256_hex(&token.arguments_hash, "arguments hash")?;
+    ensure!(
+        token.nonce_hex.len() == 64 && token.nonce_hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid audit authorization nonce"
+    );
+
+    let checkpoint = checkpoint_payload(root)?;
+    ensure!(
+        token.inventory_hash == checkpoint.inventory_hash,
+        "audit inventory changed after authorization"
+    );
+    let _lock = AuditLock::acquire(root, false)?;
+    let hmac_key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &hmac_key)?
+        .context("Manager audit authorization key is not configured")?;
+    let public_key = decode_hex(&registry.public_key_hex)?;
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(&public_key).context("invalid registered Manager key")?;
+    let signature = Signature::from_der(&decode_hex(&token.signature_der_hex)?)
+        .context("invalid Manager audit authorization signature")?;
+    let message = audit_authorization_message(
+        &token.action,
+        &token.inventory_hash,
+        &token.arguments_hash,
+        &token.nonce_hex,
+    );
+    verifying_key
+        .verify(message.as_bytes(), &signature)
+        .context("Manager audit authorization signature rejected")
+}
+
+fn read_manager_auth_registry(
+    root: &Path,
+    key: &[u8; 32],
+) -> Result<Option<ManagerAuditAuthRegistry>> {
+    let path = manager_auth_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let authenticated: AuthenticatedRecord<ManagerAuditAuthRegistry> = read_json(&path)?;
+    verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+    ensure!(
+        authenticated.record.schema_version == MANAGER_AUTH_SCHEMA_VERSION,
+        "unsupported Manager audit authorization registry schema"
+    );
+    let public_key = decode_hex(&authenticated.record.public_key_hex)?;
+    ensure!(
+        authenticated.record.key_id == hex(&Sha256::digest(&public_key)),
+        "Manager audit authorization key id mismatch"
+    );
+    VerifyingKey::from_sec1_bytes(&public_key).context("invalid registered Manager key")?;
+    Ok(Some(authenticated.record))
+}
+
+fn audit_authorization_message(
+    action: &str,
+    inventory_hash: &str,
+    arguments_hash: &str,
+    nonce_hex: &str,
+) -> String {
+    format!(
+        "kernelsu-audit-authorization-v1\n{action}\n{inventory_hash}\n{arguments_hash}\n{nonce_hex}\n"
+    )
+}
+
+fn validate_authorization_field(value: &str, name: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'-'),
+        "invalid audit authorization {name}"
+    );
+    Ok(())
+}
+
+fn validate_sha256_hex(value: &str, name: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid audit authorization {name}"
+    );
+    Ok(())
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    ensure!(value.len().is_multiple_of(2), "invalid hexadecimal input");
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char)
+                .to_digit(16)
+                .context("invalid hexadecimal input")?;
+            let low = (pair[1] as char)
+                .to_digit(16)
+                .context("invalid hexadecimal input")?;
+            Ok(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
+fn manager_auth_path(root: &Path) -> PathBuf {
+    root.join(MANAGER_AUTH_FILE)
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
@@ -1232,6 +1503,7 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use ksu_module_audit::{Finding, Severity};
+    use p256::ecdsa::{SigningKey, signature::Signer};
     use tempfile::TempDir;
 
     fn report(module_id: &str, package_hash: &str) -> AuditReport {
@@ -1256,6 +1528,43 @@ mod tests {
     fn record(root: &Path, module_id: &str, package_hash: &str) {
         let receipt = begin_install(root, report(module_id, package_hash)).unwrap();
         finish_install(root, receipt, InstallOutcome::Installed, None).unwrap();
+    }
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes((&[seed; 32]).into()).unwrap()
+    }
+
+    fn public_key_hex(signing_key: &SigningKey) -> String {
+        hex(signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes())
+    }
+
+    fn authorization_token(
+        root: &Path,
+        signing_key: &SigningKey,
+        action: &str,
+        arguments_hash: &str,
+    ) -> String {
+        let challenge = manager_audit_auth_challenge(root, action, arguments_hash).unwrap();
+        let nonce_hex = "42".repeat(32);
+        let message = audit_authorization_message(
+            action,
+            &challenge.inventory_hash,
+            arguments_hash,
+            &nonce_hex,
+        );
+        let signature: Signature = signing_key.sign(message.as_bytes());
+        let token = SignedAuditAuthorization {
+            schema_version: MANAGER_AUTH_SCHEMA_VERSION,
+            action: action.to_owned(),
+            inventory_hash: challenge.inventory_hash,
+            arguments_hash: arguments_hash.to_owned(),
+            nonce_hex,
+            signature_der_hex: hex(signature.to_der().as_bytes()),
+        };
+        hex(&serde_json::to_vec(&token).unwrap())
     }
 
     #[test]
@@ -1421,6 +1730,117 @@ mod tests {
             Some(&payload.tombstones[0].previous_head_hash)
         );
         assert_eq!(payload.hmac_key_id.len(), 64);
+        assert_eq!(payload.schema_version, CHECKPOINT_SCHEMA_VERSION);
+        assert_eq!(payload.inventory_hash.len(), 64);
+        assert_eq!(
+            checkpoint_payload(&audit_root).unwrap().inventory_hash,
+            payload.inventory_hash
+        );
+    }
+
+    #[test]
+    fn manager_authorization_is_bound_to_action_arguments_and_inventory() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let key = signing_key(7);
+        let status =
+            register_manager_audit_auth_key(temp.path(), &public_key_hex(&key), false).unwrap();
+        assert!(status.configured);
+        assert_eq!(
+            status.key_id,
+            Some(hex(&Sha256::digest(
+                key.verifying_key().to_encoded_point(false).as_bytes()
+            )))
+        );
+
+        let arguments_hash = "ab".repeat(32);
+        let token = authorization_token(temp.path(), &key, "rescan", &arguments_hash);
+        verify_manager_audit_authorization(temp.path(), &token, "rescan", &arguments_hash).unwrap();
+        assert!(
+            verify_manager_audit_authorization(temp.path(), &token, "prune", &arguments_hash,)
+                .is_err()
+        );
+        assert!(
+            verify_manager_audit_authorization(temp.path(), &token, "rescan", &"cd".repeat(32),)
+                .is_err()
+        );
+
+        record(temp.path(), "test.module", "cd");
+        let error =
+            verify_manager_audit_authorization(temp.path(), &token, "rescan", &arguments_hash)
+                .unwrap_err();
+        assert!(error.to_string().contains("inventory changed"));
+    }
+
+    #[test]
+    fn manager_key_replacement_requires_explicit_recovery() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let first = signing_key(7);
+        let replacement = signing_key(9);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&first), false).unwrap();
+
+        assert!(
+            register_manager_audit_auth_key(temp.path(), &public_key_hex(&replacement), false,)
+                .is_err()
+        );
+        let status =
+            register_manager_audit_auth_key(temp.path(), &public_key_hex(&replacement), true)
+                .unwrap();
+        assert_eq!(
+            status.key_id,
+            Some(hex(&Sha256::digest(
+                replacement
+                    .verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes()
+            )))
+        );
+
+        let arguments_hash = "ef".repeat(32);
+        let stale_token = authorization_token(temp.path(), &first, "rescan", &arguments_hash);
+        assert!(
+            verify_manager_audit_authorization(
+                temp.path(),
+                &stale_token,
+                "rescan",
+                &arguments_hash,
+            )
+            .is_err()
+        );
+        let replacement_token =
+            authorization_token(temp.path(), &replacement, "rescan", &arguments_hash);
+        verify_manager_audit_authorization(
+            temp.path(),
+            &replacement_token,
+            "rescan",
+            &arguments_hash,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn corrupted_manager_registry_can_only_be_replaced_by_recovery() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let first = signing_key(7);
+        let replacement = signing_key(9);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&first), false).unwrap();
+        std::fs::write(manager_auth_path(temp.path()), b"corrupt registry").unwrap();
+
+        assert!(manager_audit_auth_status(temp.path()).is_err());
+        assert!(
+            register_manager_audit_auth_key(temp.path(), &public_key_hex(&replacement), false,)
+                .is_err()
+        );
+        let recovered =
+            register_manager_audit_auth_key(temp.path(), &public_key_hex(&replacement), true)
+                .unwrap();
+        assert!(recovered.configured);
+        assert_eq!(
+            recovered.key_id,
+            manager_audit_auth_status(temp.path()).unwrap().key_id
+        );
     }
 
     #[test]

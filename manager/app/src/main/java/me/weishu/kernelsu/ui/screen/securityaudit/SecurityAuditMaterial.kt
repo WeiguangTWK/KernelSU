@@ -61,6 +61,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.security.AuditKeyProtection
 import me.weishu.kernelsu.ui.component.material.ExpressiveScaffold
 import me.weishu.kernelsu.ui.component.material.TonalCard
 import me.weishu.kernelsu.ui.component.material.TopBarBackButton
@@ -275,6 +276,7 @@ private fun AuditScaffoldMaterial(
 private fun AuditOverviewMaterial(state: SecurityAuditUiState, onOpenCategory: (AuditCategory) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionTitleMaterial(stringResource(R.string.security_audit_overview))
+        AuditKeyProtectionMaterial(state.keyProtection)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AuditMetricMaterial(state.highRiskModules, stringResource(R.string.security_audit_high_risk), Icons.Outlined.Security, Modifier.weight(1f), state.highRiskModules > 0) {
                 onOpenCategory(AuditCategory.CriticalRisk)
@@ -289,6 +291,43 @@ private fun AuditOverviewMaterial(state: SecurityAuditUiState, onOpenCategory: (
             }
             AuditMetricMaterial(state.persistentScriptModules, stringResource(R.string.security_audit_persistent), Icons.Outlined.Schedule, Modifier.weight(1f)) {
                 onOpenCategory(AuditCategory.PersistentScripts)
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuditKeyProtectionMaterial(protection: AuditKeyProtection) {
+    val title = auditKeyProtectionTitle(protection)
+    val description = auditKeyProtectionDescription(protection)
+    val alert = protection == AuditKeyProtection.Emergency ||
+        protection == AuditKeyProtection.Unavailable
+    val containerColor = when (protection) {
+        AuditKeyProtection.Degraded -> MaterialTheme.colorScheme.tertiaryContainer
+        AuditKeyProtection.Emergency,
+        AuditKeyProtection.Unavailable -> MaterialTheme.colorScheme.errorContainer
+        AuditKeyProtection.Hardware -> MaterialTheme.colorScheme.surfaceBright
+    }
+    val tint = when {
+        alert -> MaterialTheme.colorScheme.error
+        protection == AuditKeyProtection.Degraded -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.primary
+    }
+    TonalCard(Modifier.fillMaxWidth(), containerColor = containerColor) {
+        Row(
+            Modifier.padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Outlined.Shield, null, tint = tint, modifier = Modifier.size(26.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(
+                    stringResource(R.string.security_audit_key_protection),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(title, style = MaterialTheme.typography.titleMedium, color = tint)
+                Text(description, style = MaterialTheme.typography.bodySmall)
             }
         }
     }

@@ -12,6 +12,7 @@ use is_executable::is_executable;
 use java_properties::PropertiesIter;
 use log::{debug, error, info, warn};
 use regex_lite::Regex;
+use sha2::Digest;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1007,7 +1008,14 @@ struct InstalledAuditScanResult {
     error: Option<String>,
 }
 
-pub fn audit_installed_modules(json: bool) -> Result<()> {
+pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
+    let arguments_hash = audit_rescan_arguments_hash()?;
+    module_audit_log::verify_manager_audit_authorization(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        authorization,
+        "rescan",
+        &arguments_hash,
+    )?;
     let modules_root = Path::new(defs::MODULE_DIR);
     let mut entries = match std::fs::read_dir(modules_root) {
         Ok(entries) => entries.flatten().collect::<Vec<_>>(),
@@ -1081,6 +1089,7 @@ pub fn prune_module_audit_histories(
     module_id: Option<&str>,
     dry_run: bool,
     json: bool,
+    authorization: Option<&str>,
 ) -> Result<()> {
     if let Some(module_id) = module_id {
         validate_module_id(module_id)?;
@@ -1107,6 +1116,13 @@ pub fn prune_module_audit_histories(
             }
         }
     } else {
+        let arguments_hash = audit_prune_arguments_hash(module_id)?;
+        module_audit_log::verify_manager_audit_authorization(
+            audit_root,
+            authorization.context("Manager authorization is required for audit cleanup")?,
+            "prune",
+            &arguments_hash,
+        )?;
         let pruned = module_audit_log::prune_stale_histories(
             audit_root,
             installed_root,
@@ -1120,6 +1136,57 @@ pub fn prune_module_audit_histories(
         }
     }
     Ok(())
+}
+
+pub fn audit_rescan_arguments_hash() -> Result<String> {
+    audit_operation_arguments_hash("rescan", &installed_module_ids()?)
+}
+
+pub fn audit_prune_arguments_hash(module_id: Option<&str>) -> Result<String> {
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    let installed_root = Path::new(defs::MODULE_DIR);
+    let pending_root = Path::new(defs::MODULE_UPDATE_DIR);
+    let mut targets =
+        module_audit_log::list_stale_histories(audit_root, installed_root, pending_root)?
+            .into_iter()
+            .map(|history| history.module_id)
+            .collect::<Vec<_>>();
+    if let Some(module_id) = module_id {
+        ensure!(
+            targets.iter().any(|candidate| candidate == module_id),
+            "module audit history is not eligible for cleanup"
+        );
+        targets.retain(|candidate| candidate == module_id);
+    }
+    audit_operation_arguments_hash("prune", &targets)
+}
+
+fn installed_module_ids() -> Result<Vec<String>> {
+    let mut module_ids = Vec::new();
+    let entries = match std::fs::read_dir(defs::MODULE_DIR) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(module_ids),
+        Err(error) => return Err(error).context("read installed module directory"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || !entry.path().join("module.prop").is_file() {
+            continue;
+        }
+        let Some(module_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if validate_module_id(&module_id).is_ok() {
+            module_ids.push(module_id);
+        }
+    }
+    module_ids.sort();
+    Ok(module_ids)
+}
+
+fn audit_operation_arguments_hash(action: &str, targets: &[String]) -> Result<String> {
+    let bytes = serde_json::to_vec(&(action, targets))?;
+    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
 }
 
 /// Get all managed features from active modules

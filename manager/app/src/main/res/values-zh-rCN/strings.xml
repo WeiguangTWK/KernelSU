@@ -38,6 +38,15 @@
     <string name="module_repos_source_code">源码</string>
     <string name="security_audit_center">安全与审计中心</string>
     <string name="security_audit_overview">总览</string>
+    <string name="security_audit_key_protection">审计身份保护</string>
+    <string name="security_audit_key_hardware">硬件保护</string>
+    <string name="security_audit_key_hardware_desc">系统报告审计签名密钥由 TEE 或 StrongBox 隔离保护。</string>
+    <string name="security_audit_key_degraded">降级保护</string>
+    <string name="security_audit_key_degraded_desc">Android Keystore 可用，但无法确认硬件隔离；Root 级攻击可能伪造审计授权。</string>
+    <string name="security_audit_key_emergency">应急软件保护</string>
+    <string name="security_audit_key_emergency_desc">建立本审计链时 Android Keystore 不可用。本地回退可维持操作，但无法抵抗 Root。</string>
+    <string name="security_audit_key_unavailable">保护状态不可用</string>
+    <string name="security_audit_key_unavailable_desc">审计身份尚未初始化，或当前无法验证其保护状态。</string>
     <string name="security_audit_modules">已审计模块</string>
     <string name="security_audit_high_risk">高风险</string>
     <string name="security_audit_network">存在外联行为</string>
@@ -54,6 +63,8 @@
     <string name="security_audit_checkpoint_verified">Manager Keystore 检查点验证通过</string>
     <string name="security_audit_checkpoint_compromised">Manager Keystore 检查点验证失败</string>
     <string name="security_audit_checkpoint_incident">Manager 检查点发现审计记录丢失或回滚。恢复原始记录并验证通过前，重新扫描与清理功能已停用：%1$s</string>
+    <string name="security_audit_authorization_unavailable">Manager 审计授权暂不可用。请重启进入 KernelSU 安全模式，然后重新打开“安全与审计中心”进行恢复。</string>
+    <string name="security_audit_authorization_changed">Manager 审计授权密钥已变化。请重启进入 KernelSU 安全模式，然后重新打开“安全与审计中心”进行恢复。</string>
     <string name="security_audit_event_accepted">用户已允许安装</string>
     <string name="security_audit_event_installed">模块安装完成</string>
     <string name="security_audit_event_failed">模块安装失败</string>

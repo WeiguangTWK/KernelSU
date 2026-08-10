@@ -56,6 +56,15 @@
     <string name="module_repos_source_code">Source code</string>
     <string name="security_audit_center">Security &amp; audit center</string>
     <string name="security_audit_overview">Overview</string>
+    <string name="security_audit_key_protection">Audit identity protection</string>
+    <string name="security_audit_key_hardware">Hardware protection</string>
+    <string name="security_audit_key_hardware_desc">The system reports that the audit signing key is isolated by TEE or StrongBox.</string>
+    <string name="security_audit_key_degraded">Degraded protection</string>
+    <string name="security_audit_key_degraded_desc">Android Keystore is available, but hardware isolation could not be confirmed. Root-level compromise may forge audit authorization.</string>
+    <string name="security_audit_key_emergency">Emergency software protection</string>
+    <string name="security_audit_key_emergency_desc">Android Keystore was unavailable when this audit chain was created. The local fallback preserves access but does not resist Root.</string>
+    <string name="security_audit_key_unavailable">Protection unavailable</string>
+    <string name="security_audit_key_unavailable_desc">The audit identity has not been initialized or its protection state cannot be verified.</string>
     <string name="security_audit_modules">Audited modules</string>
     <string name="security_audit_high_risk">High risk</string>
     <string name="security_audit_network">Network access</string>
@@ -72,6 +81,8 @@
     <string name="security_audit_checkpoint_verified">Manager Keystore checkpoint verified</string>
     <string name="security_audit_checkpoint_compromised">Manager Keystore checkpoint verification failed</string>
     <string name="security_audit_checkpoint_incident">Manager checkpoint detected audit record loss or rollback. Rescan and cleanup are disabled until the original records are restored and verified: %1$s</string>
+    <string name="security_audit_authorization_unavailable">Manager audit authorization is unavailable. Reboot into KernelSU safe mode and reopen Security &amp; Audit Center to recover it.</string>
+    <string name="security_audit_authorization_changed">Manager audit authorization key changed. Reboot into KernelSU safe mode and reopen Security &amp; Audit Center to recover it.</string>
     <string name="security_audit_event_accepted">Installation accepted</string>
     <string name="security_audit_event_installed">Installation completed</string>
     <string name="security_audit_event_failed">Installation failed</string>

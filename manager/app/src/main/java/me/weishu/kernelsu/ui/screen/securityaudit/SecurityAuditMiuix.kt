@@ -58,7 +58,9 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.security.AuditKeyProtection
 import top.yukonga.miuix.kmp.basic.Card
+import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.CircularProgressIndicator
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
@@ -283,6 +285,7 @@ private fun AuditBackButtonMiuix(onClick: () -> Unit) {
 private fun AuditOverviewMiuix(state: SecurityAuditUiState, onOpenCategory: (AuditCategory) -> Unit) {
     Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionTitleMiuix(stringResource(R.string.security_audit_overview), horizontalPadding = 12)
+        AuditKeyProtectionMiuix(state.keyProtection)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AuditMetricMiuix(state.highRiskModules, stringResource(R.string.security_audit_high_risk), Icons.Outlined.Security, state.highRiskModules > 0, Modifier.weight(1f)) { onOpenCategory(AuditCategory.CriticalRisk) }
             AuditMetricMiuix(state.networkModules, stringResource(R.string.security_audit_network), Icons.Outlined.Language, false, Modifier.weight(1f)) { onOpenCategory(AuditCategory.Network) }
@@ -290,6 +293,58 @@ private fun AuditOverviewMiuix(state: SecurityAuditUiState, onOpenCategory: (Aud
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AuditMetricMiuix(state.binaryModules, stringResource(R.string.security_audit_binaries), Icons.Outlined.Computer, false, Modifier.weight(1f)) { onOpenCategory(AuditCategory.PrebuiltBinaries) }
             AuditMetricMiuix(state.persistentScriptModules, stringResource(R.string.security_audit_persistent), Icons.Outlined.Schedule, false, Modifier.weight(1f)) { onOpenCategory(AuditCategory.PersistentScripts) }
+        }
+    }
+}
+
+@Composable
+private fun AuditKeyProtectionMiuix(protection: AuditKeyProtection) {
+    val alert = protection == AuditKeyProtection.Emergency ||
+        protection == AuditKeyProtection.Unavailable
+    val containerColor = when (protection) {
+        AuditKeyProtection.Degraded -> colorScheme.tertiaryContainer
+        AuditKeyProtection.Emergency,
+        AuditKeyProtection.Unavailable -> colorScheme.errorContainer
+        AuditKeyProtection.Hardware -> colorScheme.surface
+    }
+    val contentColor = when (protection) {
+        AuditKeyProtection.Degraded -> colorScheme.onTertiaryContainer
+        AuditKeyProtection.Emergency,
+        AuditKeyProtection.Unavailable -> colorScheme.onErrorContainer
+        AuditKeyProtection.Hardware -> colorScheme.onSurface
+    }
+    val tint = if (alert) colorScheme.error else colorScheme.primary
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        insideMargin = PaddingValues(16.dp),
+        colors = CardDefaults.defaultColors(
+            color = containerColor,
+            contentColor = contentColor,
+        ),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Outlined.Shield, null, tint = tint, modifier = Modifier.size(26.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(
+                    stringResource(R.string.security_audit_key_protection),
+                    fontSize = 12.sp,
+                    color = contentColor,
+                )
+                Text(
+                    auditKeyProtectionTitle(protection),
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = tint,
+                )
+                Text(
+                    auditKeyProtectionDescription(protection),
+                    fontSize = 12.sp,
+                    color = contentColor,
+                )
+            }
         }
     }
 }

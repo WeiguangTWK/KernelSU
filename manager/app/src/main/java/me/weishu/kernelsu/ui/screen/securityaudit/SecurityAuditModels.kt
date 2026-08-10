@@ -1,5 +1,6 @@
 package me.weishu.kernelsu.ui.screen.securityaudit
 
+import me.weishu.kernelsu.security.AuditKeyProtection
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -66,10 +67,13 @@ data class SecurityAuditUiState(
     val staleModuleIds: List<String> = emptyList(),
     val checkpointCompromised: Boolean = false,
     val checkpointIncident: String? = null,
+    val keyProtection: AuditKeyProtection = AuditKeyProtection.Unavailable,
+    val auditAuthorizationReady: Boolean = false,
     val errorMessage: String? = null,
 ) {
     val auditMutationBlocked: Boolean
-        get() = checkpointCompromised || isLoading || isRefreshing
+        get() =
+            checkpointCompromised || !auditAuthorizationReady || isLoading || isRefreshing
 
     val highRiskModules: Int
         get() = histories.count { it.isHighRisk() }
