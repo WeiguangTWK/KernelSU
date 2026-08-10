@@ -131,6 +131,19 @@ fun listModules(): String {
     return out.joinToString("\n").ifBlank { "[]" }
 }
 
+suspend fun getModuleAuditHistories(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} module audit-history --json")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read module audit history" }
+    }
+    stdout.joinToString("\n").ifBlank { "[]" }
+}
+
 fun getModuleCount(): Int {
     val result = listModules()
     runCatching {

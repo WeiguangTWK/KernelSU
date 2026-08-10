@@ -63,6 +63,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -359,14 +360,21 @@ fun ModulePagerMiuix(
                             )
                         },
                         navigationIcon = {
-                            IconButton(
-                                onClick = actions.onOpenRepo,
-                            ) {
-                                Icon(
-                                    imageVector = MiuixIcons.Download,
-                                    tint = colorScheme.onSurface,
-                                    contentDescription = null
-                                )
+                            Row {
+                                IconButton(onClick = actions.onOpenSecurityAudit) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Shield,
+                                        tint = colorScheme.onSurface,
+                                        contentDescription = stringResource(R.string.security_audit_center),
+                                    )
+                                }
+                                IconButton(onClick = actions.onOpenRepo) {
+                                    Icon(
+                                        imageVector = MiuixIcons.Download,
+                                        tint = colorScheme.onSurface,
+                                        contentDescription = stringResource(R.string.module_repos),
+                                    )
+                                }
                             }
                         },
                         scrollBehavior = scrollBehavior,

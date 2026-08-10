@@ -63,6 +63,7 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonColors
 import androidx.compose.material3.ButtonDefaults
@@ -282,13 +283,19 @@ fun ModulePagerMaterial(
                 onClearClick = actions.onClearSearch,
                 snackbarHostState = snackBarHost,
                 navigationIcon = {
-                    IconButton(
-                        onClick = { actions.onOpenRepo() }
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Cloud,
-                            contentDescription = stringResource(id = R.string.module_repos)
-                        )
+                    Row {
+                        IconButton(onClick = actions.onOpenSecurityAudit) {
+                            Icon(
+                                imageVector = Icons.Outlined.Shield,
+                                contentDescription = stringResource(R.string.security_audit_center),
+                            )
+                        }
+                        IconButton(onClick = actions.onOpenRepo) {
+                            Icon(
+                                imageVector = Icons.Outlined.Cloud,
+                                contentDescription = stringResource(id = R.string.module_repos)
+                            )
+                        }
                     }
                 },
                 actions = {

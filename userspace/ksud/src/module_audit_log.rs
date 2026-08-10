@@ -310,6 +310,9 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
 }
 
 pub fn list_modules(root: &Path, repair: bool) -> Result<Vec<ModuleAuditStatus>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
     load_key(root, false)?;
     let modules_dir = root.join("modules");
     if !modules_dir.exists() {
@@ -1164,6 +1167,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         assert!(!temp.path().join(KEY_FILE).exists());
         assert!(!temp.path().join("modules").exists());
+    }
+
+    #[test]
+    fn uninitialized_store_lists_as_empty_without_creating_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("audit");
+
+        assert!(list_histories(&root, true).unwrap().is_empty());
+        assert!(!root.exists());
     }
 
     #[test]
