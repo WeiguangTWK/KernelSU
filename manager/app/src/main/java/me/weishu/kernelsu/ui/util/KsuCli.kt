@@ -144,6 +144,19 @@ suspend fun getModuleAuditHistories(): String = withContext(Dispatchers.IO) {
     stdout.joinToString("\n").ifBlank { "[]" }
 }
 
+suspend fun getModuleAuditCheckpoint(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} module audit-checkpoint")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read module audit checkpoint" }
+    }
+    stdout.joinToString("\n").also { check(it.isNotBlank()) }
+}
+
 suspend fun rescanInstalledModules(): String = withContext(Dispatchers.IO) {
     val stdout = ArrayList<String>()
     val stderr = ArrayList<String>()

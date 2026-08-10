@@ -79,6 +79,9 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
         if (state.interruptedInstalls > 0) {
             item { AuditErrorMaterial(stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls)) }
         }
+        state.checkpointIncident?.let {
+            item { AuditErrorMaterial(stringResource(R.string.security_audit_checkpoint_incident, it)) }
+        }
         state.errorMessage?.let { item { AuditErrorMaterial(it) } }
         if (state.histories.isEmpty() && !state.isLoading) {
             item { AuditEmptyMaterial() }
@@ -104,6 +107,9 @@ fun SecurityAuditCategoryMaterial(
         state = state,
         actions = actions,
     ) {
+        state.checkpointIncident?.let {
+            item { AuditErrorMaterial(stringResource(R.string.security_audit_checkpoint_incident, it)) }
+        }
         state.errorMessage?.let { item { AuditErrorMaterial(it) } }
         if (matches.isEmpty() && !state.isLoading) {
             item { AuditEmptyResultMaterial() }
@@ -137,9 +143,10 @@ fun SecurityAuditModuleMaterial(
     val listState = rememberLazyListState()
     val focusedGroupIndex = groups.indexOfFirst { it.category == focusedFindingCategory }
     val focusIntegrity = history != null && focusCategory == AuditCategory.CriticalRisk && focusedGroupIndex < 0
+    val messageCount = listOf(state.checkpointIncident, state.errorMessage).count { it != null }
     val targetItemIndex = when {
-        focusIntegrity -> if (state.errorMessage == null) 0 else 1
-        focusedGroupIndex >= 0 -> (if (state.errorMessage == null) 2 else 3) + focusedGroupIndex
+        focusIntegrity -> messageCount
+        focusedGroupIndex >= 0 -> messageCount + 2 + focusedGroupIndex
         else -> -1
     }
     LaunchedEffect(targetItemIndex, state.isLoading) {
@@ -153,6 +160,9 @@ fun SecurityAuditModuleMaterial(
         actions = actions,
         listState = listState,
     ) {
+        state.checkpointIncident?.let {
+            item { AuditErrorMaterial(stringResource(R.string.security_audit_checkpoint_incident, it)) }
+        }
         state.errorMessage?.let { item { AuditErrorMaterial(it) } }
         when {
             history == null && !state.isLoading -> item { AuditEmptyResultMaterial() }
@@ -196,7 +206,9 @@ private fun AuditScaffoldMaterial(
                     if (showPrune && state.staleModuleIds.isNotEmpty()) {
                         IconButton(
                             onClick = actions.onPrune,
-                            enabled = !state.isPruning && !state.isRescanning,
+                            enabled = !state.isPruning &&
+                                !state.isRescanning &&
+                                !state.auditMutationBlocked,
                         ) {
                             if (state.isPruning) {
                                 CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
@@ -211,7 +223,9 @@ private fun AuditScaffoldMaterial(
                     if (showRescan) {
                         IconButton(
                             onClick = actions.onRescan,
-                            enabled = !state.isRescanning && !state.isPruning,
+                            enabled = !state.isRescanning &&
+                                !state.isPruning &&
+                                !state.auditMutationBlocked,
                         ) {
                             if (state.isRescanning) {
                                 CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
@@ -390,8 +404,7 @@ private fun AuditIntegrityMaterial(history: AuditHistory) {
                 color = if (history.status.hmacVerified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
             )
             Text(
-                if (history.status.managerCheckpoint == "not_configured") stringResource(R.string.security_audit_checkpoint_unavailable)
-                else history.status.managerCheckpoint.replace('_', ' '),
+                managerCheckpointLabel(history.status.managerCheckpoint),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -68,6 +68,10 @@
     <string name="security_audit_hmac_verified">Local audit chain verified</string>
     <string name="security_audit_hmac_unverified">Local audit chain is not verified</string>
     <string name="security_audit_checkpoint_unavailable">Manager Keystore checkpoint is not configured</string>
+    <string name="security_audit_checkpoint_initialized">Manager Keystore checkpoint initialized</string>
+    <string name="security_audit_checkpoint_verified">Manager Keystore checkpoint verified</string>
+    <string name="security_audit_checkpoint_compromised">Manager Keystore checkpoint verification failed</string>
+    <string name="security_audit_checkpoint_incident">Manager checkpoint detected audit record loss or rollback. Rescan and cleanup are disabled until the original records are restored and verified: %1$s</string>
     <string name="security_audit_event_accepted">Installation accepted</string>
     <string name="security_audit_event_installed">Installation completed</string>
     <string name="security_audit_event_failed">Installation failed</string>

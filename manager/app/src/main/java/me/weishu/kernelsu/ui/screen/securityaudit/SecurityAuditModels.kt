@@ -64,8 +64,13 @@ data class SecurityAuditUiState(
     val isPruning: Boolean = false,
     val histories: List<AuditHistory> = emptyList(),
     val staleModuleIds: List<String> = emptyList(),
+    val checkpointCompromised: Boolean = false,
+    val checkpointIncident: String? = null,
     val errorMessage: String? = null,
 ) {
+    val auditMutationBlocked: Boolean
+        get() = checkpointCompromised || isLoading || isRefreshing
+
     val highRiskModules: Int
         get() = histories.count { it.isHighRisk() }
 

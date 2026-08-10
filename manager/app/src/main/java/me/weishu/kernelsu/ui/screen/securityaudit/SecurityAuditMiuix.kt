@@ -86,6 +86,9 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
         if (state.interruptedInstalls > 0) {
             item { AuditMessageCardMiuix(stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls), true) }
         }
+        state.checkpointIncident?.let {
+            item { AuditMessageCardMiuix(stringResource(R.string.security_audit_checkpoint_incident, it), true) }
+        }
         state.errorMessage?.let { item { AuditMessageCardMiuix(it, true) } }
         if (state.histories.isEmpty() && !state.isLoading) {
             item { AuditEmptyMiuix(stringResource(R.string.security_audit_empty)) }
@@ -102,6 +105,9 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
 fun SecurityAuditCategoryMiuix(category: AuditCategory, state: SecurityAuditUiState, actions: SecurityAuditActions) {
     val matches = state.histories.filter { it.hasCategory(category) }
     AuditScaffoldMiuix(auditCategoryLabel(category), state, actions) {
+        state.checkpointIncident?.let {
+            item { AuditMessageCardMiuix(stringResource(R.string.security_audit_checkpoint_incident, it), true) }
+        }
         state.errorMessage?.let { item { AuditMessageCardMiuix(it, true) } }
         if (matches.isEmpty() && !state.isLoading) {
             item { AuditEmptyMiuix(stringResource(R.string.security_audit_empty_result)) }
@@ -134,9 +140,10 @@ fun SecurityAuditModuleMiuix(
     val listState = rememberLazyListState()
     val focusedGroupIndex = groups.indexOfFirst { it.category == focusedFindingCategory }
     val focusIntegrity = history != null && focusCategory == AuditCategory.CriticalRisk && focusedGroupIndex < 0
+    val messageCount = listOf(state.checkpointIncident, state.errorMessage).count { it != null }
     val targetItemIndex = when {
-        focusIntegrity -> if (state.errorMessage == null) 0 else 1
-        focusedGroupIndex >= 0 -> (if (state.errorMessage == null) 2 else 3) + focusedGroupIndex
+        focusIntegrity -> messageCount
+        focusedGroupIndex >= 0 -> messageCount + 2 + focusedGroupIndex
         else -> -1
     }
     LaunchedEffect(targetItemIndex, state.isLoading) {
@@ -150,6 +157,9 @@ fun SecurityAuditModuleMiuix(
         actions = actions,
         listState = listState,
     ) {
+        state.checkpointIncident?.let {
+            item { AuditMessageCardMiuix(stringResource(R.string.security_audit_checkpoint_incident, it), true) }
+        }
         state.errorMessage?.let { item { AuditMessageCardMiuix(it, true) } }
         when {
             history == null && !state.isLoading -> item { AuditEmptyMiuix(stringResource(R.string.security_audit_empty_result)) }
@@ -198,7 +208,9 @@ private fun AuditScaffoldMiuix(
                     if (showPrune && state.staleModuleIds.isNotEmpty()) {
                         IconButton(
                             onClick = actions.onPrune,
-                            enabled = !state.isPruning && !state.isRescanning,
+                            enabled = !state.isPruning &&
+                                !state.isRescanning &&
+                                !state.auditMutationBlocked,
                         ) {
                             if (state.isPruning) {
                                 CircularProgressIndicator(Modifier.size(22.dp))
@@ -213,7 +225,9 @@ private fun AuditScaffoldMiuix(
                     if (showRescan) {
                         IconButton(
                             onClick = actions.onRescan,
-                            enabled = !state.isRescanning && !state.isPruning,
+                            enabled = !state.isRescanning &&
+                                !state.isPruning &&
+                                !state.auditMutationBlocked,
                         ) {
                             if (state.isRescanning) {
                                 CircularProgressIndicator(Modifier.size(22.dp))
@@ -393,8 +407,7 @@ private fun AuditIntegrityMiuix(history: AuditHistory) {
                 color = if (history.status.hmacVerified) colorScheme.primary else colorScheme.error,
             )
             Text(
-                if (history.status.managerCheckpoint == "not_configured") stringResource(R.string.security_audit_checkpoint_unavailable)
-                else history.status.managerCheckpoint.replace('_', ' '),
+                managerCheckpointLabel(history.status.managerCheckpoint),
                 fontSize = 12.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )

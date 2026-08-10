@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: u32 = 1;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 const KEY_FILE: &str = ".hmac-key";
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -93,6 +94,8 @@ struct PrunedHistoryTombstone {
     cleared_at_unix_seconds: u64,
     previous_event_count: usize,
     previous_head_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    previous_event_hashes: Vec<String>,
     had_integrity_incident: bool,
     reason: String,
 }
@@ -155,7 +158,18 @@ pub struct CheckpointModuleHead {
     pub module_id: String,
     pub sequence: u64,
     pub head_hash: String,
+    pub event_hashes: Vec<String>,
     pub high_risk: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckpointTombstone {
+    pub module_id: String,
+    pub cleared_at_unix_seconds: u64,
+    pub previous_event_count: usize,
+    pub previous_head_hash: String,
+    pub previous_event_hashes: Vec<String>,
+    pub had_integrity_incident: bool,
 }
 
 /// Canonical payload intended to be signed by the Manager's Android Keystore key.
@@ -166,6 +180,7 @@ pub struct CheckpointPayload {
     pub created_at_unix_seconds: u64,
     pub hmac_key_id: String,
     pub modules: Vec<CheckpointModuleHead>,
+    pub tombstones: Vec<CheckpointTombstone>,
 }
 
 struct VerifiedChain {
@@ -482,6 +497,11 @@ pub fn prune_stale_histories(
             continue;
         }
         let status = verify_module_unlocked(root, &module_id, true)?;
+        let event_hashes = verify_chain(root, &module_id, &key, false)?
+            .events
+            .into_iter()
+            .map(|event| event.event_hash)
+            .collect();
         // Recheck immediately before committing the authenticated tombstone to
         // narrow the race with a concurrent module installation.
         ensure!(
@@ -495,6 +515,7 @@ pub fn prune_stale_histories(
             cleared_at_unix_seconds: now(),
             previous_event_count: status.event_count,
             previous_head_hash: status.head_hash,
+            previous_event_hashes: event_hashes,
             had_integrity_incident: status.high_risk,
             reason: "user_cleanup".to_owned(),
         };
@@ -530,10 +551,15 @@ fn installed_module_exists(
 }
 
 fn verify_tombstones(root: &Path, key: &[u8; 32]) -> Result<()> {
+    verified_tombstones(root, key).map(|_| ())
+}
+
+fn verified_tombstones(root: &Path, key: &[u8; 32]) -> Result<Vec<PrunedHistoryTombstone>> {
     let tombstones_root = root.join("tombstones");
     if !tombstones_root.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut tombstones = Vec::new();
     for module_entry in
         std::fs::read_dir(&tombstones_root).context("read audit tombstone directory")?
     {
@@ -557,28 +583,78 @@ fn verify_tombstones(root: &Path, key: &[u8; 32]) -> Result<()> {
                 tombstone.record.module_id == module_id,
                 "audit tombstone module id mismatch"
             );
+            if !tombstone.record.previous_event_hashes.is_empty() {
+                ensure!(
+                    tombstone.record.previous_event_hashes.len()
+                        == tombstone.record.previous_event_count,
+                    "audit tombstone event hash count mismatch"
+                );
+                ensure!(
+                    tombstone.record.previous_event_hashes.last()
+                        == Some(&tombstone.record.previous_head_hash),
+                    "audit tombstone head hash mismatch"
+                );
+            }
+            tombstones.push(tombstone.record);
         }
     }
-    Ok(())
+    tombstones.sort_by(|left, right| {
+        left.module_id
+            .cmp(&right.module_id)
+            .then_with(|| {
+                left.cleared_at_unix_seconds
+                    .cmp(&right.cleared_at_unix_seconds)
+            })
+            .then_with(|| left.previous_head_hash.cmp(&right.previous_head_hash))
+    });
+    Ok(tombstones)
 }
 
 pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
+    let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
-    let statuses = list_modules(root, true)?;
-    let modules = statuses
+    let tombstones = verified_tombstones(root, &key)?
         .into_iter()
-        .map(|status| CheckpointModuleHead {
-            module_id: status.module_id,
-            sequence: u64::try_from(status.event_count).unwrap_or(u64::MAX),
-            head_hash: status.head_hash,
-            high_risk: status.high_risk,
+        .map(|tombstone| CheckpointTombstone {
+            module_id: tombstone.module_id,
+            cleared_at_unix_seconds: tombstone.cleared_at_unix_seconds,
+            previous_event_count: tombstone.previous_event_count,
+            previous_head_hash: tombstone.previous_head_hash,
+            previous_event_hashes: tombstone.previous_event_hashes,
+            had_integrity_incident: tombstone.had_integrity_incident,
         })
         .collect();
+    let modules_dir = root.join("modules");
+    let modules = if modules_dir.exists() {
+        audit_module_ids(&modules_dir)?
+            .into_iter()
+            .map(|module_id| verify_module_unlocked(root, &module_id, true))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|status| {
+                let event_hashes = verify_chain(root, &status.module_id, &key, false)?
+                    .events
+                    .into_iter()
+                    .map(|event| event.event_hash)
+                    .collect();
+                Ok(CheckpointModuleHead {
+                    module_id: status.module_id,
+                    sequence: u64::try_from(status.event_count).unwrap_or(u64::MAX),
+                    head_hash: status.head_hash,
+                    event_hashes,
+                    high_risk: status.high_risk,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     Ok(CheckpointPayload {
-        schema_version: SCHEMA_VERSION,
+        schema_version: CHECKPOINT_SCHEMA_VERSION,
         created_at_unix_seconds: now(),
         hmac_key_id: hex(&Sha256::digest(key)),
         modules,
+        tombstones,
     })
 }
 
@@ -1317,14 +1393,73 @@ mod tests {
     #[test]
     fn checkpoint_payload_contains_verified_module_heads() {
         let temp = TempDir::new().unwrap();
-        record(temp.path(), "module.beta", "ab");
-        record(temp.path(), "module.alpha", "cd");
+        let audit_root = temp.path().join("audit");
+        let installed_root = temp.path().join("modules");
+        let pending_root = temp.path().join("modules_update");
+        let installed_module = installed_root.join("module.alpha");
+        std::fs::create_dir_all(&installed_module).unwrap();
+        std::fs::write(installed_module.join("module.prop"), b"id=module.alpha\n").unwrap();
+        record(&audit_root, "module.beta", "ab");
+        record(&audit_root, "module.alpha", "cd");
+
+        prune_stale_histories(&audit_root, &installed_root, &pending_root, None).unwrap();
+
+        let payload = checkpoint_payload(&audit_root).unwrap();
+        assert_eq!(payload.modules.len(), 1);
+        assert_eq!(payload.modules[0].module_id, "module.alpha");
+        assert_eq!(payload.modules[0].event_hashes.len(), 2);
+        assert_eq!(
+            payload.modules[0].event_hashes.last(),
+            Some(&payload.modules[0].head_hash)
+        );
+        assert_eq!(payload.tombstones.len(), 1);
+        assert_eq!(payload.tombstones[0].module_id, "module.beta");
+        assert_eq!(payload.tombstones[0].previous_event_count, 2);
+        assert_eq!(payload.tombstones[0].previous_event_hashes.len(), 2);
+        assert_eq!(
+            payload.tombstones[0].previous_event_hashes.last(),
+            Some(&payload.tombstones[0].previous_head_hash)
+        );
+        assert_eq!(payload.hmac_key_id.len(), 64);
+    }
+
+    #[test]
+    fn checkpoint_accepts_legacy_tombstone_without_event_hashes() {
+        #[derive(Serialize)]
+        struct LegacyTombstone {
+            schema_version: u32,
+            module_id: String,
+            cleared_at_unix_seconds: u64,
+            previous_event_count: usize,
+            previous_head_hash: String,
+            had_integrity_incident: bool,
+            reason: String,
+        }
+
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "active.module", "ab");
+        let key = load_key(temp.path(), false).unwrap();
+        let legacy = LegacyTombstone {
+            schema_version: SCHEMA_VERSION,
+            module_id: "legacy.module".to_owned(),
+            cleared_at_unix_seconds: 1,
+            previous_event_count: 3,
+            previous_head_hash: "ab".repeat(32),
+            had_integrity_incident: false,
+            reason: "user_cleanup".to_owned(),
+        };
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let authenticated = AuthenticatedRecord {
+            record: legacy,
+            hmac_sha256: hex(&hmac_sha256(&key, &bytes)),
+        };
+        let path = temp.path().join("tombstones/legacy.module/legacy.json");
+        ensure_dir(path.parent().unwrap()).unwrap();
+        atomic_write_json(&path, &authenticated).unwrap();
 
         let payload = checkpoint_payload(temp.path()).unwrap();
-        assert_eq!(payload.modules.len(), 2);
-        assert_eq!(payload.modules[0].module_id, "module.alpha");
-        assert_eq!(payload.modules[1].module_id, "module.beta");
-        assert_eq!(payload.hmac_key_id.len(), 64);
+        assert_eq!(payload.tombstones.len(), 1);
+        assert!(payload.tombstones[0].previous_event_hashes.is_empty());
     }
 
     #[test]

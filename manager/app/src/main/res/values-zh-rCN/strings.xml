@@ -50,6 +50,10 @@
     <string name="security_audit_hmac_verified">本地审计链验证通过</string>
     <string name="security_audit_hmac_unverified">本地审计链未通过验证</string>
     <string name="security_audit_checkpoint_unavailable">尚未配置 Manager Keystore 检查点</string>
+    <string name="security_audit_checkpoint_initialized">Manager Keystore 检查点已初始化</string>
+    <string name="security_audit_checkpoint_verified">Manager Keystore 检查点验证通过</string>
+    <string name="security_audit_checkpoint_compromised">Manager Keystore 检查点验证失败</string>
+    <string name="security_audit_checkpoint_incident">Manager 检查点发现审计记录丢失或回滚。恢复原始记录并验证通过前，重新扫描与清理功能已停用：%1$s</string>
     <string name="security_audit_event_accepted">用户已允许安装</string>
     <string name="security_audit_event_installed">模块安装完成</string>
     <string name="security_audit_event_failed">模块安装失败</string>

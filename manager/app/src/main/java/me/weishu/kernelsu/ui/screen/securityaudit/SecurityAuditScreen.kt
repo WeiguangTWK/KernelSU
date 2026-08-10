@@ -125,6 +125,14 @@ fun auditCategoryLabel(category: AuditCategory): String = stringResource(
     }
 )
 
+@Composable
+fun managerCheckpointLabel(state: String): String = when (state) {
+    "keystore_initialized" -> stringResource(R.string.security_audit_checkpoint_initialized)
+    "keystore_verified" -> stringResource(R.string.security_audit_checkpoint_verified)
+    "keystore_compromised" -> stringResource(R.string.security_audit_checkpoint_compromised)
+    else -> stringResource(R.string.security_audit_checkpoint_unavailable)
+}
+
 fun formatAuditTime(timestampUnixSeconds: Long): String = DateFormat
     .getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM)
     .format(Date(timestampUnixSeconds * 1_000L))
