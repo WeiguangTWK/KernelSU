@@ -15,7 +15,7 @@ import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditUiState
 import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
-import me.weishu.kernelsu.ui.util.rescanInstalledModules
+import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
 
 class SecurityAuditViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(SecurityAuditUiState())
@@ -65,7 +65,7 @@ class SecurityAuditViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             _uiState.update { it.copy(isRescanning = true, errorMessage = null) }
             runCatching {
-                rescanInstalledModules()
+                runInstalledModuleRescan()
             }.onFailure { error ->
                 if (error is CancellationException) throw error
                 _uiState.update {
