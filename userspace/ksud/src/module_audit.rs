@@ -47,7 +47,7 @@ enum AuditDecision {
 }
 
 #[cfg(target_os = "android")]
-pub fn audit_before_install(zip: &str) -> Result<()> {
+pub fn audit_before_install(zip: &str) -> Result<AuditReport> {
     println!("- Auditing module package");
     let report =
         scan_zip_path(zip, &AuditConfig::default()).context("static module audit failed")?;
@@ -55,7 +55,7 @@ pub fn audit_before_install(zip: &str) -> Result<()> {
 
     if !report.requires_confirmation() {
         println!("- Static audit found no behavior requiring confirmation");
-        return Ok(());
+        return Ok(report);
     }
 
     let required_presses = report.required_confirmation_presses();
@@ -74,7 +74,7 @@ pub fn audit_before_install(zip: &str) -> Result<()> {
         "Module ZIP changed after static audit; installation aborted"
     );
     println!("- Audit warning accepted; continuing installation");
-    Ok(())
+    Ok(report)
 }
 
 pub fn print_zip_report(zip: &str, json: bool) -> Result<()> {

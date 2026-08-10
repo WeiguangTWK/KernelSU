@@ -291,6 +291,19 @@ enum Module {
         json: bool,
     },
 
+    /// Verify persisted module audit history
+    AuditHistory {
+        /// limit verification to one module id
+        #[arg(long)]
+        id: Option<String>,
+        /// print structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the canonical payload for a Manager Keystore checkpoint
+    AuditCheckpoint,
+
     /// Undo module uninstall mark <id>
     UndoUninstall {
         /// module id
@@ -530,6 +543,40 @@ pub fn run() -> Result<()> {
             match command {
                 Module::Install { zip } => module::install_module(&zip),
                 Module::Audit { zip, json } => crate::module_audit::print_zip_report(&zip, json),
+                Module::AuditHistory { id, json } => {
+                    let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
+                    let histories = if let Some(id) = id {
+                        crate::module::validate_module_id(&id)?;
+                        vec![crate::module_audit_log::read_module_history(
+                            root, &id, true,
+                        )?]
+                    } else {
+                        crate::module_audit_log::list_histories(root, true)?
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&histories)?);
+                    } else {
+                        for history in histories {
+                            let status = history.status;
+                            println!(
+                                "{}: {:?}, events={}, high_risk={}, head={}",
+                                status.module_id,
+                                status.verification,
+                                status.event_count,
+                                status.high_risk,
+                                status.head_hash
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                Module::AuditCheckpoint => {
+                    let payload = crate::module_audit_log::checkpoint_payload(
+                        std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                    Ok(())
+                }
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),
                 Module::Uninstall { id } => module::uninstall_module(&id),
                 Module::Enable { id } => module::enable_module(&id),

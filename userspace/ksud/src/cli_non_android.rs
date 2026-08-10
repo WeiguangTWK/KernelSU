@@ -37,6 +37,24 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Verify a development module audit history store
+    ModuleAuditHistory {
+        /// audit history root
+        root: String,
+        /// limit verification to one module id
+        #[arg(long)]
+        id: Option<String>,
+        /// repair corrupt event suffixes
+        #[arg(long)]
+        repair: bool,
+    },
+
+    /// Export a development Manager-checkpoint payload
+    ModuleAuditCheckpoint {
+        /// audit history root
+        root: String,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -66,6 +84,23 @@ pub fn run() -> Result<()> {
         }
 
         Commands::ModuleAudit { zip, json } => crate::module_audit::print_zip_report(&zip, json),
+        Commands::ModuleAuditHistory { root, id, repair } => {
+            let root = std::path::Path::new(&root);
+            let histories = if let Some(id) = id {
+                vec![crate::module_audit_log::read_module_history(
+                    root, &id, repair,
+                )?]
+            } else {
+                crate::module_audit_log::list_histories(root, repair)?
+            };
+            println!("{}", serde_json::to_string_pretty(&histories)?);
+            Ok(())
+        }
+        Commands::ModuleAuditCheckpoint { root } => {
+            let payload = crate::module_audit_log::checkpoint_payload(std::path::Path::new(&root))?;
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+            Ok(())
+        }
     };
 
     if let Err(e) = &result {

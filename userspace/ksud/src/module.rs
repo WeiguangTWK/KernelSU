@@ -1,7 +1,7 @@
 #[allow(clippy::wildcard_imports)]
 use crate::utils::*;
 use crate::{
-    assets, defs, ksucalls, metamodule, module_audit,
+    assets, defs, ksucalls, metamodule, module_audit, module_audit_log,
     restorecon::{restore_syscon, setsyscon},
     sepolicy,
 };
@@ -620,53 +620,82 @@ fn install_module_to_system(zip: &str) -> Result<()> {
     );
 
     // Audit the exact package before extracting or executing any module-controlled content.
-    module_audit::audit_before_install(zip)?;
+    let audit_report = module_audit::audit_before_install(zip)?;
+    let audit_receipt =
+        module_audit_log::begin_install(Path::new(defs::MODULE_AUDIT_DIR), audit_report)
+            .context("persist accepted module audit")?;
 
-    // Ensure module directory exists and set SELinux context
-    ensure_dir_exists(defs::MODULE_UPDATE_DIR)?;
-    setsyscon(defs::MODULE_UPDATE_DIR)?;
+    let install_result = (|| -> Result<()> {
+        // Ensure module directory exists and set SELinux context
+        ensure_dir_exists(defs::MODULE_UPDATE_DIR)?;
+        setsyscon(defs::MODULE_UPDATE_DIR)?;
 
-    // Prepare target directory
-    println!("- Installing to {}", updated_dir.display());
-    ensure_clean_dir(&updated_dir)?;
-    info!("target dir: {}", updated_dir.display());
+        // Prepare target directory
+        println!("- Installing to {}", updated_dir.display());
+        ensure_clean_dir(&updated_dir)?;
+        info!("target dir: {}", updated_dir.display());
 
-    // Extract zip to target directory
-    println!("- Extracting module files");
-    let file = File::open(zip)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    archive.extract(&updated_dir)?;
+        // Extract zip to target directory
+        println!("- Extracting module files");
+        let file = File::open(zip)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        archive.extract(&updated_dir)?;
 
-    // Set permission and selinux context for $MOD/system
-    let module_system_dir = updated_dir.join("system");
-    if module_system_dir.exists() {
-        #[cfg(unix)]
-        set_permissions(&module_system_dir, Permissions::from_mode(0o755))?;
-        restore_syscon(&module_system_dir)?;
+        // Set permission and selinux context for $MOD/system
+        let module_system_dir = updated_dir.join("system");
+        if module_system_dir.exists() {
+            #[cfg(unix)]
+            set_permissions(&module_system_dir, Permissions::from_mode(0o755))?;
+            restore_syscon(&module_system_dir)?;
+        }
+
+        // Execute install script
+        println!("- Running module installer");
+        exec_install_script(zip, is_metamodule, module_id)?;
+
+        let module_dir = Path::new(MODULE_DIR).join(module_id);
+        ensure_dir_exists(&module_dir)?;
+        copy(
+            updated_dir.join("module.prop"),
+            module_dir.join("module.prop"),
+        )?;
+        ensure_file_exists(module_dir.join(UPDATE_FILE_NAME))?;
+
+        // Create symlink for metamodule
+        if is_metamodule {
+            println!("- Creating metamodule symlink");
+            metamodule::ensure_symlink(&module_dir)?;
+        }
+
+        println!("- Module installed successfully!");
+        info!("Module {module_id} installed successfully!");
+
+        Ok(())
+    })();
+
+    let outcome = if install_result.is_ok() {
+        module_audit_log::InstallOutcome::Installed
+    } else {
+        module_audit_log::InstallOutcome::InstallationFailed
+    };
+    let install_error = install_result
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    let audit_log_result = module_audit_log::finish_install(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        audit_receipt,
+        outcome,
+        install_error,
+    );
+    match (install_result, audit_log_result) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Ok(()), Err(log_error)) => Err(log_error.context("persist accepted module audit")),
+        (Err(install_error), Ok(_)) => Err(install_error),
+        (Err(install_error), Err(log_error)) => Err(install_error.context(format!(
+            "additionally failed to persist accepted module audit: {log_error:#}"
+        ))),
     }
-
-    // Execute install script
-    println!("- Running module installer");
-    exec_install_script(zip, is_metamodule, module_id)?;
-
-    let module_dir = Path::new(MODULE_DIR).join(module_id);
-    ensure_dir_exists(&module_dir)?;
-    copy(
-        updated_dir.join("module.prop"),
-        module_dir.join("module.prop"),
-    )?;
-    ensure_file_exists(module_dir.join(UPDATE_FILE_NAME))?;
-
-    // Create symlink for metamodule
-    if is_metamodule {
-        println!("- Creating metamodule symlink");
-        metamodule::ensure_symlink(&module_dir)?;
-    }
-
-    println!("- Module installed successfully!");
-    info!("Module {module_id} installed successfully!");
-
-    Ok(())
 }
 
 pub fn install_module(zip: &str) -> Result<()> {

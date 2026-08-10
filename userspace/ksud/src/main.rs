@@ -35,6 +35,7 @@ mod metamodule;
 #[cfg(target_os = "android")]
 mod module;
 mod module_audit;
+mod module_audit_log;
 #[cfg(target_os = "android")]
 mod module_config;
 #[cfg(target_os = "android")]
