@@ -75,6 +75,10 @@
     <string name="security_audit_more_findings">%1$d more findings</string>
     <string name="security_audit_empty">No accepted module audits yet</string>
     <string name="security_audit_rescan">Rescan installed modules</string>
+    <string name="security_audit_prune">Clear removed-module audit records</string>
+    <string name="security_audit_prune_title">Clear expired audit records?</string>
+    <string name="security_audit_prune_message">This will remove the detailed audit history of %1$d modules that are no longer installed. A compact authenticated tombstone will be retained.\n\n%2$s</string>
+    <string name="security_audit_prune_confirm">Clear records</string>
     <string name="security_audit_event_rescan">Installed module rescanned</string>
     <string name="security_audit_event_rescan_failed">Installed module rescan failed</string>
     <string name="security_audit_hit_modules">Modules (%1$d)</string>

@@ -61,7 +61,9 @@ data class SecurityAuditUiState(
     val isLoading: Boolean = true,
     val isRefreshing: Boolean = false,
     val isRescanning: Boolean = false,
+    val isPruning: Boolean = false,
     val histories: List<AuditHistory> = emptyList(),
+    val staleModuleIds: List<String> = emptyList(),
     val errorMessage: String? = null,
 ) {
     val highRiskModules: Int
@@ -180,6 +182,9 @@ fun parseAuditHistories(raw: String): List<AuditHistory> = JSONArray(raw).mapObj
         events = history.optJSONArray("events")?.mapObjects(::parseAuditEvent).orEmpty(),
     )
 }
+
+fun parseStaleAuditModuleIds(raw: String): List<String> = JSONArray(raw)
+    .mapObjects { entry -> entry.getString("module_id") }
 
 private fun parseAuditEvent(event: JSONObject): AuditEvent {
     val kind = event.getJSONObject("kind")

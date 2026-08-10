@@ -86,6 +86,18 @@ struct HeadRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+struct PrunedHistoryTombstone {
+    schema_version: u32,
+    module_id: String,
+    cleared_at_unix_seconds: u64,
+    previous_event_count: usize,
+    previous_head_hash: String,
+    had_integrity_incident: bool,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct AuthenticatedRecord<T> {
     record: T,
     hmac_sha256: String,
@@ -120,6 +132,22 @@ pub struct ModuleAuditStatus {
 pub struct ModuleAuditHistory {
     pub status: ModuleAuditStatus,
     pub events: Vec<AuditEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub struct StaleAuditHistory {
+    pub module_id: String,
+    pub event_count: usize,
+    pub high_risk: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub struct PrunedAuditHistory {
+    pub module_id: String,
+    pub removed_event_count: usize,
+    pub retained_integrity_incident: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -341,13 +369,21 @@ pub fn list_modules(root: &Path, repair: bool) -> Result<Vec<ModuleAuditStatus>>
     if !root.exists() {
         return Ok(Vec::new());
     }
-    load_key(root, false)?;
+    let key = load_key(root, false)?;
+    verify_tombstones(root, &key)?;
     let modules_dir = root.join("modules");
     if !modules_dir.exists() {
         return Ok(Vec::new());
     }
+    audit_module_ids(&modules_dir)?
+        .iter()
+        .map(|module_id| verify_module(root, module_id, repair))
+        .collect()
+}
+
+fn audit_module_ids(modules_dir: &Path) -> Result<Vec<String>> {
     let mut module_ids = Vec::new();
-    for entry in std::fs::read_dir(&modules_dir).context("read audit module directory")? {
+    for entry in std::fs::read_dir(modules_dir).context("read audit module directory")? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -358,10 +394,7 @@ pub fn list_modules(root: &Path, repair: bool) -> Result<Vec<ModuleAuditStatus>>
         module_ids.push(module_id);
     }
     module_ids.sort();
-    module_ids
-        .iter()
-        .map(|module_id| verify_module(root, module_id, repair))
-        .collect()
+    Ok(module_ids)
 }
 
 pub fn read_module_history(
@@ -370,6 +403,7 @@ pub fn read_module_history(
     repair: bool,
 ) -> Result<ModuleAuditHistory> {
     let _lock = AuditLock::acquire(root, false)?;
+    verify_tombstones(root, &load_key(root, false)?)?;
     let status = verify_module_unlocked(root, module_id, repair)?;
     let key = load_key(root, false)?;
     let events = verify_chain(root, module_id, &key, false)?
@@ -385,6 +419,147 @@ pub fn list_histories(root: &Path, repair: bool) -> Result<Vec<ModuleAuditHistor
         .into_iter()
         .map(|status| read_module_history(root, &status.module_id, false))
         .collect()
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn list_stale_histories(
+    root: &Path,
+    installed_modules_root: &Path,
+    pending_modules_root: &Path,
+) -> Result<Vec<StaleAuditHistory>> {
+    if !root.exists() || !root.join("modules").exists() {
+        return Ok(Vec::new());
+    }
+    let _lock = AuditLock::acquire(root, false)?;
+    verify_tombstones(root, &load_key(root, false)?)?;
+    let mut stale = Vec::new();
+    for module_id in audit_module_ids(&root.join("modules"))? {
+        if installed_module_exists(installed_modules_root, pending_modules_root, &module_id) {
+            continue;
+        }
+        let status = verify_module_unlocked(root, &module_id, true)?;
+        stale.push(StaleAuditHistory {
+            module_id,
+            event_count: status.event_count,
+            high_risk: status.high_risk,
+        });
+    }
+    Ok(stale)
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn prune_stale_histories(
+    root: &Path,
+    installed_modules_root: &Path,
+    pending_modules_root: &Path,
+    requested_module_id: Option<&str>,
+) -> Result<Vec<PrunedAuditHistory>> {
+    if !root.exists() || !root.join("modules").exists() {
+        return Ok(Vec::new());
+    }
+    if let Some(module_id) = requested_module_id {
+        validate_module_id(module_id)?;
+    }
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    verify_tombstones(root, &key)?;
+    let mut module_ids = audit_module_ids(&root.join("modules"))?;
+    if let Some(module_id) = requested_module_id {
+        ensure!(
+            module_ids.iter().any(|candidate| candidate == module_id),
+            "module audit history not found"
+        );
+        module_ids.retain(|candidate| candidate == module_id);
+    }
+
+    let mut pruned = Vec::new();
+    for module_id in module_ids {
+        if installed_module_exists(installed_modules_root, pending_modules_root, &module_id) {
+            ensure!(
+                requested_module_id.is_none(),
+                "cannot clear audit history for an installed module"
+            );
+            continue;
+        }
+        let status = verify_module_unlocked(root, &module_id, true)?;
+        // Recheck immediately before committing the authenticated tombstone to
+        // narrow the race with a concurrent module installation.
+        ensure!(
+            !installed_module_exists(installed_modules_root, pending_modules_root, &module_id),
+            "module was reinstalled while its audit history was being cleared"
+        );
+        let tombstone_path = new_tombstone_path(root, &module_id, &status.head_hash);
+        let tombstone = PrunedHistoryTombstone {
+            schema_version: SCHEMA_VERSION,
+            module_id: module_id.clone(),
+            cleared_at_unix_seconds: now(),
+            previous_event_count: status.event_count,
+            previous_head_hash: status.head_hash,
+            had_integrity_incident: status.high_risk,
+            reason: "user_cleanup".to_owned(),
+        };
+        write_record(&tombstone_path, tombstone, &key)?;
+
+        std::fs::remove_dir_all(module_path(root, &module_id))
+            .with_context(|| format!("remove audit history for {module_id}"))?;
+        let risk = risk_path(root, &module_id);
+        if risk.exists() {
+            std::fs::remove_file(&risk)
+                .with_context(|| format!("remove compacted risk record for {module_id}"))?;
+            sync_dir(risk.parent().context("risk record has no parent")?)?;
+        }
+        sync_dir(&root.join("modules"))?;
+        pruned.push(PrunedAuditHistory {
+            module_id,
+            removed_event_count: status.event_count,
+            retained_integrity_incident: status.high_risk,
+        });
+    }
+    Ok(pruned)
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+fn installed_module_exists(
+    installed_modules_root: &Path,
+    pending_modules_root: &Path,
+    module_id: &str,
+) -> bool {
+    [installed_modules_root, pending_modules_root]
+        .iter()
+        .any(|root| root.join(module_id).join("module.prop").is_file())
+}
+
+fn verify_tombstones(root: &Path, key: &[u8; 32]) -> Result<()> {
+    let tombstones_root = root.join("tombstones");
+    if !tombstones_root.exists() {
+        return Ok(());
+    }
+    for module_entry in
+        std::fs::read_dir(&tombstones_root).context("read audit tombstone directory")?
+    {
+        let module_entry = module_entry?;
+        ensure!(
+            module_entry.file_type()?.is_dir(),
+            "unexpected file in audit tombstone directory"
+        );
+        let module_id = module_entry.file_name().to_string_lossy().into_owned();
+        validate_module_id(&module_id)?;
+        for entry in std::fs::read_dir(module_entry.path()).context("read module tombstones")? {
+            let entry = entry?;
+            ensure!(entry.file_type()?.is_file(), "unexpected tombstone entry");
+            let tombstone: AuthenticatedRecord<PrunedHistoryTombstone> = read_json(&entry.path())?;
+            verify_record(&tombstone.record, &tombstone.hmac_sha256, key)?;
+            ensure!(
+                tombstone.record.schema_version == SCHEMA_VERSION,
+                "unsupported audit tombstone schema"
+            );
+            ensure!(
+                tombstone.record.module_id == module_id,
+                "audit tombstone module id mismatch"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
@@ -902,6 +1077,13 @@ fn risk_path(root: &Path, module_id: &str) -> PathBuf {
         .join(format!("{}.json", module_dir_name(module_id)))
 }
 
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+fn new_tombstone_path(root: &Path, module_id: &str, previous_head_hash: &str) -> PathBuf {
+    root.join("tombstones")
+        .join(module_dir_name(module_id))
+        .join(format!("{}-{previous_head_hash}.json", now()))
+}
+
 fn head_path(root: &Path, module_id: &str) -> PathBuf {
     module_path(root, module_id).join("head.json")
 }
@@ -1214,6 +1396,127 @@ mod tests {
             &load_key(temp.path(), false).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn stale_history_is_pruned_with_authenticated_tombstone() {
+        let temp = TempDir::new().unwrap();
+        let audit_root = temp.path().join("audit");
+        let installed_root = temp.path().join("modules");
+        let pending_root = temp.path().join("modules_update");
+        std::fs::create_dir(&installed_root).unwrap();
+        record(&audit_root, "stale.module", "ab");
+
+        let stale = list_stale_histories(&audit_root, &installed_root, &pending_root).unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].module_id, "stale.module");
+        assert_eq!(stale[0].event_count, 2);
+
+        let pruned = prune_stale_histories(
+            &audit_root,
+            &installed_root,
+            &pending_root,
+            Some("stale.module"),
+        )
+        .unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].removed_event_count, 2);
+        assert!(!module_path(&audit_root, "stale.module").exists());
+        assert!(list_histories(&audit_root, false).unwrap().is_empty());
+
+        let tombstones = audit_root.join("tombstones/stale.module");
+        let tombstone_path = std::fs::read_dir(tombstones)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let tombstone: AuthenticatedRecord<PrunedHistoryTombstone> =
+            read_json(&tombstone_path).unwrap();
+        let key = load_key(&audit_root, false).unwrap();
+        verify_record(&tombstone.record, &tombstone.hmac_sha256, &key).unwrap();
+        assert_eq!(tombstone.record.module_id, "stale.module");
+        assert_eq!(tombstone.record.previous_event_count, 2);
+        assert_eq!(tombstone.record.reason, "user_cleanup");
+
+        std::fs::write(&tombstone_path, b"corrupt").unwrap();
+        assert!(list_histories(&audit_root, false).is_err());
+    }
+
+    #[test]
+    fn installed_history_cannot_be_pruned() {
+        let temp = TempDir::new().unwrap();
+        let audit_root = temp.path().join("audit");
+        let installed_root = temp.path().join("modules");
+        let pending_root = temp.path().join("modules_update");
+        let installed_module = installed_root.join("active.module");
+        std::fs::create_dir_all(&installed_module).unwrap();
+        std::fs::write(installed_module.join("module.prop"), b"id=active.module\n").unwrap();
+        record(&audit_root, "active.module", "ab");
+
+        assert!(
+            list_stale_histories(&audit_root, &installed_root, &pending_root)
+                .unwrap()
+                .is_empty()
+        );
+        let error = prune_stale_histories(
+            &audit_root,
+            &installed_root,
+            &pending_root,
+            Some("active.module"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("installed module"));
+        assert!(module_path(&audit_root, "active.module").exists());
+
+        let pending_module = pending_root.join("pending.module");
+        std::fs::create_dir_all(&pending_module).unwrap();
+        std::fs::write(pending_module.join("module.prop"), b"id=pending.module\n").unwrap();
+        record(&audit_root, "pending.module", "cd");
+
+        assert!(
+            list_stale_histories(&audit_root, &installed_root, &pending_root)
+                .unwrap()
+                .is_empty()
+        );
+        let error = prune_stale_histories(
+            &audit_root,
+            &installed_root,
+            &pending_root,
+            Some("pending.module"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("installed module"));
+        assert!(module_path(&audit_root, "pending.module").exists());
+    }
+
+    #[test]
+    fn pruning_retains_integrity_incident_in_tombstone() {
+        let temp = TempDir::new().unwrap();
+        let audit_root = temp.path().join("audit");
+        let installed_root = temp.path().join("modules");
+        let pending_root = temp.path().join("modules_update");
+        std::fs::create_dir(&installed_root).unwrap();
+        record(&audit_root, "risky.module", "ab");
+        std::fs::write(event_path(&audit_root, "risky.module", 1), b"corrupt").unwrap();
+
+        let pruned = prune_stale_histories(
+            &audit_root,
+            &installed_root,
+            &pending_root,
+            Some("risky.module"),
+        )
+        .unwrap();
+        assert!(pruned[0].retained_integrity_incident);
+        let tombstone_path = std::fs::read_dir(audit_root.join("tombstones/risky.module"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let tombstone: AuthenticatedRecord<PrunedHistoryTombstone> =
+            read_json(&tombstone_path).unwrap();
+        assert!(tombstone.record.had_integrity_incident);
     }
 
     #[test]

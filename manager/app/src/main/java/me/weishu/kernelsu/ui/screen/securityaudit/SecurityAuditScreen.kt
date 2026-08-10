@@ -10,6 +10,7 @@ import androidx.compose.ui.res.stringResource
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.ui.LocalUiMode
 import me.weishu.kernelsu.ui.UiMode
+import me.weishu.kernelsu.ui.component.dialog.rememberConfirmDialog
 import me.weishu.kernelsu.ui.navigation3.LocalNavigator
 import me.weishu.kernelsu.ui.navigation3.Route
 import me.weishu.kernelsu.ui.viewmodel.SecurityAuditViewModel
@@ -20,6 +21,7 @@ data class SecurityAuditActions(
     val onBack: () -> Unit,
     val onRefresh: () -> Unit,
     val onRescan: () -> Unit,
+    val onPrune: () -> Unit,
     val onOpenCategory: (AuditCategory) -> Unit,
     val onOpenModule: (String) -> Unit,
 )
@@ -34,10 +36,26 @@ fun SecurityAuditScreen() {
         viewModel.refresh()
     }
 
+    val pruneDialog = rememberConfirmDialog(onConfirm = viewModel::pruneStaleAuditHistories)
+    val pruneTitle = stringResource(R.string.security_audit_prune_title)
+    val pruneMessage = stringResource(
+        R.string.security_audit_prune_message,
+        state.staleModuleIds.size,
+        state.staleModuleIds.joinToString("\n") { "• $it" },
+    )
+    val pruneConfirm = stringResource(R.string.security_audit_prune_confirm)
+
     val actions = SecurityAuditActions(
         onBack = dropUnlessResumed { navigator.pop() },
         onRefresh = viewModel::refresh,
         onRescan = viewModel::rescanInstalledModules,
+        onPrune = {
+            pruneDialog.showConfirm(
+                title = pruneTitle,
+                content = pruneMessage,
+                confirm = pruneConfirm,
+            )
+        },
         onOpenCategory = { navigator.push(Route.SecurityAuditCategory(it.key)) },
         onOpenModule = { navigator.push(Route.SecurityAuditModule(it)) },
     )
@@ -58,6 +76,7 @@ fun SecurityAuditCategoryScreen(categoryKey: String) {
         onBack = dropUnlessResumed { navigator.pop() },
         onRefresh = viewModel::refresh,
         onRescan = viewModel::rescanInstalledModules,
+        onPrune = {},
         onOpenCategory = {},
         onOpenModule = { navigator.push(Route.SecurityAuditModule(it, category.key)) },
     )
@@ -78,6 +97,7 @@ fun SecurityAuditModuleScreen(moduleId: String, focusCategoryKey: String? = null
         onBack = dropUnlessResumed { navigator.pop() },
         onRefresh = viewModel::refresh,
         onRescan = viewModel::rescanInstalledModules,
+        onPrune = {},
         onOpenCategory = {},
         onOpenModule = {},
     )

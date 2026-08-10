@@ -311,6 +311,19 @@ enum Module {
         json: bool,
     },
 
+    /// List or clear audit histories whose modules are no longer installed
+    AuditPrune {
+        /// only clear one stale module history
+        #[arg(long)]
+        id: Option<String>,
+        /// list eligible histories without clearing them
+        #[arg(long)]
+        dry_run: bool,
+        /// print structured JSON results
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Undo module uninstall mark <id>
     UndoUninstall {
         /// module id
@@ -585,6 +598,9 @@ pub fn run() -> Result<()> {
                     Ok(())
                 }
                 Module::AuditRescan { json } => module::audit_installed_modules(json),
+                Module::AuditPrune { id, dry_run, json } => {
+                    module::prune_module_audit_histories(id.as_deref(), dry_run, json)
+                }
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),
                 Module::Uninstall { id } => module::uninstall_module(&id),
                 Module::Enable { id } => module::enable_module(&id),

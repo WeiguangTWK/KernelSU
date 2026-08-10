@@ -157,6 +157,32 @@ suspend fun rescanInstalledModules(): String = withContext(Dispatchers.IO) {
     stdout.joinToString("\n").ifBlank { "[]" }
 }
 
+suspend fun getStaleModuleAuditHistories(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} module audit-prune --dry-run --json")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to list stale module audit histories" }
+    }
+    stdout.joinToString("\n").ifBlank { "[]" }
+}
+
+suspend fun pruneStaleModuleAuditHistories(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} module audit-prune --json")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to clear stale module audit histories" }
+    }
+    stdout.joinToString("\n").ifBlank { "[]" }
+}
+
 fun getModuleCount(): Int {
     val result = listModules()
     runCatching {

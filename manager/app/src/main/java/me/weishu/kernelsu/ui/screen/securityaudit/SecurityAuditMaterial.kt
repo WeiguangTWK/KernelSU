@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Computer
+import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Info
@@ -72,6 +73,7 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
         state = state,
         actions = actions,
         showRescan = true,
+        showPrune = true,
     ) {
         item { AuditOverviewMaterial(state, actions.onOpenCategory) }
         if (state.interruptedInstalls > 0) {
@@ -179,6 +181,7 @@ private fun AuditScaffoldMaterial(
     state: SecurityAuditUiState,
     actions: SecurityAuditActions,
     showRescan: Boolean = false,
+    showPrune: Boolean = false,
     listState: LazyListState? = null,
     content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit,
 ) {
@@ -190,8 +193,26 @@ private fun AuditScaffoldMaterial(
                 title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { TopBarBackButton(onClick = actions.onBack) },
                 actions = {
+                    if (showPrune && state.staleModuleIds.isNotEmpty()) {
+                        IconButton(
+                            onClick = actions.onPrune,
+                            enabled = !state.isPruning && !state.isRescanning,
+                        ) {
+                            if (state.isPruning) {
+                                CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(
+                                    Icons.Outlined.DeleteSweep,
+                                    contentDescription = stringResource(R.string.security_audit_prune),
+                                )
+                            }
+                        }
+                    }
                     if (showRescan) {
-                        IconButton(onClick = actions.onRescan, enabled = !state.isRescanning) {
+                        IconButton(
+                            onClick = actions.onRescan,
+                            enabled = !state.isRescanning && !state.isPruning,
+                        ) {
                             if (state.isRescanning) {
                                 CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                             } else {

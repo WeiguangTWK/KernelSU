@@ -1077,6 +1077,51 @@ pub fn audit_installed_modules(json: bool) -> Result<()> {
     Ok(())
 }
 
+pub fn prune_module_audit_histories(
+    module_id: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
+    if let Some(module_id) = module_id {
+        validate_module_id(module_id)?;
+    }
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    let installed_root = Path::new(defs::MODULE_DIR);
+    let pending_root = Path::new(defs::MODULE_UPDATE_DIR);
+    if dry_run {
+        ensure!(
+            module_id.is_none(),
+            "--id cannot be combined with --dry-run"
+        );
+        let stale =
+            module_audit_log::list_stale_histories(audit_root, installed_root, pending_root)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&stale)?);
+        } else {
+            println!("- {} stale module audit histories", stale.len());
+            for history in stale {
+                println!(
+                    "  {}: events={}, integrity_risk={}",
+                    history.module_id, history.event_count, history.high_risk
+                );
+            }
+        }
+    } else {
+        let pruned = module_audit_log::prune_stale_histories(
+            audit_root,
+            installed_root,
+            pending_root,
+            module_id,
+        )?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&pruned)?);
+        } else {
+            println!("- Cleared {} stale module audit histories", pruned.len());
+        }
+    }
+    Ok(())
+}
+
 /// Get all managed features from active modules
 /// Modules declare managed features via config system (manage.<feature>=true)
 /// Returns: HashMap<ModuleId, Vec<ManagedFeature>>

@@ -57,6 +57,10 @@
     <string name="security_audit_more_findings">另有 %1$d 项发现</string>
     <string name="security_audit_empty">暂无已允许安装的模块审计记录</string>
     <string name="security_audit_rescan">重新扫描已安装模块</string>
+    <string name="security_audit_prune">清理已移除模块的审计记录</string>
+    <string name="security_audit_prune_title">清理过期审计记录？</string>
+    <string name="security_audit_prune_message">将删除 %1$d 个已移除模块的详细审计历史，并保留经过认证的精简墓碑。\n\n%2$s</string>
+    <string name="security_audit_prune_confirm">清理记录</string>
     <string name="security_audit_event_rescan">已重新扫描安装目录</string>
     <string name="security_audit_event_rescan_failed">安装目录重新扫描失败</string>
     <string name="security_audit_hit_modules">命中模块（%1$d）</string>

@@ -14,7 +14,10 @@ import me.weishu.kernelsu.ui.screen.securityaudit.AuditHistory
 import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditUiState
 import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
+import me.weishu.kernelsu.ui.screen.securityaudit.parseStaleAuditModuleIds
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
+import me.weishu.kernelsu.ui.util.getStaleModuleAuditHistories
+import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
 
 class SecurityAuditViewModel : ViewModel() {
@@ -34,18 +37,21 @@ class SecurityAuditViewModel : ViewModel() {
                 )
             }
             runCatching {
-                parseAuditHistories(getModuleAuditHistories())
+                val histories = parseAuditHistories(getModuleAuditHistories())
                     .sortedWith(
                         compareByDescending<AuditHistory> { it.isHighRisk() }
                             .thenByDescending { history ->
                                 history.events.maxOfOrNull { it.timestampUnixSeconds } ?: 0L
                             }
                     )
-            }.onSuccess { histories ->
+                histories to parseStaleAuditModuleIds(getStaleModuleAuditHistories())
+            }.onSuccess { (histories, staleModuleIds) ->
                 _uiState.value = SecurityAuditUiState(
                     isLoading = false,
                     isRescanning = _uiState.value.isRescanning,
+                    isPruning = _uiState.value.isPruning,
                     histories = histories,
+                    staleModuleIds = staleModuleIds,
                 )
             }.onFailure { error ->
                 if (error is CancellationException) throw error
@@ -61,7 +67,7 @@ class SecurityAuditViewModel : ViewModel() {
     }
 
     fun rescanInstalledModules() {
-        if (_uiState.value.isRescanning) return
+        if (_uiState.value.isRescanning || _uiState.value.isPruning) return
         viewModelScope.launch(Dispatchers.IO) {
             _uiState.update { it.copy(isRescanning = true, errorMessage = null) }
             runCatching {
@@ -74,6 +80,33 @@ class SecurityAuditViewModel : ViewModel() {
             }
             _uiState.update { it.copy(isRescanning = false) }
             refresh()
+        }
+    }
+
+    fun pruneStaleAuditHistories() {
+        if (
+            _uiState.value.isPruning ||
+            _uiState.value.isRescanning ||
+            _uiState.value.staleModuleIds.isEmpty()
+        ) return
+        viewModelScope.launch(Dispatchers.IO) {
+            _uiState.update { it.copy(isPruning = true, errorMessage = null) }
+            val result = runCatching {
+                pruneStaleModuleAuditHistories()
+            }
+            result.onFailure { error ->
+                if (error is CancellationException) throw error
+                _uiState.update {
+                    it.copy(
+                        isPruning = false,
+                        errorMessage = error.message ?: error::class.java.simpleName,
+                    )
+                }
+            }
+            if (result.isSuccess) {
+                _uiState.update { it.copy(isPruning = false) }
+                refresh()
+            }
         }
     }
 }
