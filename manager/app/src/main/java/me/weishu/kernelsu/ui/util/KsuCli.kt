@@ -22,6 +22,7 @@ import me.weishu.kernelsu.ksuApp
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.Executor
 
 /**
  * @author weishu
@@ -148,7 +149,7 @@ suspend fun getModuleAuditHistories(): String = withContext(Dispatchers.IO) {
 suspend fun streamModuleAuditDashboard(onLine: (String) -> Unit): Unit =
     withContext(Dispatchers.IO) {
         val stderr = ArrayList<String>()
-        val stdout = object : CallbackList<String?>() {
+        val stdout = object : CallbackList<String?>(Executor { command -> command.run() }) {
             override fun onAddElement(value: String?) {
                 value?.takeIf(String::isNotBlank)?.let(onLine)
             }

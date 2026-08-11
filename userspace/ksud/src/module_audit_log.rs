@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: u32 = 1;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 5;
+const EVENT_SCHEMA_VERSION: u32 = 2;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 6;
 const MANAGER_AUTH_SCHEMA_VERSION: u32 = 2;
 const KEY_FILE: &str = ".hmac-key";
 const MANAGER_AUTH_FILE: &str = "manager-auth.json";
@@ -856,9 +857,22 @@ pub fn dashboard_module_ids(root: &Path) -> Result<Vec<String>> {
     audit_module_ids(&modules_dir)
 }
 
-/// Cheap change detector used only to trigger a new full verification. This is
-/// never accepted as integrity evidence; an attacker controlling timestamps can
-/// at worst suppress the hint until the next explicit dashboard verification.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn dashboard_store_uninitialized(root: &Path) -> Result<bool> {
+    if !root.exists() {
+        return Ok(true);
+    }
+    for entry in std::fs::read_dir(root).context("read module audit root")? {
+        if entry?.file_name() != ".lock" {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Content-aware change detector used only to trigger a new full verification.
+/// This digest is never accepted as integrity evidence; event HMACs and the
+/// Manager seal remain the authority for all dashboard and response decisions.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn dashboard_store_revision(root: &Path) -> Result<String> {
     let mut digest = Sha256::new();
@@ -894,6 +908,17 @@ pub fn dashboard_store_revision(root: &Path) -> Result<String> {
             ]);
             if file_type.is_dir() {
                 pending.push(path);
+            } else if file_type.is_file() {
+                let mut file = File::open(&path)
+                    .with_context(|| format!("open audit dashboard input {}", path.display()))?;
+                let mut buffer = [0_u8; 8192];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..read]);
+                }
             }
         }
     }
@@ -2025,6 +2050,21 @@ fn diagnose_sealed_module(
     root: &Path,
     module: &CheckpointModuleHead,
 ) -> Result<Option<SealedIntegrityFailure>> {
+    let events_dir = module_path(root, &module.module_id).join("events");
+    if events_dir.is_dir() {
+        let (_, unexpected) = audit_event_paths(&events_dir)?;
+        if let Some(path) = unexpected.first() {
+            return Ok(Some(SealedIntegrityFailure {
+                module_id: module.module_id.clone(),
+                corrupted_from_sequence: u64::try_from(module.event_hashes.len())?
+                    .saturating_add(1),
+                reason: format!(
+                    "audit event directory contains unexpected entry {}",
+                    path.display()
+                ),
+            }));
+        }
+    }
     let mut valid = Vec::new();
     for (index, sealed_hash) in module.event_hashes.iter().enumerate() {
         let sequence = u64::try_from(index)?.saturating_add(1);
@@ -3427,7 +3467,7 @@ fn append_event(root: &Path, module_id: &str, kind: AuditEventKind) -> Result<()
         .last()
         .map_or_else(|| GENESIS_HASH.to_owned(), |entry| entry.event_hash.clone());
     let event = AuditEvent {
-        schema_version: SCHEMA_VERSION,
+        schema_version: EVENT_SCHEMA_VERSION,
         module_id: module_id.to_owned(),
         sequence,
         timestamp_unix_seconds: now(),
@@ -3455,21 +3495,18 @@ fn verify_chain(
             state: VerificationState::Empty,
         });
     }
-    let mut paths = std::fs::read_dir(&events_dir)
-        .context("read audit events")?
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect::<Vec<_>>();
+    let (mut paths, unexpected) = audit_event_paths(&events_dir)?;
     paths.sort();
     ensure!(
         paths.len() >= sealed_event_hashes.len(),
         "Manager-sealed audit history was truncated"
     );
+    if !unexpected.is_empty() && !sealed_event_hashes.is_empty() {
+        bail!(
+            "Manager-sealed audit event directory contains unexpected entry {}",
+            unexpected[0].display()
+        );
+    }
 
     let mut valid = Vec::new();
     let mut failure = None;
@@ -3490,7 +3527,23 @@ fn verify_chain(
         }
     }
 
-    let Some((bad_index, corrupted_from_sequence, reason)) = failure else {
+    let Some((corrupted_from_sequence, reason, corrupt_paths)) = failure
+        .map(|(index, sequence, reason)| (sequence, reason, paths[index..].to_vec()))
+        .or_else(|| {
+            (!unexpected.is_empty()).then(|| {
+                (
+                    u64::try_from(paths.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_add(1),
+                    format!(
+                        "audit event directory contains unexpected entry {}",
+                        unexpected[0].display()
+                    ),
+                    unexpected,
+                )
+            })
+        })
+    else {
         if !valid.is_empty() {
             match verify_head(root, module_id, key, &valid) {
                 Ok(HeadState::Current) => {}
@@ -3533,7 +3586,7 @@ fn verify_chain(
     };
     ensure!(repair, "audit history integrity failure: {reason}");
 
-    let quarantine = quarantine_suffix(root, module_id, &paths[bad_index..])?;
+    let quarantine = quarantine_suffix(root, module_id, &corrupt_paths)?;
     append_incident(
         root,
         module_id,
@@ -3566,7 +3619,7 @@ fn append_incident(
         .context("too many audit events")?
         .saturating_add(1);
     let incident = AuditEvent {
-        schema_version: SCHEMA_VERSION,
+        schema_version: EVENT_SCHEMA_VERSION,
         module_id: module_id.to_owned(),
         sequence,
         timestamp_unix_seconds: now(),
@@ -3593,9 +3646,14 @@ fn verify_event_file(
     key: &[u8; 32],
     sealed_hash: Option<&str>,
 ) -> Result<AuthenticatedEvent> {
-    let entry: AuthenticatedEvent = read_json(path)?;
+    let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let entry: AuthenticatedEvent =
+        serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?;
+    let mut canonical = serde_json::to_vec_pretty(&entry)?;
+    canonical.push(b'\n');
+    ensure!(raw == canonical, "audit event encoding is not canonical");
     ensure!(
-        entry.event.schema_version == SCHEMA_VERSION,
+        entry.event.schema_version == EVENT_SCHEMA_VERSION,
         "unsupported event schema"
     );
     ensure!(
@@ -3615,9 +3673,17 @@ fn verify_event_file(
     );
     let bytes = serde_json::to_vec(&entry.event)?;
     ensure!(
+        entry.hmac_sha256.len() == 64
+            && entry
+                .hmac_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "invalid event authentication tag"
+    );
+    ensure!(
         constant_time_eq(
             entry.event_hash.as_bytes(),
-            hex(&Sha256::digest(&bytes)).as_bytes()
+            authenticated_event_hash(&bytes, &entry.hmac_sha256).as_bytes()
         ),
         "event hash mismatch"
     );
@@ -3640,15 +3706,46 @@ fn verify_event_file(
 
 fn write_event(root: &Path, module_id: &str, key: &[u8; 32], event: AuditEvent) -> Result<()> {
     let bytes = serde_json::to_vec(&event)?;
+    let hmac_sha256 = hex(&hmac_sha256(key, &bytes));
     let entry = AuthenticatedEvent {
-        event_hash: hex(&Sha256::digest(&bytes)),
-        hmac_sha256: hex(&hmac_sha256(key, &bytes)),
+        event_hash: authenticated_event_hash(&bytes, &hmac_sha256),
+        hmac_sha256,
         event,
     };
     let path = event_path(root, module_id, entry.event.sequence);
     ensure_dir(path.parent().context("event path has no parent")?)?;
     atomic_write_json(&path, &entry)?;
     write_head(root, module_id, key, &entry)
+}
+
+fn authenticated_event_hash(event: &[u8], hmac_sha256: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"kernelsu-module-audit-event-v2\0");
+    digest.update(u64::try_from(event.len()).unwrap_or(u64::MAX).to_le_bytes());
+    digest.update(event);
+    digest.update(hmac_sha256.as_bytes());
+    hex(&digest.finalize())
+}
+
+fn audit_event_paths(events_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let mut events = Vec::new();
+    let mut unexpected = Vec::new();
+    for entry in std::fs::read_dir(events_dir).context("read audit events")? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let expected_name = name.len() == 25
+            && name.ends_with(".json")
+            && name[..20].bytes().all(|byte| byte.is_ascii_digit());
+        if entry.file_type()?.is_file() && expected_name {
+            events.push(path);
+        } else {
+            unexpected.push(path);
+        }
+    }
+    unexpected.sort();
+    Ok((events, unexpected))
 }
 
 enum HeadState {
@@ -4780,12 +4877,90 @@ mod tests {
         let mut event: AuthenticatedEvent = read_json(&path).unwrap();
         event.event.timestamp_unix_seconds = event.event.timestamp_unix_seconds.saturating_add(1);
         let bytes = serde_json::to_vec(&event.event).unwrap();
-        event.event_hash = hex(&Sha256::digest(&bytes));
         event.hmac_sha256 = hex(&hmac_sha256(&key, &bytes));
+        event.event_hash = authenticated_event_hash(&bytes, &event.hmac_sha256);
         atomic_write_json(&path, &event).unwrap();
 
         let error = verify_module(temp.path(), "test.module", false).unwrap_err();
         assert!(error.to_string().contains("Manager-sealed"));
+    }
+
+    #[test]
+    fn manager_seal_detects_event_hmac_tampering() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "module.alpha", "ab");
+        record(temp.path(), "module.beta", "cd");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(temp.path(), &checkpoint_envelope(temp.path(), &manager, 1))
+            .unwrap();
+
+        let path = event_path(temp.path(), "module.alpha", 1);
+        let mut event: AuthenticatedEvent = read_json(&path).unwrap();
+        event.hmac_sha256.truncate(48);
+        atomic_write_json(&path, &event).unwrap();
+
+        let compromised = read_module_history_resilient(temp.path(), "module.alpha", true).unwrap();
+        assert!(compromised.status.unresolved_risk);
+        assert!(
+            compromised
+                .integrity_error
+                .unwrap()
+                .contains("authentication tag")
+        );
+        assert!(
+            !verify_module(temp.path(), "module.beta", false)
+                .unwrap()
+                .unresolved_risk
+        );
+    }
+
+    #[test]
+    fn manager_seal_detects_same_length_event_hmac_replacement() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(temp.path(), &checkpoint_envelope(temp.path(), &manager, 1))
+            .unwrap();
+
+        let path = event_path(temp.path(), "test.module", 1);
+        let mut event: AuthenticatedEvent = read_json(&path).unwrap();
+        event.hmac_sha256 = "0".repeat(64);
+        atomic_write_json(&path, &event).unwrap();
+
+        let compromised = read_module_history_resilient(temp.path(), "test.module", true).unwrap();
+        assert!(compromised.status.unresolved_risk);
+        assert!(
+            compromised
+                .integrity_error
+                .unwrap()
+                .contains("event hash mismatch")
+        );
+    }
+
+    #[test]
+    fn manager_seal_detects_noncanonical_event_encoding() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(temp.path(), &checkpoint_envelope(temp.path(), &manager, 1))
+            .unwrap();
+
+        let path = event_path(temp.path(), "test.module", 1);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b" \n");
+        std::fs::write(&path, bytes).unwrap();
+
+        let compromised = read_module_history_resilient(temp.path(), "test.module", true).unwrap();
+        assert!(compromised.status.unresolved_risk);
+        assert!(
+            compromised
+                .integrity_error
+                .unwrap()
+                .contains("not canonical")
+        );
     }
 
     #[test]
@@ -5471,8 +5646,16 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("audit");
 
+        assert!(dashboard_store_uninitialized(&root).unwrap());
         assert!(list_histories(&root, true).unwrap().is_empty());
         assert!(!root.exists());
+
+        std::fs::create_dir(&root).unwrap();
+        assert!(dashboard_store_uninitialized(&root).unwrap());
+        std::fs::write(root.join(".lock"), b"").unwrap();
+        assert!(dashboard_store_uninitialized(&root).unwrap());
+        std::fs::write(root.join("unexpected"), b"").unwrap();
+        assert!(!dashboard_store_uninitialized(&root).unwrap());
     }
 
     #[test]

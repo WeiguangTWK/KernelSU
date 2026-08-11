@@ -435,7 +435,9 @@ private fun AuditBackButtonMiuix(onClick: () -> Unit) {
 private fun AuditOverviewMiuix(state: SecurityAuditUiState, onOpenCategory: (AuditCategory) -> Unit) {
     Column(Modifier.padding(horizontal = 12.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionTitleMiuix(stringResource(R.string.security_audit_overview), horizontalPadding = 12)
-        AuditKeyProtectionMiuix(state.keyProtection)
+        if (state.auditInitialized) {
+            AuditKeyProtectionMiuix(state.keyProtection)
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AuditMetricMiuix(state.highRiskModules, stringResource(R.string.security_audit_high_risk), Icons.Outlined.Security, state.highRiskModules > 0, Modifier.weight(1f)) { onOpenCategory(AuditCategory.CriticalRisk) }
             AuditMetricMiuix(state.networkModules, stringResource(R.string.security_audit_network), Icons.Outlined.Language, false, Modifier.weight(1f)) { onOpenCategory(AuditCategory.Network) }

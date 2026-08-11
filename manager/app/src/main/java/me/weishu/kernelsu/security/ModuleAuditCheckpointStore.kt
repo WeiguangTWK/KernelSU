@@ -1356,7 +1356,7 @@ class ModuleAuditCheckpointStore(context: Context) {
         const val DASHBOARD_CACHE_FILE_NAME = "module_audit_dashboard_cache.json"
         const val ENVELOPE_SCHEMA_VERSION = 2
         const val SOFTWARE_KEY_SCHEMA_VERSION = 1
-        const val CHECKPOINT_SCHEMA_VERSION = 5
+        const val CHECKPOINT_SCHEMA_VERSION = 6
         const val AUTHORIZATION_SCHEMA_VERSION = 2
         const val DASHBOARD_CACHE_SCHEMA_VERSION = 1
         const val P256_COORDINATE_BYTES = 32

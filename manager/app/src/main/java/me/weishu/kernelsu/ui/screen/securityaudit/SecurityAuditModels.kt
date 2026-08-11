@@ -92,6 +92,7 @@ data class SecurityAuditUiState(
     val recoverableModuleIds: List<String> = emptyList(),
     val sealedRecoveryModuleIds: List<String> = emptyList(),
     val recoverySafeMode: Boolean = false,
+    val auditInitialized: Boolean = true,
     val keyProtection: AuditKeyProtection = AuditKeyProtection.Unavailable,
     val auditAuthorizationReady: Boolean = false,
     val errorMessage: String? = null,

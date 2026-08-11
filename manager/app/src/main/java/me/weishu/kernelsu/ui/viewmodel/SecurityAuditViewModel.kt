@@ -178,6 +178,21 @@ class SecurityAuditViewModel : ViewModel() {
             runCatching {
                 val stream = loadDashboardStream(generation)
                 val completion = stream.completion
+                if (completion.optBoolean("uninitialized", false)) {
+                    val checkpoint = checkpointStore.checkpointUnavailable(
+                        "Module audit history is not initialized"
+                    )
+                    return@runCatching AuditLoadResult(
+                        histories = emptyList(),
+                        staleModuleIds = emptyList(),
+                        checkpoint = checkpoint,
+                        initialized = false,
+                        authorizationReady = false,
+                        sealedRecoveryModuleIds = emptyList(),
+                        storeRevision = completion.getString("store_revision"),
+                        error = null,
+                    )
+                }
                 val rawCheckpoint = completion.getJSONObject("checkpoint").toString()
                 val sealStatus = completion.getJSONObject("seal_status")
                 val authorizationStatus = completion.getJSONObject("authorization_status")
@@ -256,6 +271,7 @@ class SecurityAuditViewModel : ViewModel() {
                     recoverableModuleIds = result.checkpoint.recoverableModules,
                     sealedRecoveryModuleIds = result.sealedRecoveryModuleIds,
                     recoverySafeMode = Natives.isSafeMode,
+                    auditInitialized = result.initialized,
                     keyProtection = result.checkpoint.protection,
                     auditAuthorizationReady = result.authorizationReady,
                     errorMessage = result.error?.let {
@@ -291,6 +307,7 @@ class SecurityAuditViewModel : ViewModel() {
         val histories: List<AuditHistory>,
         val staleModuleIds: List<String>,
         val checkpoint: AuditCheckpointVerification,
+        val initialized: Boolean = true,
         val authorizationReady: Boolean,
         val sealedRecoveryModuleIds: List<String>,
         val storeRevision: String,

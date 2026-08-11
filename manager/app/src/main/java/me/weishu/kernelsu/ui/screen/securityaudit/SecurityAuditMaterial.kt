@@ -416,7 +416,9 @@ private fun AuditScaffoldMaterial(
 private fun AuditOverviewMaterial(state: SecurityAuditUiState, onOpenCategory: (AuditCategory) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionTitleMaterial(stringResource(R.string.security_audit_overview))
-        AuditKeyProtectionMaterial(state.keyProtection)
+        if (state.auditInitialized) {
+            AuditKeyProtectionMaterial(state.keyProtection)
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             AuditMetricMaterial(state.highRiskModules, stringResource(R.string.security_audit_high_risk), Icons.Outlined.Security, Modifier.weight(1f), state.highRiskModules > 0) {
                 onOpenCategory(AuditCategory.CriticalRisk)
