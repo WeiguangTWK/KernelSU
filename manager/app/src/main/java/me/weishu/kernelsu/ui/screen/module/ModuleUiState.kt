@@ -53,6 +53,7 @@ data class ModuleUiState(
     val checkModuleUpdate: Boolean = true,
     val isSafeMode: Boolean = false,
     val magiskInstalled: Boolean = false,
+    val secureRemovalModuleIds: Set<String> = emptySet(),
     val confirmDialogState: ModuleConfirmDialogState? = null,
 ) {
     val installButtonVisible: Boolean
@@ -71,6 +72,7 @@ data class ModuleActions(
     val onConfirmUpdate: (ModuleConfirmRequest.Update) -> Unit,
     val onOpenRepo: () -> Unit,
     val onOpenSecurityAudit: () -> Unit,
+    val onOpenModuleAudit: (String) -> Unit,
     val onToggleSortActionFirst: () -> Unit,
     val onToggleSortEnabledFirst: () -> Unit,
     val onOpenWebUi: (Module) -> Unit,

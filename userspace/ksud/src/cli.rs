@@ -307,6 +307,13 @@ enum Module {
         json: bool,
     },
 
+    /// Verify persisted module audit state without returning event payloads
+    AuditStatus {
+        /// print structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Export the canonical payload for a Manager Keystore checkpoint
     AuditCheckpoint,
 
@@ -346,6 +353,24 @@ enum Module {
         /// one-shot Manager authorization token (required unless --dry-run)
         #[arg(long)]
         authorization: Option<String>,
+    },
+
+    /// Disable an untrusted module and cancel its normal scripted uninstall
+    AuditContain {
+        /// untrusted module id
+        id: String,
+    },
+
+    /// Remove an untrusted module without executing module-controlled scripts
+    AuditSecureRemove {
+        /// untrusted module id
+        id: String,
+        /// print structured JSON result
+        #[arg(long)]
+        json: bool,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
     },
 
     /// Undo module uninstall mark <id>
@@ -652,6 +677,21 @@ pub fn run() -> Result<()> {
                     }
                     Ok(())
                 }
+                Module::AuditStatus { json } => {
+                    let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
+                    let statuses = crate::module_audit_log::list_modules(root, true)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&statuses)?);
+                    } else {
+                        for status in statuses {
+                            println!(
+                                "{}: unresolved_risk={}, events={}",
+                                status.module_id, status.unresolved_risk, status.event_count
+                            );
+                        }
+                    }
+                    Ok(())
+                }
                 Module::AuditCheckpoint => {
                     let payload = crate::module_audit_log::checkpoint_payload(
                         std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),
@@ -696,6 +736,12 @@ pub fn run() -> Result<()> {
                                     module::audit_rescan_arguments_hash()?
                                 }
                                 "prune" => module::audit_prune_arguments_hash(id.as_deref())?,
+                                "secure-remove" => {
+                                    let id = id
+                                        .as_deref()
+                                        .context("secure-remove authorization requires --id")?;
+                                    module::audit_secure_remove_arguments_hash(id)?
+                                }
                                 _ => anyhow::bail!("unsupported audit authorization action"),
                             };
                             let challenge = crate::module_audit_log::manager_audit_auth_challenge(
@@ -746,6 +792,23 @@ pub fn run() -> Result<()> {
                     json,
                     authorization.as_deref(),
                 ),
+                Module::AuditContain { id } => module::contain_module_for_secure_removal(&id),
+                Module::AuditSecureRemove {
+                    id,
+                    json,
+                    authorization,
+                } => {
+                    module::secure_remove_module(&id, &authorization)?;
+                    if json {
+                        println!(
+                            "{{\"module_id\":{},\"removed\":true}}",
+                            serde_json::to_string(&id)?
+                        );
+                    } else {
+                        println!("- Securely removed module {id}");
+                    }
+                    Ok(())
+                }
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),
                 Module::Uninstall { id } => module::uninstall_module(&id),
                 Module::Enable { id } => module::enable_module(&id),

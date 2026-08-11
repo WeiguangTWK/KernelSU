@@ -488,6 +488,7 @@ fun ModulePagerMiuix(
                         .overScrollVertical(),
                     modules = uiState.searchResults,
                     updateInfoMap = uiState.updateInfo,
+                    secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                     actions = actions,
                     onModuleAddShortcut = ::onModuleAddShortcut,
                     contentPadding = PaddingValues(
@@ -593,6 +594,7 @@ fun ModulePagerMiuix(
                                 .nestedScroll(nestedScrollConnection),
                             modules = modules,
                             updateInfoMap = uiState.updateInfo,
+                            secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                             actions = actions,
                             onModuleAddShortcut = { module, type ->
                                 onModuleAddShortcut(module, type)
@@ -748,6 +750,7 @@ private fun ModuleList(
     modifier: Modifier = Modifier,
     modules: List<Module>,
     updateInfoMap: Map<String, ModuleUpdateInfo>,
+    secureRemovalModuleIds: Set<String>,
     actions: ModuleActions,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
     contentPadding: PaddingValues,
@@ -771,9 +774,14 @@ private fun ModuleList(
             val content: @Composable () -> Unit = {
                 ModuleItem(
                     module = module,
+                    requiresSecureRemoval = module.id in secureRemovalModuleIds,
                     updateUrl = moduleUpdateInfo.downloadUrl,
                     onUninstall = {
-                        actions.onRequestUninstallConfirmation(currentModuleState.value)
+                        if (module.id in secureRemovalModuleIds) {
+                            actions.onOpenModuleAudit(module.id)
+                        } else {
+                            actions.onRequestUninstallConfirmation(currentModuleState.value)
+                        }
                     },
                     onUndoUninstall = {
                         scope.launch {
@@ -817,6 +825,7 @@ private fun ModuleList(
 @Composable
 fun ModuleItem(
     module: Module,
+    requiresSecureRemoval: Boolean,
     updateUrl: String,
     onUndoUninstall: () -> Unit,
     onUninstall: () -> Unit,
@@ -919,7 +928,7 @@ fun ModuleItem(
                 )
             }
             Switch(
-                enabled = !module.update,
+                enabled = !module.update && !requiresSecureRemoval,
                 checked = module.enabled,
                 onCheckedChange = {
                     if (it != module.enabled) onCheckChanged(it)
@@ -957,7 +966,7 @@ fun ModuleItem(
 
         Row {
             AnimatedVisibility(
-                visible = module.enabled && !module.remove && !module.update,
+                visible = module.enabled && !module.remove && !module.update && !requiresSecureRemoval,
                 enter = fadeIn(),
                 exit = fadeOut()
             ) {
@@ -1042,7 +1051,7 @@ fun ModuleItem(
                 IconButton(
                     modifier = Modifier.padding(end = 8.dp),
                     backgroundColor = updateBg,
-                    enabled = !module.remove,
+                    enabled = !module.remove && !requiresSecureRemoval,
                     minHeight = 35.dp,
                     minWidth = 35.dp,
                     onClick = onUpdate,
@@ -1071,7 +1080,13 @@ fun ModuleItem(
             IconButton(
                 minHeight = 35.dp,
                 minWidth = 35.dp,
-                onClick = if (module.remove) onUndoUninstall else onUninstall,
+                onClick = if (requiresSecureRemoval) {
+                    onUninstall
+                } else if (module.remove) {
+                    onUndoUninstall
+                } else {
+                    onUninstall
+                },
                 backgroundColor = if (module.remove) {
                     secondaryContainer.copy(alpha = 0.8f)
                 } else {
@@ -1088,7 +1103,9 @@ fun ModuleItem(
                 ) {
                     Icon(
                         modifier = Modifier.size(20.dp),
-                        imageVector = if (module.remove) {
+                        imageVector = if (requiresSecureRemoval) {
+                            Icons.Outlined.Shield
+                        } else if (module.remove) {
                             MiuixIcons.Undo
                         } else {
                             MiuixIcons.Delete
@@ -1104,7 +1121,11 @@ fun ModuleItem(
                         Text(
                             modifier = Modifier.padding(start = 4.dp, end = 3.dp),
                             text = stringResource(
-                                if (module.remove) R.string.undo else R.string.uninstall
+                                when {
+                                    requiresSecureRemoval -> R.string.security_audit_secure_remove_confirm
+                                    module.remove -> R.string.undo
+                                    else -> R.string.uninstall
+                                }
                             ),
                             color = actionIconTint,
                             fontWeight = FontWeight.Medium,

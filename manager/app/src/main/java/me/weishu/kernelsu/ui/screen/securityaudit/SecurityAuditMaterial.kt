@@ -208,6 +208,29 @@ fun SecurityAuditModuleMaterial(
             history == null && !state.isLoading -> item { AuditEmptyResultMaterial() }
             history != null -> {
                 item { AuditIntegrityMaterial(history) }
+                if (
+                    history.status.unresolvedRisk &&
+                    moduleId !in state.staleModuleIds
+                ) {
+                    item {
+                        Button(
+                            onClick = { actions.onRequestSecureRemoval(moduleId) },
+                            enabled = state.secureRemovalModuleId == null && !state.isLoading,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            if (state.secureRemovalModuleId == moduleId) {
+                                CircularProgressIndicator(
+                                    Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            } else {
+                                Icon(Icons.Outlined.Shield, contentDescription = null)
+                                Spacer(Modifier.size(8.dp))
+                                Text(stringResource(R.string.security_audit_secure_remove_action, moduleId))
+                            }
+                        }
+                    }
+                }
                 if (groups.isEmpty()) {
                     item { AuditEmptyResultMaterial() }
                 } else {
@@ -538,6 +561,7 @@ fun auditEventTitle(event: AuditEvent): String = when (event.kind.type) {
     "installed_rescan" -> stringResource(R.string.security_audit_event_rescan)
     "installed_rescan_failed" -> stringResource(R.string.security_audit_event_rescan_failed)
     "integrity_incident" -> stringResource(R.string.security_audit_event_integrity)
+    "secure_removal_completed" -> stringResource(R.string.security_audit_event_secure_removed)
     else -> event.kind.type.replace('_', ' ')
 }
 

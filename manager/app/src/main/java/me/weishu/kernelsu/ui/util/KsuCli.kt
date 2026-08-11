@@ -144,6 +144,13 @@ suspend fun getModuleAuditHistories(): String = withContext(Dispatchers.IO) {
     stdout.joinToString("\n").ifBlank { "[]" }
 }
 
+suspend fun getModuleAuditStatuses(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-status --json",
+        "Unable to read module audit status",
+    )
+}
+
 suspend fun getModuleAuditCheckpoint(): String = withContext(Dispatchers.IO) {
     val stdout = ArrayList<String>()
     val stderr = ArrayList<String>()
@@ -178,13 +185,19 @@ suspend fun registerModuleAuditAuthorizationKey(
     )
 }
 
-suspend fun getModuleAuditAuthorizationChallenge(action: String): String =
+suspend fun getModuleAuditAuthorizationChallenge(action: String, moduleId: String? = null): String =
     withContext(Dispatchers.IO) {
-        check(action == "rescan" || action == "prune") {
+        check(action == "rescan" || action == "prune" || action == "secure-remove") {
             "Unsupported audit authorization action"
         }
+        check(moduleId == null || moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) {
+            "Invalid module id"
+        }
+        check((action == "secure-remove") == (moduleId != null)) {
+            "Secure removal authorization must target exactly one module"
+        }
         runModuleAuditCommand(
-            "audit-auth challenge $action",
+            "audit-auth challenge $action" + (moduleId?.let { " --id $it" } ?: ""),
             "Unable to obtain Manager audit authorization challenge",
         )
     }
@@ -265,6 +278,26 @@ suspend fun pruneStaleModuleAuditHistories(authorization: String): String =
             stderr.joinToString("\n").ifBlank { "Unable to clear stale module audit histories" }
         }
         stdout.joinToString("\n").ifBlank { "[]" }
+    }
+
+suspend fun containModuleForSecureRemoval(moduleId: String): String = withContext(Dispatchers.IO) {
+    check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
+    runModuleAuditCommand(
+        "audit-contain $moduleId",
+        "Unable to contain untrusted module",
+    )
+}
+
+suspend fun securelyRemoveModule(moduleId: String, authorization: String): String =
+    withContext(Dispatchers.IO) {
+        check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
+        check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+            "Invalid Manager audit authorization token"
+        }
+        runModuleAuditCommand(
+            "audit-secure-remove $moduleId --json --authorization $authorization",
+            "Unable to securely remove untrusted module",
+        )
     }
 
 private fun runModuleAuditCommand(command: String, fallbackError: String): String {

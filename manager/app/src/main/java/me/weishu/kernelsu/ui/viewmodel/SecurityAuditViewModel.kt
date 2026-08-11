@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.ksuApp
@@ -23,6 +24,7 @@ import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
 import me.weishu.kernelsu.ui.screen.securityaudit.parseStaleAuditModuleIds
 import me.weishu.kernelsu.ui.util.commitModuleAuditSeal
+import me.weishu.kernelsu.ui.util.containModuleForSecureRemoval
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
 import me.weishu.kernelsu.ui.util.getModuleAuditCheckpoint
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationChallenge
@@ -32,6 +34,7 @@ import me.weishu.kernelsu.ui.util.getStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
+import me.weishu.kernelsu.ui.util.securelyRemoveModule as runSecureModuleRemoval
 import org.json.JSONObject
 
 class SecurityAuditViewModel : ViewModel() {
@@ -214,9 +217,9 @@ class SecurityAuditViewModel : ViewModel() {
         error(ksuApp.getString(R.string.security_audit_authorization_changed))
     }
 
-    private suspend fun createAuthorization(action: String): String =
+    private suspend fun createAuthorization(action: String, moduleId: String? = null): String =
         checkpointStore.signAuditAuthorization(
-            getModuleAuditAuthorizationChallenge(action)
+            getModuleAuditAuthorizationChallenge(action, moduleId)
         )
 
     private suspend fun ensureAuditSeal(): Boolean {
@@ -360,6 +363,52 @@ class SecurityAuditViewModel : ViewModel() {
                 _uiState.update { it.copy(isPruning = false) }
                 refresh()
             }
+        }
+    }
+
+    fun containForSecureRemoval(moduleId: String, onContained: () -> Unit) {
+        val history = _uiState.value.histories.firstOrNull { it.status.moduleId == moduleId }
+        if (history?.status?.unresolvedRisk != true || moduleId in _uiState.value.staleModuleIds) {
+            return
+        }
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { containModuleForSecureRemoval(moduleId) }
+            }.onSuccess {
+                onContained()
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                _uiState.update {
+                    it.copy(errorMessage = error.message ?: error::class.java.simpleName)
+                }
+            }
+        }
+    }
+
+    fun securelyRemoveModule(moduleId: String) {
+        while (true) {
+            val state = _uiState.value
+            val history = state.histories.firstOrNull { it.status.moduleId == moduleId }
+            if (
+                state.secureRemovalModuleId != null || state.auditMutationBlocked ||
+                !state.recoverySafeMode || history?.status?.unresolvedRisk != true ||
+                moduleId in state.staleModuleIds
+            ) {
+                return
+            }
+            if (_uiState.compareAndSet(state, state.copy(secureRemovalModuleId = moduleId))) break
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                runSecureModuleRemoval(moduleId, createAuthorization("secure-remove", moduleId))
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                _uiState.update {
+                    it.copy(errorMessage = error.message ?: error::class.java.simpleName)
+                }
+            }
+            _uiState.update { it.copy(secureRemovalModuleId = null) }
+            refresh()
         }
     }
 }

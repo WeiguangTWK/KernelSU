@@ -56,6 +56,10 @@ pub enum AuditEventKind {
         reason: String,
         quarantine: String,
     },
+    SecureRemovalCompleted {
+        operation_id: String,
+        removed_paths: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -137,6 +141,7 @@ pub struct ModuleAuditStatus {
     pub module_id: String,
     pub verification: VerificationState,
     pub high_risk: bool,
+    pub unresolved_risk: bool,
     pub event_count: usize,
     pub head_hash: String,
     pub hmac_verified: bool,
@@ -648,6 +653,22 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
     if high_risk {
         write_risk(root, module_id, &key, "audit history integrity failure")?;
     }
+    let last_secure_removal = chain
+        .events
+        .iter()
+        .filter_map(|entry| match entry.event.kind {
+            AuditEventKind::SecureRemovalCompleted { .. } => Some(entry.event.sequence),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let unresolved_integrity_risk = chain.events.iter().any(|entry| {
+        entry.event.sequence > last_secure_removal
+            && matches!(entry.event.kind, AuditEventKind::IntegrityIncident { .. })
+    });
+    // Static Critical findings are advisory after the user explicitly accepts an install.
+    // Only authenticated runtime integrity incidents require containment and secure removal.
+    let unresolved_risk = unresolved_integrity_risk;
     let head_hash = chain
         .events
         .last()
@@ -656,6 +677,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         module_id: module_id.to_owned(),
         verification: chain.state,
         high_risk,
+        unresolved_risk,
         event_count: chain.events.len(),
         head_hash,
         hmac_verified: true,
@@ -665,6 +687,16 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
             CheckpointState::Sealed
         },
     })
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn module_requires_secure_removal(root: &Path, module_id: &str) -> Result<bool> {
+    validate_module_id(module_id)?;
+    if !module_path(root, module_id).exists() {
+        return Ok(false);
+    }
+    let _lock = AuditLock::acquire(root, false)?;
+    Ok(verify_module_unlocked(root, module_id, true)?.unresolved_risk)
 }
 
 pub fn list_modules(root: &Path, repair: bool) -> Result<Vec<ModuleAuditStatus>> {
@@ -862,6 +894,123 @@ pub fn prune_stale_histories(
         });
     }
     Ok(pruned)
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn quarantine_module_for_secure_removal(
+    root: &Path,
+    installed_modules_root: &Path,
+    pending_modules_root: &Path,
+    operation_id: &str,
+    module_id: &str,
+) -> Result<Vec<String>> {
+    validate_sha256_hex(operation_id, "operation id")?;
+    validate_module_id(module_id)?;
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let operation = read_operation(root, operation_id, &key)?
+        .context("secure removal audit operation is unavailable")?;
+    ensure!(
+        operation.action == "secure-remove"
+            && operation.state == AuditOperationState::Applying
+            && operation.targets == [module_id],
+        "secure removal audit operation is not active"
+    );
+    ensure!(
+        verify_module_unlocked(root, module_id, true)?.unresolved_risk,
+        "module does not have an unresolved audit integrity incident"
+    );
+
+    let trash_root = root
+        .join(OPERATION_TRASH_DIR)
+        .join(operation_id)
+        .join("module-content");
+    let candidates = [
+        (installed_modules_root.join(module_id), "installed"),
+        (pending_modules_root.join(module_id), "pending"),
+    ];
+    let mut removed_paths = Vec::new();
+    for (source, label) in candidates {
+        let destination = trash_root.join(label);
+        if source.exists() {
+            ensure!(
+                !destination.exists(),
+                "secure removal quarantine destination already exists"
+            );
+            ensure_dir(
+                destination
+                    .parent()
+                    .context("removal trash has no parent")?,
+            )?;
+            std::fs::rename(&source, &destination)
+                .with_context(|| format!("quarantine untrusted module {module_id}"))?;
+            sync_dir(source.parent().context("module path has no parent")?)?;
+            sync_dir(
+                destination
+                    .parent()
+                    .context("removal trash has no parent")?,
+            )?;
+        }
+        if destination.exists() {
+            removed_paths.push(source.to_string_lossy().into_owned());
+        }
+    }
+    ensure!(
+        !removed_paths.is_empty(),
+        "module content and secure removal quarantine are both missing"
+    );
+    Ok(removed_paths)
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn complete_secure_module_removal(
+    root: &Path,
+    operation_id: &str,
+    module_id: &str,
+    mut removed_paths: Vec<String>,
+) -> Result<ModuleAuditStatus> {
+    validate_sha256_hex(operation_id, "operation id")?;
+    validate_module_id(module_id)?;
+    removed_paths.sort();
+    removed_paths.dedup();
+    ensure!(
+        !removed_paths.is_empty(),
+        "secure removal removed no module paths"
+    );
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let mut operation = read_operation(root, operation_id, &key)?
+        .context("secure removal audit operation is unavailable")?;
+    ensure!(
+        operation.action == "secure-remove"
+            && operation.state == AuditOperationState::Applying
+            && operation.targets == [module_id],
+        "secure removal audit operation is not active"
+    );
+    let already_recorded = verify_chain(root, module_id, &key, true)?
+        .events
+        .iter()
+        .any(|entry| {
+            matches!(
+                &entry.event.kind,
+                AuditEventKind::SecureRemovalCompleted { operation_id: recorded, .. }
+                    if recorded == operation_id
+            )
+        });
+    if !already_recorded {
+        append_event(
+            root,
+            module_id,
+            AuditEventKind::SecureRemovalCompleted {
+                operation_id: operation_id.to_owned(),
+                removed_paths,
+            },
+        )?;
+    }
+    operation.completed_targets = vec![module_id.to_owned()];
+    operation.updated_at_unix_seconds = now();
+    write_record(&operation_path(root, operation_id), operation, &key)?;
+    verify_module_unlocked(root, module_id, true)
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
@@ -1121,6 +1270,12 @@ fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
                     operation_trash_path(root, &operation.operation_id, target).exists()
                         && operation_tombstone_path(root, target, &operation.operation_id).exists()
                 }
+                "secure-remove" => operation_secure_removal_event_exists(
+                    root,
+                    target,
+                    &operation.operation_id,
+                    key,
+                )?,
                 _ => false,
             };
             if completed {
@@ -1163,6 +1318,27 @@ fn operation_rescan_event_exists(
                 ..
             } => recorded == operation_id,
             _ => false,
+        }))
+}
+
+fn operation_secure_removal_event_exists(
+    root: &Path,
+    module_id: &str,
+    operation_id: &str,
+    key: &[u8; 32],
+) -> Result<bool> {
+    if !module_path(root, module_id).exists() {
+        return Ok(false);
+    }
+    Ok(verify_chain(root, module_id, key, true)?
+        .events
+        .iter()
+        .any(|entry| {
+            matches!(
+                &entry.event.kind,
+                AuditEventKind::SecureRemovalCompleted { operation_id: recorded, .. }
+                    if recorded == operation_id
+            )
         }))
 }
 
@@ -1350,7 +1526,9 @@ pub fn commit_manager_audit_seal(
 
 fn finalize_sealed_operation_trash(root: &Path, payload: &CheckpointPayload) -> Result<()> {
     for operation in &payload.operations {
-        if operation.action != "prune" || operation.state == AuditOperationState::Applying {
+        if !matches!(operation.action.as_str(), "prune" | "secure-remove")
+            || operation.state == AuditOperationState::Applying
+        {
             continue;
         }
         let trash = root.join(OPERATION_TRASH_DIR).join(&operation.operation_id);
@@ -1657,7 +1835,10 @@ fn validate_checkpoint_operation(operation: &CheckpointOperation) -> Result<()> 
         "invalid checkpoint audit operation authorization"
     );
     ensure!(
-        matches!(operation.action.as_str(), "rescan" | "prune"),
+        matches!(
+            operation.action.as_str(),
+            "rescan" | "prune" | "secure-remove"
+        ),
         "unsupported checkpoint audit operation"
     );
     ensure!(
@@ -3961,6 +4142,111 @@ mod tests {
         let tombstone: AuthenticatedRecord<PrunedHistoryTombstone> =
             read_json(&tombstone_path).unwrap();
         assert!(tombstone.record.had_integrity_incident);
+    }
+
+    #[test]
+    fn accepted_critical_install_does_not_require_secure_removal() {
+        let temp = TempDir::new().unwrap();
+        let audit_root = temp.path().join("audit");
+        let mut critical = report("risky.module", "ab");
+        critical.findings[0].severity = Severity::Critical;
+
+        let receipt = begin_install(&audit_root, critical).unwrap();
+        finish_install(&audit_root, receipt, InstallOutcome::Installed, None).unwrap();
+
+        assert!(
+            !module_requires_secure_removal(&audit_root, "risky.module").unwrap(),
+            "an accepted static Critical finding must remain advisory"
+        );
+    }
+
+    #[test]
+    fn secure_removal_quarantines_module_without_running_its_scripts() {
+        let temp = TempDir::new().unwrap();
+        let audit_root = temp.path().join("audit");
+        let installed_root = temp.path().join("modules");
+        let pending_root = temp.path().join("modules_update");
+        let module_root = installed_root.join("risky.module");
+        let pending_module_root = pending_root.join("risky.module");
+        std::fs::create_dir_all(&module_root).unwrap();
+        std::fs::create_dir_all(&pending_module_root).unwrap();
+        std::fs::write(module_root.join("module.prop"), b"id=risky.module\n").unwrap();
+        std::fs::write(
+            pending_module_root.join("module.prop"),
+            b"id=risky.module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            module_root.join("uninstall.sh"),
+            b"touch /data/local/tmp/should-not-run\n",
+        )
+        .unwrap();
+
+        let receipt = begin_install(&audit_root, report("risky.module", "ab")).unwrap();
+        finish_install(&audit_root, receipt, InstallOutcome::Installed, None).unwrap();
+        std::fs::write(event_path(&audit_root, "risky.module", 2), b"corrupt").unwrap();
+        verify_module(&audit_root, "risky.module", true).unwrap();
+        assert!(module_requires_secure_removal(&audit_root, "risky.module").unwrap());
+
+        let rescan = begin_test_operation(&audit_root, "rescan", &["risky.module"]);
+        record_installed_rescan(
+            &audit_root,
+            &rescan.operation_id,
+            "risky.module",
+            Ok(report("risky.module", "cd")),
+        )
+        .unwrap();
+        finish_manager_audit_operation(&audit_root, &rescan.operation_id).unwrap();
+        assert!(
+            module_requires_secure_removal(&audit_root, "risky.module").unwrap(),
+            "a later clean scan must not silently dismiss an integrity incident"
+        );
+
+        let operation = begin_test_operation(&audit_root, "secure-remove", &["risky.module"]);
+        let removed_paths = quarantine_module_for_secure_removal(
+            &audit_root,
+            &installed_root,
+            &pending_root,
+            &operation.operation_id,
+            "risky.module",
+        )
+        .unwrap();
+        assert!(!module_root.exists());
+        assert!(!pending_module_root.exists());
+        assert!(
+            audit_root
+                .join(OPERATION_TRASH_DIR)
+                .join(&operation.operation_id)
+                .join("module-content/installed/uninstall.sh")
+                .exists()
+        );
+        assert!(
+            audit_root
+                .join(OPERATION_TRASH_DIR)
+                .join(&operation.operation_id)
+                .join("module-content/pending/module.prop")
+                .exists()
+        );
+
+        let status = complete_secure_module_removal(
+            &audit_root,
+            &operation.operation_id,
+            "risky.module",
+            removed_paths,
+        )
+        .unwrap();
+        assert!(!status.unresolved_risk);
+        finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
+
+        let manager = signing_key(29);
+        commit_manager_audit_seal(&audit_root, &checkpoint_envelope(&audit_root, &manager, 1))
+            .unwrap();
+        assert!(
+            !audit_root
+                .join(OPERATION_TRASH_DIR)
+                .join(operation.operation_id)
+                .exists()
+        );
     }
 
     #[test]

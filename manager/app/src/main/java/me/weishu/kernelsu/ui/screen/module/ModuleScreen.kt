@@ -122,6 +122,7 @@ fun ModulePager(
         },
         onOpenRepo = { navigator.push(Route.ModuleRepo) },
         onOpenSecurityAudit = { navigator.push(Route.SecurityAudit) },
+        onOpenModuleAudit = { moduleId -> navigator.push(Route.SecurityAuditModule(moduleId)) },
         onToggleSortActionFirst = {
             viewModel.toggleSortActionFirst()
         },

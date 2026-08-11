@@ -213,6 +213,23 @@ fun SecurityAuditModuleMiuix(
             history == null && !state.isLoading -> item { AuditEmptyMiuix(stringResource(R.string.security_audit_empty_result)) }
             history != null -> {
                 item { AuditIntegrityMiuix(history) }
+                if (
+                    history.status.unresolvedRisk &&
+                    moduleId !in state.staleModuleIds
+                ) {
+                    item {
+                        TextButton(
+                            text = if (state.secureRemovalModuleId == moduleId) {
+                                stringResource(R.string.security_audit_secure_remove_working)
+                            } else {
+                                stringResource(R.string.security_audit_secure_remove_action, moduleId)
+                            },
+                            onClick = { actions.onRequestSecureRemoval(moduleId) },
+                            enabled = state.secureRemovalModuleId == null && !state.isLoading,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
                 if (groups.isEmpty()) {
                     item { AuditEmptyMiuix(stringResource(R.string.security_audit_no_findings)) }
                 } else {

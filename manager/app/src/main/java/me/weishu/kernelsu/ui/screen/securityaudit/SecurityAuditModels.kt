@@ -13,6 +13,7 @@ data class AuditStatus(
     val moduleId: String,
     val verification: String,
     val highRisk: Boolean,
+    val unresolvedRisk: Boolean,
     val eventCount: Int,
     val headHash: String,
     val hmacVerified: Boolean,
@@ -37,6 +38,8 @@ data class AuditEventKind(
     val corruptedFromSequence: Long? = null,
     val reason: String? = null,
     val quarantine: String? = null,
+    val operationId: String? = null,
+    val removedPaths: List<String> = emptyList(),
 )
 
 data class AuditReport(
@@ -64,6 +67,7 @@ data class SecurityAuditUiState(
     val isRescanning: Boolean = false,
     val isPruning: Boolean = false,
     val isRecovering: Boolean = false,
+    val secureRemovalModuleId: String? = null,
     val histories: List<AuditHistory> = emptyList(),
     val staleModuleIds: List<String> = emptyList(),
     val checkpointCompromised: Boolean = false,
@@ -146,14 +150,36 @@ fun AuditHistory.displayName(): String = latestReport()?.moduleId ?: status.modu
 
 fun AuditHistory.packageFingerprint(): String? = latestReport()?.packageSha256?.take(12)
 
-fun AuditHistory.isHighRisk(): Boolean = status.highRisk || latestFindings().any {
+fun AuditHistory.isHighRisk(): Boolean = status.unresolvedRisk || latestFindings().any {
     it.severity == "critical"
 }
 
-fun AuditHistory.categoryGroups(): List<AuditCategoryGroup> = latestFindings()
+fun AuditHistory.categoryGroups(): List<AuditCategoryGroup> = findingsForDetails()
     .groupBy { it.auditCategory() }
     .map { (category, findings) -> AuditCategoryGroup(category, findings) }
     .sortedBy { it.category.ordinal }
+
+private fun AuditHistory.findingsForDetails(): List<AuditFinding> {
+    val latest = latestFindings()
+    if (!status.unresolvedRisk) return latest
+    val lastRemovalSequence = events
+        .lastOrNull { it.kind.type == "secure_removal_completed" }
+        ?.sequence
+        ?: 0L
+    val unresolvedCritical = events
+        .asReversed()
+        .firstNotNullOfOrNull { event ->
+            event.kind.report
+                ?.takeIf { event.sequence > lastRemovalSequence }
+                ?.findings
+                ?.filter { it.severity == "critical" }
+                ?.takeIf { it.isNotEmpty() }
+        }
+        .orEmpty()
+    return (latest + unresolvedCritical).distinctBy {
+        listOf(it.ruleId, it.path, it.line?.toString().orEmpty(), it.evidence)
+    }
+}
 
 fun AuditHistory.hasCategory(category: AuditCategory): Boolean =
     if (category == AuditCategory.CriticalRisk) {
@@ -187,6 +213,7 @@ fun parseAuditHistories(raw: String): List<AuditHistory> = JSONArray(raw).mapObj
             moduleId = status.getString("module_id"),
             verification = status.getString("verification"),
             highRisk = status.getBoolean("high_risk"),
+            unresolvedRisk = status.getBoolean("unresolved_risk"),
             eventCount = status.getInt("event_count"),
             headHash = status.getString("head_hash"),
             hmacVerified = status.getBoolean("hmac_verified"),
@@ -216,6 +243,8 @@ private fun parseAuditEvent(event: JSONObject): AuditEvent {
             corruptedFromSequence = kind.optLongOrNull("corrupted_from_sequence"),
             reason = kind.nullableString("reason"),
             quarantine = kind.nullableString("quarantine"),
+            operationId = kind.nullableString("operation_id"),
+            removedPaths = kind.optJSONArray("removed_paths")?.mapStrings().orEmpty(),
         ),
     )
 }

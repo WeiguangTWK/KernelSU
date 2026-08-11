@@ -408,7 +408,7 @@ class ModuleAuditCheckpointStore(context: Context) {
         val previousOperationIds = previous.operations.mapTo(mutableSetOf()) { it.operationId }
         for (operation in current.operations) {
             if (
-                operation.action !in setOf("rescan", "prune") ||
+                operation.action !in setOf("rescan", "prune", "secure-remove") ||
                 operation.targets != operation.targets.sorted().distinct() ||
                 operation.completedTargets != operation.completedTargets.sorted().distinct() ||
                 !operation.targets.containsAll(operation.completedTargets) ||

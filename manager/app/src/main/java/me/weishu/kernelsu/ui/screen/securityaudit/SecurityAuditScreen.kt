@@ -12,6 +12,7 @@ import me.weishu.kernelsu.security.AuditKeyProtection
 import me.weishu.kernelsu.ui.LocalUiMode
 import me.weishu.kernelsu.ui.UiMode
 import me.weishu.kernelsu.ui.component.dialog.rememberConfirmDialog
+import me.weishu.kernelsu.ui.component.rebootlistpopup.rememberRebootAction
 import me.weishu.kernelsu.ui.navigation3.LocalNavigator
 import me.weishu.kernelsu.ui.navigation3.Route
 import me.weishu.kernelsu.ui.viewmodel.SecurityAuditViewModel
@@ -24,6 +25,7 @@ data class SecurityAuditActions(
     val onRescan: () -> Unit,
     val onPrune: () -> Unit,
     val onRecover: () -> Unit,
+    val onRequestSecureRemoval: (String) -> Unit,
     val onOpenCategory: (AuditCategory) -> Unit,
     val onOpenModule: (String) -> Unit,
 )
@@ -74,6 +76,7 @@ fun SecurityAuditScreen() {
                 confirm = recoveryConfirm,
             )
         },
+        onRequestSecureRemoval = {},
         onOpenCategory = { navigator.push(Route.SecurityAuditCategory(it.key)) },
         onOpenModule = { navigator.push(Route.SecurityAuditModule(it)) },
     )
@@ -96,6 +99,7 @@ fun SecurityAuditCategoryScreen(categoryKey: String) {
         onRescan = viewModel::rescanInstalledModules,
         onPrune = {},
         onRecover = viewModel::recoverCheckpointAfterChainRebuild,
+        onRequestSecureRemoval = {},
         onOpenCategory = {},
         onOpenModule = { navigator.push(Route.SecurityAuditModule(it, category.key)) },
     )
@@ -111,13 +115,46 @@ fun SecurityAuditModuleScreen(moduleId: String, focusCategoryKey: String? = null
     val viewModel = viewModel<SecurityAuditViewModel>()
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val focusCategory = focusCategoryKey?.let { AuditCategory.fromKey(it) }
+    val reboot = rememberRebootAction()
     LaunchedEffect(Unit) { viewModel.refresh() }
+    val secureRemovalDialog = rememberConfirmDialog(
+        onConfirm = {
+            if (state.recoverySafeMode) {
+                viewModel.securelyRemoveModule(moduleId)
+            } else {
+                viewModel.containForSecureRemoval(moduleId) { reboot("") }
+            }
+        }
+    )
+    val secureRemovalTitle = stringResource(R.string.security_audit_secure_remove_title, moduleId)
+    val secureRemovalMessage = stringResource(
+        if (state.recoverySafeMode) {
+            R.string.security_audit_secure_remove_message
+        } else {
+            R.string.security_audit_secure_remove_reboot_guide
+        },
+        moduleId,
+    )
+    val secureRemovalConfirm = stringResource(
+        if (state.recoverySafeMode) {
+            R.string.security_audit_secure_remove_confirm
+        } else {
+            R.string.security_audit_secure_remove_reboot
+        }
+    )
     val actions = SecurityAuditActions(
         onBack = dropUnlessResumed { navigator.pop() },
         onRefresh = viewModel::refresh,
         onRescan = viewModel::rescanInstalledModules,
         onPrune = {},
         onRecover = viewModel::recoverCheckpointAfterChainRebuild,
+        onRequestSecureRemoval = {
+            secureRemovalDialog.showConfirm(
+                title = secureRemovalTitle,
+                content = secureRemovalMessage,
+                confirm = secureRemovalConfirm,
+            )
+        },
         onOpenCategory = {},
         onOpenModule = {},
     )

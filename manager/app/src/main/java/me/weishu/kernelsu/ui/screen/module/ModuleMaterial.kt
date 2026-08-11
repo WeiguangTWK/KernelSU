@@ -363,6 +363,7 @@ fun ModulePagerMaterial(
                         listState = searchListState,
                         displayModules = uiState.searchResults,
                         updateInfoMap = uiState.updateInfo,
+                        secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                         actions = actions,
                         onClickModule = { module ->
                             if (module.hasWebUi) {
@@ -474,6 +475,7 @@ fun ModulePagerMaterial(
                 listState = listState,
                 displayModules = uiState.moduleList,
                 updateInfoMap = uiState.updateInfo,
+                secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                 actions = actions,
                 onClickModule = { module ->
                     if (module.hasWebUi) {
@@ -508,6 +510,7 @@ private fun ModuleList(
     listState: LazyListState = rememberLazyListState(),
     displayModules: List<Module>,
     updateInfoMap: Map<String, ModuleUpdateInfo>,
+    secureRemovalModuleIds: Set<String>,
     actions: ModuleActions,
     onClickModule: (Module) -> Unit,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
@@ -530,9 +533,12 @@ private fun ModuleList(
 
             ModuleItem(
                 module = module,
+                requiresSecureRemoval = module.id in secureRemovalModuleIds,
                 updateUrl = moduleUpdateInfo.downloadUrl,
                 onUninstallClicked = {
-                    if (module.remove) {
+                    if (module.id in secureRemovalModuleIds) {
+                        actions.onOpenModuleAudit(module.id)
+                    } else if (module.remove) {
                         actions.onUndoUninstallModule(module)
                     } else {
                         actions.onRequestUninstallConfirmation(module)
@@ -715,6 +721,7 @@ private fun ModuleShortcutSheet(
 @Composable
 private fun ModuleItem(
     module: Module,
+    requiresSecureRemoval: Boolean,
     updateUrl: String,
     onUninstallClicked: () -> Unit,
     onCheckChanged: (Boolean) -> Unit,
@@ -740,7 +747,7 @@ private fun ModuleItem(
                     if (module.hasWebUi) {
                         toggleable(
                             value = module.enabled,
-                            enabled = !module.remove && module.enabled,
+                            enabled = !module.remove && module.enabled && !requiresSecureRemoval,
                             interactionSource = interactionSource,
                             role = Role.Button,
                             indication = indication,
@@ -792,7 +799,7 @@ private fun ModuleItem(
                     horizontalArrangement = Arrangement.End,
                 ) {
                     ExpressiveSwitch(
-                        enabled = !module.update,
+                        enabled = !module.update && !requiresSecureRemoval,
                         checked = module.enabled,
                         onCheckedChange = {
                             haptic.performHapticFeedback(HapticFeedbackType.VirtualKey)
@@ -858,7 +865,7 @@ private fun ModuleItem(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 val hasUpdate = updateUrl.isNotEmpty()
-                val actionButtonsEnabled = !module.remove && module.enabled
+                val actionButtonsEnabled = !module.remove && module.enabled && !requiresSecureRemoval
 
                 AnimatedVisibility(
                     visible = actionButtonsEnabled,
@@ -940,7 +947,7 @@ private fun ModuleItem(
                     Row {
                         Button(
                             modifier = Modifier.defaultMinSize(52.dp, 32.dp),
-                            enabled = !module.remove,
+                            enabled = !module.remove && !requiresSecureRemoval,
                             onClick = onUpdate,
                             shape = ButtonDefaults.textShape,
                             contentPadding = ButtonDefaults.TextButtonContentPadding
@@ -969,7 +976,13 @@ private fun ModuleItem(
                     onClick = onUninstallClicked,
                     contentPadding = ButtonDefaults.TextButtonContentPadding
                 ) {
-                    if (!module.remove) {
+                    if (requiresSecureRemoval) {
+                        Icon(
+                            modifier = Modifier.size(20.dp),
+                            imageVector = Icons.Outlined.Shield,
+                            contentDescription = null,
+                        )
+                    } else if (!module.remove) {
                         Icon(
                             modifier = Modifier.size(20.dp),
                             imageVector = Icons.Outlined.Delete,
@@ -989,7 +1002,13 @@ private fun ModuleItem(
                             modifier = Modifier.padding(start = 7.dp),
                             fontFamily = MaterialTheme.typography.labelMedium.fontFamily,
                             fontSize = MaterialTheme.typography.labelMedium.fontSize,
-                            text = stringResource(if (module.remove) R.string.undo else R.string.uninstall)
+                            text = stringResource(
+                                when {
+                                    requiresSecureRemoval -> R.string.security_audit_secure_remove_confirm
+                                    module.remove -> R.string.undo
+                                    else -> R.string.uninstall
+                                }
+                            )
                         )
                     }
                 }

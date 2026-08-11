@@ -37,9 +37,11 @@ import me.weishu.kernelsu.ui.screen.module.ModuleEffect
 import me.weishu.kernelsu.ui.screen.module.ModuleUiState
 import me.weishu.kernelsu.ui.util.PinyinUtil
 import me.weishu.kernelsu.ui.util.hasMagisk
+import me.weishu.kernelsu.ui.util.getModuleAuditStatuses
 import me.weishu.kernelsu.ui.util.module.fetchModuleDetail
 import me.weishu.kernelsu.ui.util.module.fetchReleaseDescriptionHtml
 import okhttp3.Request
+import org.json.JSONArray
 import java.text.Collator
 import java.util.Locale
 import kotlin.time.Duration.Companion.milliseconds
@@ -233,17 +235,30 @@ class ModuleViewModel(
     }
 
     suspend fun loadModuleList(resort: Boolean = true) {
-        val parsedModules = withContext(Dispatchers.IO) {
-            repo.getModules().getOrElse {
+        val (parsedModules, secureRemovalModuleIds) = withContext(Dispatchers.IO) {
+            val modules = repo.getModules().getOrElse {
                 Log.e(TAG, "fetchModuleList: ", it)
                 emptyList()
             }
+            val restricted = runCatching {
+                val statuses = JSONArray(getModuleAuditStatuses())
+                (0 until statuses.length()).mapNotNullTo(mutableSetOf()) { index ->
+                    statuses.getJSONObject(index).takeIf {
+                        it.getBoolean("unresolved_risk")
+                    }?.getString("module_id")
+                }
+            }.getOrElse {
+                Log.e(TAG, "load secure module dispositions: ", it)
+                emptySet()
+            }
+            modules to restricted
         }
 
         withContext(Dispatchers.Main) {
             _uiState.update {
                 it.copy(
                     modules = parsedModules,
+                    secureRemovalModuleIds = secureRemovalModuleIds,
                 )
             }
             // Trigger recalculation of moduleList
