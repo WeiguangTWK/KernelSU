@@ -20,6 +20,7 @@ import me.weishu.kernelsu.BuildConfig
 import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.ksuApp
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 
 /**
@@ -143,6 +144,49 @@ suspend fun getModuleAuditHistories(): String = withContext(Dispatchers.IO) {
     }
     stdout.joinToString("\n").ifBlank { "[]" }
 }
+
+suspend fun streamModuleAuditDashboard(onLine: (String) -> Unit): Unit =
+    withContext(Dispatchers.IO) {
+        val stderr = ArrayList<String>()
+        val stdout = object : CallbackList<String?>() {
+            override fun onAddElement(value: String?) {
+                value?.takeIf(String::isNotBlank)?.let(onLine)
+            }
+        }
+        val result = withNewRootShell {
+            newJob()
+                .add("${getKsuDaemonPath()} module audit-dashboard")
+                .to(stdout, stderr)
+                .exec()
+        }
+        check(result.isSuccess) {
+            stderr.joinToString("\n").ifBlank { "Unable to refresh module audit dashboard" }
+        }
+    }
+
+suspend fun waitForModuleAuditDashboardChange(baseline: String): Boolean =
+    withContext(Dispatchers.IO) {
+        check(baseline.length == 64 && baseline.all { it.isLowerHexDigit() }) {
+            "Invalid module audit dashboard revision"
+        }
+        val stdout = ArrayList<String>()
+        val stderr = ArrayList<String>()
+        val result = withNewRootShell {
+            newJob()
+                .add(
+                    "${getKsuDaemonPath()} module audit-watch " +
+                        "--baseline $baseline --timeout-seconds 30"
+                )
+                .to(stdout, stderr)
+                .exec()
+        }
+        check(result.isSuccess) {
+            stderr.joinToString("\n").ifBlank { "Unable to watch module audit state" }
+        }
+        stdout.any { line ->
+            runCatching { JSONObject(line).optString("type") == "changed" }.getOrDefault(false)
+        }
+    }
 
 suspend fun getModuleAuditStatuses(): String = withContext(Dispatchers.IO) {
     runModuleAuditCommand(

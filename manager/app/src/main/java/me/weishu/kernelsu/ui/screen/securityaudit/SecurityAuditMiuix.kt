@@ -54,6 +54,7 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -85,6 +86,9 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
         showRescan = true,
         showPrune = true,
     ) {
+        if (state.isRefreshing) {
+            item { AuditVerificationProgressMiuix(state) }
+        }
         item { AuditOverviewMiuix(state, actions.onOpenCategory) }
         if (state.interruptedInstalls > 0) {
             item { AuditMessageCardMiuix(stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls), true) }
@@ -109,6 +113,39 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
             items(state.histories, key = { it.status.moduleId }) { history ->
                 AuditModuleCardMiuix(history) { actions.onOpenModule(history.status.moduleId) }
             }
+        }
+    }
+}
+
+@Composable
+private fun AuditVerificationProgressMiuix(state: SecurityAuditUiState) {
+    val label = state.verificationModuleId?.let { moduleId ->
+        stringResource(
+            R.string.security_audit_verifying_module,
+            moduleId,
+            state.verificationCompleted,
+            state.verificationTotal,
+        )
+    } ?: if (state.showingCachedSnapshot) {
+        stringResource(R.string.security_audit_snapshot_syncing)
+    } else {
+        stringResource(R.string.security_audit_finalizing_verification)
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            CircularProgressIndicator(Modifier.size(22.dp))
+            Text(
+                label,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                fontSize = 14.sp,
+            )
         }
     }
 }

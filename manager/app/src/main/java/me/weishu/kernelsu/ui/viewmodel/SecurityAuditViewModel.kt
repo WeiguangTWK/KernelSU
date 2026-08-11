@@ -5,17 +5,20 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.AuditCheckpointTrust
 import me.weishu.kernelsu.security.AuditCheckpointVerification
+import me.weishu.kernelsu.security.AuditDashboardCache
 import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
 import me.weishu.kernelsu.security.requiresAuditSealCommit
 import me.weishu.kernelsu.ui.screen.securityaudit.AuditHistory
@@ -23,7 +26,6 @@ import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditUiState
 import me.weishu.kernelsu.ui.screen.securityaudit.SecureRemovalPhase
 import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
-import me.weishu.kernelsu.ui.screen.securityaudit.parseStaleAuditModuleIds
 import me.weishu.kernelsu.ui.util.commitModuleAuditSeal
 import me.weishu.kernelsu.ui.util.containModuleForSecureRemoval
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
@@ -32,24 +34,129 @@ import me.weishu.kernelsu.ui.util.getModuleAuditCheckpoint
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationChallenge
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationStatus
 import me.weishu.kernelsu.ui.util.getModuleAuditSealStatus
-import me.weishu.kernelsu.ui.util.getStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.listModules
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.recoverManagerSealedAudit
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
 import me.weishu.kernelsu.ui.util.securelyRemoveModule as runSecureModuleRemoval
+import me.weishu.kernelsu.ui.util.streamModuleAuditDashboard
+import me.weishu.kernelsu.ui.util.waitForModuleAuditDashboardChange
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicLong
 
 class SecurityAuditViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(SecurityAuditUiState())
     val uiState: StateFlow<SecurityAuditUiState> = _uiState.asStateFlow()
     private var refreshJob: Job? = null
+    private var watchJob: Job? = null
+    private val refreshGeneration = AtomicLong()
     private val checkpointStore by lazy { ModuleAuditCheckpointStore(ksuApp) }
+
+    private data class DashboardStreamResult(
+        val rawHistories: String,
+        val completion: JSONObject,
+    )
+
+    private fun sortedHistories(histories: Collection<AuditHistory>): List<AuditHistory> =
+        histories.sortedWith(
+            compareByDescending<AuditHistory> { it.isHighRisk() }
+                .thenByDescending { history ->
+                    history.events.maxOfOrNull { it.timestampUnixSeconds } ?: 0L
+                }
+        )
+
+    private fun applyCachedDashboard(cache: AuditDashboardCache) {
+        val payload = JSONObject(cache.payload)
+        val histories = parseAuditHistories(payload.getJSONArray("histories").toString()).map {
+            it.copy(status = it.status.copy(managerCheckpoint = AuditCheckpointTrust.Verified.wireName))
+        }
+        val stale = payload.optJSONArray("stale_module_ids") ?: JSONArray()
+        _uiState.update { state ->
+            if (state.histories.isNotEmpty()) state else state.copy(
+                isLoading = false,
+                isRefreshing = true,
+                showingCachedSnapshot = true,
+                histories = sortedHistories(histories),
+                staleModuleIds = buildList {
+                    for (index in 0 until stale.length()) add(stale.getString(index))
+                },
+                keyProtection = runCatching {
+                    me.weishu.kernelsu.security.AuditKeyProtection.entries.first {
+                        it.wireName == payload.optString("key_protection")
+                    }
+                }.getOrDefault(state.keyProtection),
+            )
+        }
+    }
+
+    private suspend fun loadDashboardStream(generation: Long): DashboardStreamResult {
+        val histories = linkedMapOf<String, JSONObject>()
+        var completion: JSONObject? = null
+        streamModuleAuditDashboard { rawLine ->
+            if (refreshGeneration.get() != generation) return@streamModuleAuditDashboard
+            val line = JSONObject(rawLine)
+            when (line.getString("type")) {
+                "start" -> _uiState.update {
+                    it.copy(
+                        isLoading = it.histories.isEmpty(),
+                        isRefreshing = it.histories.isNotEmpty(),
+                        verificationModuleId = null,
+                        verificationCompleted = 0,
+                        verificationTotal = line.getInt("total_modules"),
+                    )
+                }
+                "module" -> {
+                    val moduleId = line.getString("module_id")
+                    val rawHistory = line.getJSONObject("history")
+                    histories[moduleId] = rawHistory
+                    val history = parseAuditHistories(JSONArray().put(rawHistory).toString()).single()
+                    _uiState.update { state ->
+                        val merged = state.histories
+                            .associateBy { it.status.moduleId }
+                            .toMutableMap()
+                            .apply { put(moduleId, history) }
+                        state.copy(
+                            isLoading = false,
+                            isRefreshing = true,
+                            verificationModuleId = moduleId,
+                            verificationCompleted = line.getInt("completed"),
+                            verificationTotal = line.getInt("total_modules"),
+                            histories = sortedHistories(merged.values),
+                            checkpointCompromised = state.checkpointCompromised ||
+                                history.status.unresolvedRisk,
+                            checkpointIncident = history.integrityError ?: state.checkpointIncident,
+                        )
+                    }
+                }
+                "progress" -> _uiState.update {
+                    it.copy(
+                        verificationModuleId = null,
+                        verificationCompleted = line.getInt("completed"),
+                        verificationTotal = line.getInt("total_modules"),
+                    )
+                }
+                "error" -> _uiState.update {
+                    it.copy(
+                        checkpointCompromised = true,
+                        checkpointIncident = line.optString("error"),
+                    )
+                }
+                "complete" -> completion = line
+            }
+        }
+        if (refreshGeneration.get() != generation) throw CancellationException()
+        return DashboardStreamResult(
+            rawHistories = JSONArray(histories.values).toString(),
+            completion = checkNotNull(completion) { "ksud dashboard verification did not complete" },
+        )
+    }
 
     fun refresh() {
         refreshJob?.cancel()
+        watchJob?.cancel()
+        val generation = refreshGeneration.incrementAndGet()
         while (true) {
             val state = _uiState.value
             if (state.isRescanning || state.isPruning || state.secureRemovalInProgress) return
@@ -67,78 +174,36 @@ class SecurityAuditViewModel : ViewModel() {
             }
         }
         refreshJob = viewModelScope.launch(Dispatchers.IO) {
+            checkpointStore.readDashboardCache()?.let(::applyCachedDashboard)
             runCatching {
-                val checkpointResult = runCatching { getModuleAuditCheckpoint() }
-                val rawHistoryResult = runCatching { getModuleAuditHistories() }
-                val sealedEnvelopeHash = runCatching {
-                    JSONObject(getModuleAuditSealStatus())
-                        .optString("seal_hash")
-                        .takeIf(String::isNotBlank)
-                }.getOrNull()
-                val historyResult = rawHistoryResult.mapCatching(::parseAuditHistories)
-                checkpointResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
-                historyResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
-                var checkpoint = checkpointResult.fold(
-                    onSuccess = { payload ->
-                        checkpointStore.reconcile(
-                            payload,
-                            rawHistoryResult.getOrNull(),
-                            sealedEnvelopeHash,
-                        )
-                    },
-                    onFailure = { error ->
-                        checkpointStore.checkpointUnavailable(
-                            error.message ?: error::class.java.simpleName
-                        )
-                    },
+                val stream = loadDashboardStream(generation)
+                val completion = stream.completion
+                val rawCheckpoint = completion.getJSONObject("checkpoint").toString()
+                val sealStatus = completion.getJSONObject("seal_status")
+                val authorizationStatus = completion.getJSONObject("authorization_status")
+                val sealedEnvelopeHash = sealStatus.optString("seal_hash")
+                    .takeIf(String::isNotBlank)
+                var checkpoint = checkpointStore.reconcile(
+                    rawCheckpoint,
+                    stream.rawHistories,
+                    sealedEnvelopeHash,
                 )
-                val sealedRecoveryResult: Result<List<String>> = if (
-                    checkpointResult.isFailure || rawHistoryResult.isFailure
-                ) {
-                    runCatching {
-                        JSONObject(getModuleAuditRecoveryStatus())
-                            .getJSONArray("failures")
-                            .moduleIds()
-                    }
-                } else {
-                    Result.success(emptyList())
-                }
-                sealedRecoveryResult.exceptionOrNull()?.let {
-                    if (it is CancellationException) throw it
-                }
-                val sealedRecoveryModuleIds = sealedRecoveryResult.getOrDefault(emptyList())
-                if (sealedRecoveryModuleIds.isNotEmpty()) {
-                    checkpoint = AuditCheckpointVerification(
-                        trust = AuditCheckpointTrust.Compromised,
-                        detail = "Manager-sealed audit history was damaged: " +
-                            sealedRecoveryModuleIds.joinToString(),
-                        protection = checkpoint.protection,
-                        recoverableModules = sealedRecoveryModuleIds,
-                    )
-                }
-                val histories = historyResult.getOrDefault(emptyList())
-                    .map { history ->
+                val sealedRecoveryModuleIds = checkpoint.recoverableModules
+                val histories = sortedHistories(
+                    parseAuditHistories(stream.rawHistories).map { history ->
                         history.copy(
                             status = history.status.copy(
                                 managerCheckpoint = checkpoint.trust.wireName
                             )
                         )
                     }
-                    .sortedWith(
-                        compareByDescending<AuditHistory> { it.isHighRisk() }
-                            .thenByDescending { history ->
-                                history.events.maxOfOrNull { it.timestampUnixSeconds } ?: 0L
-                            }
-                    )
-                val staleResult = runCatching {
-                    parseStaleAuditModuleIds(getStaleModuleAuditHistories())
-                }
-                staleResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
+                )
+                val staleModuleIds = completion.getJSONArray("stale_histories").moduleIds()
                 val authorizationResult = if (
                     checkpoint.trust == AuditCheckpointTrust.Initialized ||
                     checkpoint.trust == AuditCheckpointTrust.Verified
                 ) {
-                    runCatching { ensureAuditAuthorization() }
+                    runCatching { ensureAuditAuthorization(authorizationStatus) }
                 } else {
                     Result.success(false)
                 }
@@ -146,7 +211,7 @@ class SecurityAuditViewModel : ViewModel() {
                     if (it is CancellationException) throw it
                 }
                 val sealResult = authorizationResult.mapCatching { authorizationReady ->
-                    if (authorizationReady) ensureAuditSeal() else false
+                    if (authorizationReady) ensureAuditSeal(sealStatus) else false
                 }
                 sealResult.exceptionOrNull()?.let { error ->
                     if (error is CancellationException) throw error
@@ -154,22 +219,28 @@ class SecurityAuditViewModel : ViewModel() {
                         error.message ?: error::class.java.simpleName
                     )
                 }
+                if (sealResult.getOrDefault(false) &&
+                    checkpoint.trust != AuditCheckpointTrust.Compromised
+                ) {
+                    checkpointStore.writeDashboardCache(
+                        JSONObject()
+                            .put("histories", JSONArray(stream.rawHistories))
+                            .put("stale_module_ids", JSONArray(staleModuleIds))
+                            .put("key_protection", checkpoint.protection.wireName)
+                            .toString()
+                    )
+                }
                 AuditLoadResult(
                     histories = histories,
-                    staleModuleIds = staleResult.getOrDefault(emptyList()),
+                    staleModuleIds = staleModuleIds,
                     checkpoint = checkpoint,
                     authorizationReady = sealResult.getOrDefault(false),
                     sealedRecoveryModuleIds = sealedRecoveryModuleIds,
-                    error = if (sealedRecoveryModuleIds.isNotEmpty()) {
-                        null
-                    } else {
-                        historyResult.exceptionOrNull()
-                            ?: staleResult.exceptionOrNull()
-                            ?: sealResult.exceptionOrNull()
-                            ?: authorizationResult.exceptionOrNull()
-                    },
+                    storeRevision = completion.getString("store_revision"),
+                    error = sealResult.exceptionOrNull() ?: authorizationResult.exceptionOrNull(),
                 )
             }.onSuccess { result ->
+                if (refreshGeneration.get() != generation) return@onSuccess
                 _uiState.value = SecurityAuditUiState(
                     isLoading = false,
                     isRescanning = _uiState.value.isRescanning,
@@ -191,12 +262,24 @@ class SecurityAuditViewModel : ViewModel() {
                         it.message ?: it::class.java.simpleName
                     },
                 )
+                startDashboardWatch(result.storeRevision)
             }.onFailure { error ->
                 if (error is CancellationException) throw error
+                if (refreshGeneration.get() != generation) return@onFailure
+                val sealedRecoveryModuleIds = runCatching {
+                    JSONObject(getModuleAuditRecoveryStatus())
+                        .getJSONArray("failures")
+                        .moduleIds()
+                }.getOrDefault(emptyList())
                 _uiState.update {
                     it.copy(
                         isLoading = false,
                         isRefreshing = false,
+                        verificationModuleId = null,
+                        recoverableModuleIds = sealedRecoveryModuleIds,
+                        sealedRecoveryModuleIds = sealedRecoveryModuleIds,
+                        checkpointCompromised = it.checkpointCompromised ||
+                            sealedRecoveryModuleIds.isNotEmpty(),
                         errorMessage = error.message ?: error::class.java.simpleName,
                     )
                 }
@@ -210,13 +293,32 @@ class SecurityAuditViewModel : ViewModel() {
         val checkpoint: AuditCheckpointVerification,
         val authorizationReady: Boolean,
         val sealedRecoveryModuleIds: List<String>,
+        val storeRevision: String,
         val error: Throwable?,
     )
 
-    private suspend fun ensureAuditAuthorization(): Boolean {
+    private fun startDashboardWatch(initialRevision: String) {
+        watchJob?.cancel()
+        watchJob = viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                val changed = runCatching {
+                    waitForModuleAuditDashboardChange(initialRevision)
+                }.getOrElse {
+                    delay(1_000)
+                    false
+                }
+                if (changed) {
+                    viewModelScope.launch { refresh() }
+                    return@launch
+                }
+            }
+        }
+    }
+
+    private suspend fun ensureAuditAuthorization(prefetchedStatus: JSONObject? = null): Boolean {
         val publicKey = checkpointStore.authorizationPublicKeyHex()
         val ownKeyId = checkpointStore.authorizationKeyId()
-        val statusResult = runCatching {
+        val statusResult = prefetchedStatus?.let { Result.success(it) } ?: runCatching {
             JSONObject(getModuleAuditAuthorizationStatus())
         }
         val status = statusResult.getOrNull()
@@ -258,8 +360,8 @@ class SecurityAuditViewModel : ViewModel() {
             getModuleAuditAuthorizationChallenge(action, moduleId)
         )
 
-    private suspend fun ensureAuditSeal(): Boolean {
-        val status = JSONObject(getModuleAuditSealStatus())
+    private suspend fun ensureAuditSeal(prefetchedStatus: JSONObject? = null): Boolean {
+        val status = prefetchedStatus ?: JSONObject(getModuleAuditSealStatus())
         val configured = status.optBoolean("configured", false)
         val sealedHash = status.optString("seal_hash").takeIf(String::isNotBlank)
         val currentHash = checkpointStore.currentSealHash()

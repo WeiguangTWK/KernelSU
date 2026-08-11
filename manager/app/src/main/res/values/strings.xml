@@ -56,6 +56,9 @@
     <string name="module_repos_source_code">Source code</string>
     <string name="security_audit_center">Security &amp; audit center</string>
     <string name="security_audit_overview">Overview</string>
+    <string name="security_audit_snapshot_syncing">Showing the last verified snapshot · synchronizing</string>
+    <string name="security_audit_verifying_module">Verifying %1$s · %2$d/%3$d</string>
+    <string name="security_audit_finalizing_verification">Finalizing audit checkpoint verification…</string>
     <string name="security_audit_key_protection">Audit identity protection</string>
     <string name="security_audit_key_hardware">Hardware protection</string>
     <string name="security_audit_key_hardware_desc">The system reports that the audit signing key is isolated by TEE or StrongBox.</string>

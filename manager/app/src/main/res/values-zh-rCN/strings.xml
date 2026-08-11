@@ -38,6 +38,9 @@
     <string name="module_repos_source_code">源码</string>
     <string name="security_audit_center">安全与审计中心</string>
     <string name="security_audit_overview">总览</string>
+    <string name="security_audit_snapshot_syncing">正在显示上次验证快照 · 状态同步中</string>
+    <string name="security_audit_verifying_module">正在验证 %1$s · %2$d/%3$d</string>
+    <string name="security_audit_finalizing_verification">正在完成审计检查点验证…</string>
     <string name="security_audit_key_protection">审计身份保护</string>
     <string name="security_audit_key_hardware">硬件保护</string>
     <string name="security_audit_key_hardware_desc">系统报告审计签名密钥由 TEE 或 StrongBox 隔离保护。</string>

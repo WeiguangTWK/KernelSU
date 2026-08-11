@@ -847,6 +847,59 @@ fn audit_module_ids(modules_dir: &Path) -> Result<Vec<String>> {
     Ok(module_ids)
 }
 
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn dashboard_module_ids(root: &Path) -> Result<Vec<String>> {
+    let modules_dir = root.join("modules");
+    if !modules_dir.exists() {
+        return Ok(Vec::new());
+    }
+    audit_module_ids(&modules_dir)
+}
+
+/// Cheap change detector used only to trigger a new full verification. This is
+/// never accepted as integrity evidence; an attacker controlling timestamps can
+/// at worst suppress the hint until the next explicit dashboard verification.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn dashboard_store_revision(root: &Path) -> Result<String> {
+    let mut digest = Sha256::new();
+    if !root.exists() {
+        digest.update(b"missing");
+        return Ok(hex(&digest.finalize()));
+    }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut entries =
+            std::fs::read_dir(&directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            digest.update(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            );
+            digest.update(metadata.len().to_le_bytes());
+            if let Ok(modified) = metadata.modified()
+                && let Ok(elapsed) = modified.duration_since(UNIX_EPOCH)
+            {
+                digest.update(elapsed.as_secs().to_le_bytes());
+                digest.update(elapsed.subsec_nanos().to_le_bytes());
+            }
+            let file_type = metadata.file_type();
+            digest.update([
+                u8::from(file_type.is_dir()),
+                u8::from(file_type.is_symlink()),
+            ]);
+            if file_type.is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(hex(&digest.finalize()))
+}
+
 pub fn read_module_history(
     root: &Path,
     module_id: &str,
@@ -980,6 +1033,29 @@ pub fn list_stale_histories(
         });
     }
     Ok(stale)
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn stale_histories_from_verified(
+    histories: &[ModuleAuditHistory],
+    installed_modules_root: &Path,
+    pending_modules_root: &Path,
+) -> Vec<StaleAuditHistory> {
+    histories
+        .iter()
+        .filter(|history| {
+            !installed_module_exists(
+                installed_modules_root,
+                pending_modules_root,
+                &history.status.module_id,
+            )
+        })
+        .map(|history| StaleAuditHistory {
+            module_id: history.status.module_id.clone(),
+            event_count: history.status.event_count,
+            high_risk: history.status.high_risk,
+        })
+        .collect()
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
@@ -2634,6 +2710,22 @@ pub fn manager_audit_auth_status(root: &Path) -> Result<ManagerAuditAuthStatus> 
         configured: registry.is_some(),
         key_id: registry.map(|registry| registry.key_id),
         inventory_hash,
+    })
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn manager_audit_auth_status_for_inventory(
+    root: &Path,
+    inventory_hash: &str,
+) -> Result<ManagerAuditAuthStatus> {
+    validate_sha256_hex(inventory_hash, "inventory hash")?;
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?;
+    Ok(ManagerAuditAuthStatus {
+        configured: registry.is_some(),
+        key_id: registry.map(|registry| registry.key_id),
+        inventory_hash: inventory_hash.to_owned(),
     })
 }
 
@@ -5381,6 +5473,23 @@ mod tests {
 
         assert!(list_histories(&root, true).unwrap().is_empty());
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn dashboard_revision_detects_store_changes_without_creating_it() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("audit");
+        let missing_revision = dashboard_store_revision(&root).unwrap();
+
+        assert!(dashboard_module_ids(&root).unwrap().is_empty());
+        assert!(!root.exists());
+
+        record(&root, "test.module", "ab");
+        let recorded_revision = dashboard_store_revision(&root).unwrap();
+        assert_ne!(missing_revision, recorded_revision);
+
+        record(&root, "test.module", "cd");
+        assert_ne!(recorded_revision, dashboard_store_revision(&root).unwrap());
     }
 
     #[test]

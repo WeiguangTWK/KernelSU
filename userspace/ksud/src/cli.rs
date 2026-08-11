@@ -1,5 +1,6 @@
 use anyhow::{Context, Ok, Result};
 use clap::Parser;
+use std::io::Write;
 use std::path::PathBuf;
 
 use android_logger::Config;
@@ -312,6 +313,17 @@ enum Module {
         /// print structured JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Stream a consolidated Security & Audit Center dashboard as JSON Lines
+    AuditDashboard,
+
+    /// Wait briefly for the audit store to change, then request re-verification
+    AuditWatch {
+        #[arg(long)]
+        baseline: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
     },
 
     /// Diagnose damage to events anchored by the Manager audit seal
@@ -631,6 +643,126 @@ enum Initrc {
     Refresh,
 }
 
+fn emit_audit_dashboard_line(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+fn stream_audit_dashboard() -> Result<()> {
+    let root = std::path::Path::new(defs::MODULE_AUDIT_DIR);
+    let module_ids = crate::module_audit_log::dashboard_module_ids(root)?;
+    emit_audit_dashboard_line(&serde_json::json!({
+        "type": "start",
+        "total_modules": module_ids.len(),
+    }))?;
+
+    let mut histories = Vec::with_capacity(module_ids.len());
+    for (index, module_id) in module_ids.iter().enumerate() {
+        match crate::module_audit_log::read_module_history_resilient(root, module_id, true) {
+            std::result::Result::Ok(history) => {
+                emit_audit_dashboard_line(&serde_json::json!({
+                    "type": "module",
+                    "module_id": module_id,
+                    "completed": index + 1,
+                    "total_modules": module_ids.len(),
+                    "history": history,
+                }))?;
+                histories.push(history);
+            }
+            std::result::Result::Err(error) => {
+                emit_audit_dashboard_line(&serde_json::json!({
+                    "type": "error",
+                    "phase": "verifying",
+                    "module_id": module_id,
+                    "completed": index,
+                    "total_modules": module_ids.len(),
+                    "error": format!("{error:#}"),
+                }))?;
+                return Err(error);
+            }
+        }
+    }
+
+    emit_audit_dashboard_line(&serde_json::json!({
+        "type": "progress",
+        "phase": "checkpoint",
+        "completed": module_ids.len(),
+        "total_modules": module_ids.len(),
+    }))?;
+    let checkpoint = crate::module_audit_log::checkpoint_payload(root)?;
+    let checkpoint_revision = crate::module_audit_log::dashboard_store_revision(root)?;
+    let checkpoint_heads = checkpoint
+        .modules
+        .iter()
+        .map(|module| {
+            (
+                module.module_id.as_str(),
+                (module.sequence, module.head_hash.as_str()),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    anyhow::ensure!(
+        histories.len() == checkpoint_heads.len()
+            && histories.iter().all(|history| {
+                checkpoint_heads
+                    .get(history.status.module_id.as_str())
+                    .is_some_and(|(sequence, head_hash)| {
+                        *sequence == u64::try_from(history.status.event_count).unwrap_or(u64::MAX)
+                            && *head_hash == history.status.head_hash
+                    })
+            }),
+        "audit inventory changed while the dashboard was being verified"
+    );
+
+    let stale = crate::module_audit_log::stale_histories_from_verified(
+        &histories,
+        std::path::Path::new(defs::MODULE_DIR),
+        std::path::Path::new(defs::MODULE_UPDATE_DIR),
+    );
+    let seal_status = crate::module_audit_log::manager_audit_seal_status(root)?;
+    let authorization_status = crate::module_audit_log::manager_audit_auth_status_for_inventory(
+        root,
+        &checkpoint.inventory_hash,
+    )?;
+    let store_revision = crate::module_audit_log::dashboard_store_revision(root)?;
+    anyhow::ensure!(
+        checkpoint_revision == store_revision,
+        "audit store changed while the dashboard snapshot was being finalized"
+    );
+    emit_audit_dashboard_line(&serde_json::json!({
+        "type": "complete",
+        "checkpoint": checkpoint,
+        "stale_histories": stale,
+        "seal_status": seal_status,
+        "authorization_status": authorization_status,
+        "store_revision": store_revision,
+    }))
+}
+
+fn watch_audit_dashboard(baseline: &str, timeout_seconds: u64) -> Result<()> {
+    anyhow::ensure!(
+        baseline.len() == 64 && baseline.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid audit dashboard revision"
+    );
+    anyhow::ensure!(timeout_seconds <= 60, "audit watch timeout is too large");
+    let root = std::path::Path::new(defs::MODULE_AUDIT_DIR);
+    let started = std::time::Instant::now();
+    loop {
+        let revision = crate::module_audit_log::dashboard_store_revision(root)?;
+        if revision != baseline {
+            return emit_audit_dashboard_line(&serde_json::json!({
+                "type": "changed",
+                "store_revision": revision,
+            }));
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(timeout_seconds) {
+            return emit_audit_dashboard_line(&serde_json::json!({ "type": "timeout" }));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 pub fn run() -> Result<()> {
     android_logger::init_once(
         Config::default()
@@ -712,6 +844,11 @@ pub fn run() -> Result<()> {
                     }
                     Ok(())
                 }
+                Module::AuditDashboard => stream_audit_dashboard(),
+                Module::AuditWatch {
+                    baseline,
+                    timeout_seconds,
+                } => watch_audit_dashboard(&baseline, timeout_seconds),
                 Module::AuditRecoveryStatus { json } => {
                     let status = crate::module_audit_log::sealed_integrity_status(
                         std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),

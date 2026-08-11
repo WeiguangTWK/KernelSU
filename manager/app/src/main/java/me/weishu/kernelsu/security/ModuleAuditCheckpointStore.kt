@@ -45,6 +45,13 @@ data class AuditCheckpointVerification(
     val recoverableModules: List<String> = emptyList(),
 )
 
+data class AuditDashboardCache(
+    val payload: String,
+    val createdAtUnixSeconds: Long,
+    val inventoryHash: String,
+    val sealHash: String,
+)
+
 internal fun validateAuditKeyProtectionTransition(
     recorded: AuditKeyProtection?,
     current: AuditKeyProtection,
@@ -138,6 +145,8 @@ class ModuleAuditCheckpointStore(context: Context) {
     private val previousCheckpointFile =
         AtomicFile(File(context.noBackupFilesDir, PREVIOUS_CHECKPOINT_FILE_NAME))
     private val softwareKeyFile = AtomicFile(File(context.noBackupFilesDir, SOFTWARE_KEY_FILE_NAME))
+    private val dashboardCacheFile =
+        AtomicFile(File(context.noBackupFilesDir, DASHBOARD_CACHE_FILE_NAME))
     @Volatile
     private var trustedInventoryHash: String? = null
     @Volatile
@@ -627,6 +636,93 @@ class ModuleAuditCheckpointStore(context: Context) {
         previousCheckpointFile.delete()
         previousEnvelopeHash = null
     }
+
+    fun readDashboardCache(): AuditDashboardCache? {
+        if (!dashboardCacheFile.baseFile.isFile) return null
+        return runCatching {
+            val envelope = dashboardCacheFile.openRead()
+                .bufferedReader(StandardCharsets.UTF_8)
+                .use { JSONObject(it.readText()) }
+            check(envelope.getInt("schema_version") == DASHBOARD_CACHE_SCHEMA_VERSION)
+            val createdAt = envelope.getLong("created_at_unix_seconds")
+            val inventoryHash = envelope.getString("inventory_hash")
+            val sealHash = envelope.getString("seal_hash")
+            val keyId = envelope.getString("key_id")
+            val payloadBase64 = envelope.getString("payload")
+            val signature = Base64.decode(envelope.getString("signature"), Base64.DEFAULT)
+            check(createdAt >= 0L && inventoryHash.isSha256Hex() && sealHash.isSha256Hex())
+            val signingKey = loadCurrentSigningKey()
+            check(keyId == signingKey.publicKey.authorizationKeyId())
+            check(
+                Signature.getInstance(SIGNATURE_ALGORITHM).run {
+                    initVerify(signingKey.publicKey)
+                    update(
+                        dashboardCacheSignable(
+                            createdAt,
+                            inventoryHash,
+                            sealHash,
+                            keyId,
+                            payloadBase64,
+                        )
+                    )
+                    verify(signature)
+                }
+            ) { "Manager audit dashboard cache signature is invalid" }
+            val payload = String(
+                Base64.decode(payloadBase64, Base64.DEFAULT),
+                StandardCharsets.UTF_8,
+            )
+            JSONObject(payload)
+            AuditDashboardCache(payload, createdAt, inventoryHash, sealHash)
+        }.getOrNull()
+    }
+
+    fun writeDashboardCache(payload: String) {
+        JSONObject(payload)
+        val inventoryHash = trustedInventoryHash
+            ?: error("Manager audit checkpoint has not been verified")
+        val sealHash = currentSealHash()
+        val signingKey = loadCurrentSigningKey()
+        val keyId = signingKey.publicKey.authorizationKeyId()
+        val createdAt = System.currentTimeMillis() / 1_000L
+        val payloadBase64 = Base64.encodeToString(
+            payload.toByteArray(StandardCharsets.UTF_8),
+            Base64.NO_WRAP,
+        )
+        val signature = Signature.getInstance(SIGNATURE_ALGORITHM).run {
+            initSign(signingKey.privateKey)
+            update(dashboardCacheSignable(createdAt, inventoryHash, sealHash, keyId, payloadBase64))
+            sign()
+        }
+        writeAtomicText(
+            dashboardCacheFile,
+            JSONObject()
+                .put("schema_version", DASHBOARD_CACHE_SCHEMA_VERSION)
+                .put("created_at_unix_seconds", createdAt)
+                .put("inventory_hash", inventoryHash)
+                .put("seal_hash", sealHash)
+                .put("key_id", keyId)
+                .put("payload", payloadBase64)
+                .put("signature", Base64.encodeToString(signature, Base64.NO_WRAP))
+                .toString(),
+        )
+    }
+
+    private fun dashboardCacheSignable(
+        createdAt: Long,
+        inventoryHash: String,
+        sealHash: String,
+        keyId: String,
+        payloadBase64: String,
+    ): ByteArray = buildString {
+        append("kernelsu-audit-dashboard-v1\n")
+        append(DASHBOARD_CACHE_SCHEMA_VERSION).append('\n')
+        append(createdAt).append('\n')
+        append(inventoryHash).append('\n')
+        append(sealHash).append('\n')
+        append(keyId).append('\n')
+        append(payloadBase64)
+    }.toByteArray(StandardCharsets.UTF_8)
 
     fun signAuditAuthorization(rawChallenge: String): String = signAuditAuthorization(
         rawChallenge,
@@ -1257,10 +1353,12 @@ class ModuleAuditCheckpointStore(context: Context) {
         const val CHECKPOINT_FILE_NAME = "module_audit_checkpoint.json"
         const val PREVIOUS_CHECKPOINT_FILE_NAME = "module_audit_checkpoint_previous.json"
         const val SOFTWARE_KEY_FILE_NAME = "module_audit_emergency_key.json"
+        const val DASHBOARD_CACHE_FILE_NAME = "module_audit_dashboard_cache.json"
         const val ENVELOPE_SCHEMA_VERSION = 2
         const val SOFTWARE_KEY_SCHEMA_VERSION = 1
         const val CHECKPOINT_SCHEMA_VERSION = 5
         const val AUTHORIZATION_SCHEMA_VERSION = 2
+        const val DASHBOARD_CACHE_SCHEMA_VERSION = 1
         const val P256_COORDINATE_BYTES = 32
         const val UNCOMPRESSED_EC_POINT: Byte = 0x04
     }

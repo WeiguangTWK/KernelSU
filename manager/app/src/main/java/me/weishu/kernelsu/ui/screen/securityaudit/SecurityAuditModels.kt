@@ -76,6 +76,10 @@ data class AuditFinding(
 data class SecurityAuditUiState(
     val isLoading: Boolean = true,
     val isRefreshing: Boolean = false,
+    val showingCachedSnapshot: Boolean = false,
+    val verificationModuleId: String? = null,
+    val verificationCompleted: Int = 0,
+    val verificationTotal: Int = 0,
     val isRescanning: Boolean = false,
     val isPruning: Boolean = false,
     val isRecovering: Boolean = false,

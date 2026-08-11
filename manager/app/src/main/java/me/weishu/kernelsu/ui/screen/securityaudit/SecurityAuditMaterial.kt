@@ -77,6 +77,9 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
         showRescan = true,
         showPrune = true,
     ) {
+        if (state.isRefreshing) {
+            item { AuditVerificationProgressMaterial(state) }
+        }
         item { AuditOverviewMaterial(state, actions.onOpenCategory) }
         if (state.interruptedInstalls > 0) {
             item { AuditErrorMaterial(stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls)) }
@@ -101,6 +104,37 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
             items(state.histories, key = { it.status.moduleId }) { history ->
                 AuditModuleCardMaterial(history) { actions.onOpenModule(history.status.moduleId) }
             }
+        }
+    }
+}
+
+@Composable
+private fun AuditVerificationProgressMaterial(state: SecurityAuditUiState) {
+    val label = state.verificationModuleId?.let { moduleId ->
+        stringResource(
+            R.string.security_audit_verifying_module,
+            moduleId,
+            state.verificationCompleted,
+            state.verificationTotal,
+        )
+    } ?: if (state.showingCachedSnapshot) {
+        stringResource(R.string.security_audit_snapshot_syncing)
+    } else {
+        stringResource(R.string.security_audit_finalizing_verification)
+    }
+    TonalCard(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
+            Text(
+                label,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
