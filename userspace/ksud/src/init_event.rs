@@ -44,6 +44,12 @@ pub fn on_post_data_fs() -> Result<()> {
         warn!("recover interrupted module audit installs failed: {e:#}");
     }
 
+    // Resolve and materialize audit containment before any persistent or
+    // module-controlled startup script is allowed to run.
+    if let Err(e) = crate::module::enforce_audit_containment(true) {
+        warn!("enforce module audit containment failed: {e:#}");
+    }
+
     let safe_mode = crate::utils::is_safe_mode();
 
     if safe_mode {
@@ -144,6 +150,10 @@ pub fn run_stage(stage: &str, block: bool) {
     if crate::utils::is_safe_mode() {
         warn!("safe mode, skip {stage} scripts");
         return;
+    }
+
+    if let Err(e) = crate::module::enforce_audit_containment(true) {
+        warn!("refresh module audit containment before {stage}: {e:#}");
     }
 
     if let Err(e) = crate::module::exec_common_scripts(&format!("{stage}.d"), block) {

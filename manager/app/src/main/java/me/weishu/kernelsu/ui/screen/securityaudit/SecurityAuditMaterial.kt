@@ -208,8 +208,12 @@ fun SecurityAuditModuleMaterial(
             history == null && !state.isLoading -> item { AuditEmptyResultMaterial() }
             history != null -> {
                 item { AuditIntegrityMaterial(history) }
+                history.integrityError?.let { error ->
+                    item { AuditErrorMaterial(error) }
+                }
                 if (
                     history.status.unresolvedRisk &&
+                    history.integrityError == null &&
                     moduleId !in state.staleModuleIds
                 ) {
                     item {
@@ -477,6 +481,14 @@ private fun AuditModuleLinkMaterial(moduleId: String, onClick: () -> Unit) {
 
 @Composable
 private fun AuditCategorySummaryMaterial(history: AuditHistory) {
+    history.integrityError?.let { error ->
+        Text(
+            error,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error,
+        )
+        return
+    }
     val groups = history.categoryGroups()
     if (groups.isEmpty()) {
         Text(
@@ -509,6 +521,33 @@ private fun AuditIntegrityMaterial(history: AuditHistory) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            history.status.containmentState?.let { state ->
+                Text(
+                    stringResource(
+                        if (state == "contained") R.string.security_audit_containment_active
+                        else R.string.security_audit_containment_pending
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            if (history.status.quarantinedPersistentScripts > 0) {
+                Text(
+                    stringResource(
+                        R.string.security_audit_persistent_quarantined,
+                        history.status.quarantinedPersistentScripts,
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (history.status.persistentScriptOwnership == "uncertain") {
+                Text(
+                    stringResource(R.string.security_audit_persistent_uncertain),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
             history.packageFingerprint()?.let {
                 Text(stringResource(R.string.security_audit_package_hash, it), style = MaterialTheme.typography.bodySmall)
             }

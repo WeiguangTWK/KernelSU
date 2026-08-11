@@ -364,6 +364,7 @@ fun ModulePagerMaterial(
                         displayModules = uiState.searchResults,
                         updateInfoMap = uiState.updateInfo,
                         secureRemovalModuleIds = uiState.secureRemovalModuleIds,
+                        secureRemovalStates = uiState.secureRemovalStates,
                         actions = actions,
                         onClickModule = { module ->
                             if (module.hasWebUi) {
@@ -476,6 +477,7 @@ fun ModulePagerMaterial(
                 displayModules = uiState.moduleList,
                 updateInfoMap = uiState.updateInfo,
                 secureRemovalModuleIds = uiState.secureRemovalModuleIds,
+                secureRemovalStates = uiState.secureRemovalStates,
                 actions = actions,
                 onClickModule = { module ->
                     if (module.hasWebUi) {
@@ -511,6 +513,7 @@ private fun ModuleList(
     displayModules: List<Module>,
     updateInfoMap: Map<String, ModuleUpdateInfo>,
     secureRemovalModuleIds: Set<String>,
+    secureRemovalStates: Map<String, String>,
     actions: ModuleActions,
     onClickModule: (Module) -> Unit,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
@@ -534,6 +537,7 @@ private fun ModuleList(
             ModuleItem(
                 module = module,
                 requiresSecureRemoval = module.id in secureRemovalModuleIds,
+                containmentState = secureRemovalStates[module.id],
                 updateUrl = moduleUpdateInfo.downloadUrl,
                 onUninstallClicked = {
                     if (module.id in secureRemovalModuleIds) {
@@ -722,6 +726,7 @@ private fun ModuleShortcutSheet(
 private fun ModuleItem(
     module: Module,
     requiresSecureRemoval: Boolean,
+    containmentState: String?,
     updateUrl: String,
     onUninstallClicked: () -> Unit,
     onCheckChanged: (Boolean) -> Unit,
@@ -854,6 +859,23 @@ private fun ModuleItem(
                         backgroundColor = MaterialTheme.colorScheme.primary
                     )
                 }
+            }
+
+            if (requiresSecureRemoval) {
+                Text(
+                    text = stringResource(
+                        when (containmentState) {
+                            "pending_reboot" -> R.string.security_audit_containment_pending
+                            "contained" -> R.string.security_audit_module_contained
+                            else -> R.string.security_audit_integrity_compromised
+                        }
+                    ),
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(bottom = 6.dp),
+                )
             }
 
             HorizontalDivider(thickness = Dp.Hairline)

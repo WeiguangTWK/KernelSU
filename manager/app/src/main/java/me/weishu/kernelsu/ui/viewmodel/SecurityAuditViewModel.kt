@@ -26,6 +26,7 @@ import me.weishu.kernelsu.ui.screen.securityaudit.parseStaleAuditModuleIds
 import me.weishu.kernelsu.ui.util.commitModuleAuditSeal
 import me.weishu.kernelsu.ui.util.containModuleForSecureRemoval
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
+import me.weishu.kernelsu.ui.util.getModuleAuditRecoveryStatus
 import me.weishu.kernelsu.ui.util.getModuleAuditCheckpoint
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationChallenge
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationStatus
@@ -33,8 +34,10 @@ import me.weishu.kernelsu.ui.util.getModuleAuditSealStatus
 import me.weishu.kernelsu.ui.util.getStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
+import me.weishu.kernelsu.ui.util.recoverManagerSealedAudit
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
 import me.weishu.kernelsu.ui.util.securelyRemoveModule as runSecureModuleRemoval
+import org.json.JSONArray
 import org.json.JSONObject
 
 class SecurityAuditViewModel : ViewModel() {
@@ -87,6 +90,30 @@ class SecurityAuditViewModel : ViewModel() {
                         )
                     },
                 )
+                val sealedRecoveryResult: Result<List<String>> = if (
+                    checkpointResult.isFailure || rawHistoryResult.isFailure
+                ) {
+                    runCatching {
+                        JSONObject(getModuleAuditRecoveryStatus())
+                            .getJSONArray("failures")
+                            .moduleIds()
+                    }
+                } else {
+                    Result.success(emptyList())
+                }
+                sealedRecoveryResult.exceptionOrNull()?.let {
+                    if (it is CancellationException) throw it
+                }
+                val sealedRecoveryModuleIds = sealedRecoveryResult.getOrDefault(emptyList())
+                if (sealedRecoveryModuleIds.isNotEmpty()) {
+                    checkpoint = AuditCheckpointVerification(
+                        trust = AuditCheckpointTrust.Compromised,
+                        detail = "Manager-sealed audit history was damaged: " +
+                            sealedRecoveryModuleIds.joinToString(),
+                        protection = checkpoint.protection,
+                        recoverableModules = sealedRecoveryModuleIds,
+                    )
+                }
                 val histories = historyResult.getOrDefault(emptyList())
                     .map { history ->
                         history.copy(
@@ -130,10 +157,15 @@ class SecurityAuditViewModel : ViewModel() {
                     staleModuleIds = staleResult.getOrDefault(emptyList()),
                     checkpoint = checkpoint,
                     authorizationReady = sealResult.getOrDefault(false),
-                    error = historyResult.exceptionOrNull()
-                        ?: staleResult.exceptionOrNull()
-                        ?: sealResult.exceptionOrNull()
-                        ?: authorizationResult.exceptionOrNull(),
+                    sealedRecoveryModuleIds = sealedRecoveryModuleIds,
+                    error = if (sealedRecoveryModuleIds.isNotEmpty()) {
+                        null
+                    } else {
+                        historyResult.exceptionOrNull()
+                            ?: staleResult.exceptionOrNull()
+                            ?: sealResult.exceptionOrNull()
+                            ?: authorizationResult.exceptionOrNull()
+                    },
                 )
             }.onSuccess { result ->
                 _uiState.value = SecurityAuditUiState(
@@ -149,6 +181,7 @@ class SecurityAuditViewModel : ViewModel() {
                         .takeIf { it.trust == AuditCheckpointTrust.Compromised }
                         ?.detail,
                     recoverableModuleIds = result.checkpoint.recoverableModules,
+                    sealedRecoveryModuleIds = result.sealedRecoveryModuleIds,
                     recoverySafeMode = Natives.isSafeMode,
                     keyProtection = result.checkpoint.protection,
                     auditAuthorizationReady = result.authorizationReady,
@@ -174,6 +207,7 @@ class SecurityAuditViewModel : ViewModel() {
         val staleModuleIds: List<String>,
         val checkpoint: AuditCheckpointVerification,
         val authorizationReady: Boolean,
+        val sealedRecoveryModuleIds: List<String>,
         val error: Throwable?,
     )
 
@@ -275,12 +309,28 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
+                ensureAuditAuthorization()
+                for (moduleId in _uiState.value.sealedRecoveryModuleIds) {
+                    val challenge = getModuleAuditAuthorizationChallenge(
+                        "recover-sealed",
+                        moduleId,
+                    )
+                    val authorization = checkpointStore
+                        .signSealedRecoveryAuthorization(challenge)
+                    recoverManagerSealedAudit(moduleId, authorization)
+                }
                 val recovery = checkpointStore.acceptRecoveredChain(
                     getModuleAuditCheckpoint(),
                     getModuleAuditHistories(),
                 )
                 check(recovery.trust == AuditCheckpointTrust.Verified) {
                     recovery.detail ?: "Unable to accept rebuilt audit chain"
+                }
+                check(ensureAuditAuthorization()) {
+                    "Manager audit authorization is unavailable after recovery"
+                }
+                check(ensureAuditSeal()) {
+                    "Unable to anchor the recovered audit chain"
                 }
             }.onFailure { error ->
                 if (error is CancellationException) throw error
@@ -412,3 +462,13 @@ class SecurityAuditViewModel : ViewModel() {
         }
     }
 }
+
+private fun JSONArray.moduleIds(): List<String> = buildList {
+    for (index in 0 until length()) {
+        val moduleId = getJSONObject(index).getString("module_id")
+        check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) {
+            "Invalid sealed recovery module id"
+        }
+        add(moduleId)
+    }
+}.distinct().sorted()

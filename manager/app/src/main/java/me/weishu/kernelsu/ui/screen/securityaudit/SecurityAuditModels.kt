@@ -7,6 +7,7 @@ import org.json.JSONObject
 data class AuditHistory(
     val status: AuditStatus,
     val events: List<AuditEvent> = emptyList(),
+    val integrityError: String? = null,
 )
 
 data class AuditStatus(
@@ -18,6 +19,9 @@ data class AuditStatus(
     val headHash: String,
     val hmacVerified: Boolean,
     val managerCheckpoint: String,
+    val containmentState: String? = null,
+    val quarantinedPersistentScripts: Int = 0,
+    val persistentScriptOwnership: String? = null,
 )
 
 data class AuditEvent(
@@ -73,6 +77,7 @@ data class SecurityAuditUiState(
     val checkpointCompromised: Boolean = false,
     val checkpointIncident: String? = null,
     val recoverableModuleIds: List<String> = emptyList(),
+    val sealedRecoveryModuleIds: List<String> = emptyList(),
     val recoverySafeMode: Boolean = false,
     val keyProtection: AuditKeyProtection = AuditKeyProtection.Unavailable,
     val auditAuthorizationReady: Boolean = false,
@@ -218,8 +223,12 @@ fun parseAuditHistories(raw: String): List<AuditHistory> = JSONArray(raw).mapObj
             headHash = status.getString("head_hash"),
             hmacVerified = status.getBoolean("hmac_verified"),
             managerCheckpoint = status.getString("manager_checkpoint"),
+            containmentState = status.optString("containment_state").takeIf(String::isNotBlank),
+            quarantinedPersistentScripts = status.optInt("quarantined_persistent_scripts"),
+            persistentScriptOwnership = status.optString("persistent_script_ownership").takeIf(String::isNotBlank),
         ),
         events = history.optJSONArray("events")?.mapObjects(::parseAuditEvent).orEmpty(),
+        integrityError = history.optString("integrity_error").takeIf(String::isNotBlank),
     )
 }
 

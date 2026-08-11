@@ -314,6 +314,13 @@ enum Module {
         json: bool,
     },
 
+    /// Diagnose damage to events anchored by the Manager audit seal
+    AuditRecoveryStatus {
+        /// print structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Export the canonical payload for a Manager Keystore checkpoint
     AuditCheckpoint,
 
@@ -366,6 +373,18 @@ enum Module {
         /// untrusted module id
         id: String,
         /// print structured JSON result
+        #[arg(long)]
+        json: bool,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// Rebuild a damaged Manager-sealed module history in KernelSU safe mode
+    AuditRecoverSealed {
+        /// affected module id
+        id: String,
+        /// print structured JSON
         #[arg(long)]
         json: bool,
         /// one-shot Manager authorization token
@@ -654,11 +673,11 @@ pub fn run() -> Result<()> {
                     let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
                     let histories = if let Some(id) = id {
                         crate::module::validate_module_id(&id)?;
-                        vec![crate::module_audit_log::read_module_history(
+                        vec![crate::module_audit_log::read_module_history_resilient(
                             root, &id, true,
                         )?]
                     } else {
-                        crate::module_audit_log::list_histories(root, true)?
+                        crate::module_audit_log::list_histories_resilient(root, true)?
                     };
                     if json {
                         println!("{}", serde_json::to_string_pretty(&histories)?);
@@ -679,7 +698,8 @@ pub fn run() -> Result<()> {
                 }
                 Module::AuditStatus { json } => {
                     let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
-                    let statuses = crate::module_audit_log::list_modules(root, true)?;
+                    crate::module::enforce_audit_containment(false)?;
+                    let statuses = crate::module_audit_log::list_modules_resilient(root, true)?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&statuses)?);
                     } else {
@@ -687,6 +707,24 @@ pub fn run() -> Result<()> {
                             println!(
                                 "{}: unresolved_risk={}, events={}",
                                 status.module_id, status.unresolved_risk, status.event_count
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                Module::AuditRecoveryStatus { json } => {
+                    let status = crate::module_audit_log::sealed_integrity_status(
+                        std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),
+                    )?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    } else if status.failures.is_empty() {
+                        println!("- Manager-sealed audit history is intact");
+                    } else {
+                        for failure in status.failures {
+                            println!(
+                                "{}: corrupted_from={}, {}",
+                                failure.module_id, failure.corrupted_from_sequence, failure.reason
                             );
                         }
                     }
@@ -741,6 +779,21 @@ pub fn run() -> Result<()> {
                                         .as_deref()
                                         .context("secure-remove authorization requires --id")?;
                                     module::audit_secure_remove_arguments_hash(id)?
+                                }
+                                "recover-sealed" => {
+                                    let id = id
+                                        .as_deref()
+                                        .context("recover-sealed authorization requires --id")?;
+                                    return crate::module_audit_log::manager_sealed_recovery_challenge(
+                                        root, id,
+                                    )
+                                    .and_then(|challenge| {
+                                        println!(
+                                            "{}",
+                                            serde_json::to_string_pretty(&challenge)?
+                                        );
+                                        Ok(())
+                                    });
                                 }
                                 _ => anyhow::bail!("unsupported audit authorization action"),
                             };
@@ -806,6 +859,19 @@ pub fn run() -> Result<()> {
                         );
                     } else {
                         println!("- Securely removed module {id}");
+                    }
+                    Ok(())
+                }
+                Module::AuditRecoverSealed {
+                    id,
+                    json,
+                    authorization,
+                } => {
+                    let status = module::recover_manager_sealed_audit(&id, &authorization)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    } else {
+                        println!("- Rebuilt Manager-sealed audit history for {id}");
                     }
                     Ok(())
                 }

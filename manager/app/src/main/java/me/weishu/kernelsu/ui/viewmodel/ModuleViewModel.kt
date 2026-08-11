@@ -38,10 +38,12 @@ import me.weishu.kernelsu.ui.screen.module.ModuleUiState
 import me.weishu.kernelsu.ui.util.PinyinUtil
 import me.weishu.kernelsu.ui.util.hasMagisk
 import me.weishu.kernelsu.ui.util.getModuleAuditStatuses
+import me.weishu.kernelsu.ui.util.getModuleAuditRecoveryStatus
 import me.weishu.kernelsu.ui.util.module.fetchModuleDetail
 import me.weishu.kernelsu.ui.util.module.fetchReleaseDescriptionHtml
 import okhttp3.Request
 import org.json.JSONArray
+import org.json.JSONObject
 import java.text.Collator
 import java.util.Locale
 import kotlin.time.Duration.Companion.milliseconds
@@ -235,23 +237,42 @@ class ModuleViewModel(
     }
 
     suspend fun loadModuleList(resort: Boolean = true) {
-        val (parsedModules, secureRemovalModuleIds) = withContext(Dispatchers.IO) {
+        val (parsedModules, secureRemovalModuleIds, secureRemovalStates) = withContext(Dispatchers.IO) {
             val modules = repo.getModules().getOrElse {
                 Log.e(TAG, "fetchModuleList: ", it)
                 emptyList()
             }
-            val restricted = runCatching {
-                val statuses = JSONArray(getModuleAuditStatuses())
-                (0 until statuses.length()).mapNotNullTo(mutableSetOf()) { index ->
-                    statuses.getJSONObject(index).takeIf {
-                        it.getBoolean("unresolved_risk")
-                    }?.getString("module_id")
+            val restricted: Pair<Set<String>, Map<String, String>> =
+                runCatching<Pair<Set<String>, Map<String, String>>> {
+                    val statuses = JSONArray(getModuleAuditStatuses())
+                    val ids = mutableSetOf<String>()
+                    val states = mutableMapOf<String, String>()
+                    (0 until statuses.length()).forEach { index ->
+                        val status = statuses.getJSONObject(index)
+                        if (status.getBoolean("unresolved_risk")) {
+                            val id = status.getString("module_id")
+                            ids += id
+                            status.optString("containment_state")
+                                .takeIf(String::isNotBlank)
+                                ?.let { states[id] = it }
+                        }
+                    }
+                    ids to states
+                }.getOrElse { recoveryError ->
+                    Log.e(TAG, "load secure module dispositions: ", recoveryError)
+                    runCatching<Pair<Set<String>, Map<String, String>>> {
+                        val failures = JSONObject(getModuleAuditRecoveryStatus())
+                            .getJSONArray("failures")
+                        val ids = (0 until failures.length()).mapTo(mutableSetOf()) { index ->
+                            failures.getJSONObject(index).getString("module_id")
+                        }
+                        ids to emptyMap<String, String>()
+                    }.getOrElse { sealedRecoveryError ->
+                        Log.e(TAG, "load sealed audit recovery dispositions: ", sealedRecoveryError)
+                        emptySet<String>() to emptyMap<String, String>()
+                    }
                 }
-            }.getOrElse {
-                Log.e(TAG, "load secure module dispositions: ", it)
-                emptySet()
-            }
-            modules to restricted
+            Triple(modules, restricted.first, restricted.second)
         }
 
         withContext(Dispatchers.Main) {
@@ -259,6 +280,7 @@ class ModuleViewModel(
                 it.copy(
                     modules = parsedModules,
                     secureRemovalModuleIds = secureRemovalModuleIds,
+                    secureRemovalStates = secureRemovalStates,
                 )
             }
             // Trigger recalculation of moduleList

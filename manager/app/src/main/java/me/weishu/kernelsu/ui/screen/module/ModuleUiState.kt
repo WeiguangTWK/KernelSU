@@ -54,6 +54,7 @@ data class ModuleUiState(
     val isSafeMode: Boolean = false,
     val magiskInstalled: Boolean = false,
     val secureRemovalModuleIds: Set<String> = emptySet(),
+    val secureRemovalStates: Map<String, String> = emptyMap(),
     val confirmDialogState: ModuleConfirmDialogState? = null,
 ) {
     val installButtonVisible: Boolean

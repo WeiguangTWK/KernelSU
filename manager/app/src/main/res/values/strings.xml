@@ -95,6 +95,12 @@
     <string name="security_audit_secure_remove_reboot_guide">%1$s is not trusted, so its normal uninstall path has been disabled. KernelSU will disable it and cancel any pending scripted uninstall, then reboot.\n\nThis is not Android safe mode. After the first boot screen appears, quickly press and release Volume Down at least three times. Reopen Security &amp; Audit Center after boot to finish removal.</string>
     <string name="security_audit_secure_remove_confirm">Securely remove</string>
     <string name="security_audit_secure_remove_reboot">Disable and reboot</string>
+    <string name="security_audit_module_contained">Module contained · Open Security &amp; Audit Center</string>
+    <string name="security_audit_containment_pending">Containment pending reboot</string>
+    <string name="security_audit_containment_active">Module isolated</string>
+    <string name="security_audit_integrity_compromised">Audit integrity compromised · Open Security &amp; Audit Center</string>
+    <string name="security_audit_persistent_quarantined">Quarantined persistent scripts: %1$d</string>
+    <string name="security_audit_persistent_uncertain">Ownership could not be verified. Unattributed startup scripts were quarantined by exclusion and should be reviewed before restoration.</string>
     <string name="security_audit_authorization_unavailable">Manager audit authorization is unavailable. Reboot into KernelSU safe mode and reopen Security &amp; Audit Center to recover it.</string>
     <string name="security_audit_authorization_changed">Manager audit authorization key changed. Reboot into KernelSU safe mode and reopen Security &amp; Audit Center to recover it.</string>
     <string name="security_audit_event_accepted">Installation accepted</string>

@@ -489,6 +489,7 @@ fun ModulePagerMiuix(
                     modules = uiState.searchResults,
                     updateInfoMap = uiState.updateInfo,
                     secureRemovalModuleIds = uiState.secureRemovalModuleIds,
+                    secureRemovalStates = uiState.secureRemovalStates,
                     actions = actions,
                     onModuleAddShortcut = ::onModuleAddShortcut,
                     contentPadding = PaddingValues(
@@ -595,6 +596,7 @@ fun ModulePagerMiuix(
                             modules = modules,
                             updateInfoMap = uiState.updateInfo,
                             secureRemovalModuleIds = uiState.secureRemovalModuleIds,
+                            secureRemovalStates = uiState.secureRemovalStates,
                             actions = actions,
                             onModuleAddShortcut = { module, type ->
                                 onModuleAddShortcut(module, type)
@@ -751,6 +753,7 @@ private fun ModuleList(
     modules: List<Module>,
     updateInfoMap: Map<String, ModuleUpdateInfo>,
     secureRemovalModuleIds: Set<String>,
+    secureRemovalStates: Map<String, String>,
     actions: ModuleActions,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
     contentPadding: PaddingValues,
@@ -775,6 +778,7 @@ private fun ModuleList(
                 ModuleItem(
                     module = module,
                     requiresSecureRemoval = module.id in secureRemovalModuleIds,
+                    containmentState = secureRemovalStates[module.id],
                     updateUrl = moduleUpdateInfo.downloadUrl,
                     onUninstall = {
                         if (module.id in secureRemovalModuleIds) {
@@ -826,6 +830,7 @@ private fun ModuleList(
 fun ModuleItem(
     module: Module,
     requiresSecureRemoval: Boolean,
+    containmentState: String?,
     updateUrl: String,
     onUndoUninstall: () -> Unit,
     onUninstall: () -> Unit,
@@ -956,6 +961,25 @@ fun ModuleItem(
                     textDecoration = textDecoration
                 )
             }
+        }
+
+
+        if (requiresSecureRemoval) {
+            Text(
+                text = stringResource(
+                    when (containmentState) {
+                        "pending_reboot" -> R.string.security_audit_containment_pending
+                        "contained" -> R.string.security_audit_module_contained
+                        else -> R.string.security_audit_integrity_compromised
+                    }
+                ),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = colorScheme.error,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 6.dp),
+            )
         }
 
         HorizontalDivider(

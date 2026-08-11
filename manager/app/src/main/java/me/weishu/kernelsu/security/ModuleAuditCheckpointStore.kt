@@ -261,12 +261,29 @@ class ModuleAuditCheckpointStore(context: Context) {
 
     fun checkpointUnavailable(detail: String): AuditCheckpointVerification = runCatching {
         val hasEnvelope = checkpointFile.baseFile.isFile
+        if (hasEnvelope) {
+            val envelope = parseEnvelope(readEnvelope() ?: error("Manager checkpoint data is missing"))
+            val signingKey = loadSigningKey(envelope.backend)
+            activeProtection = signingKey.protection
+            check(envelope.keyId == signingKey.publicKey.authorizationKeyId()) {
+                "Manager checkpoint key identity changed"
+            }
+            validateAuditKeyProtectionTransition(envelope.protection, signingKey.protection)
+            check(verifyEnvelope(envelope, signingKey.publicKey)) {
+                "Manager checkpoint signature is invalid"
+            }
+        } else if (
+            runCatching { loadKeyStore().containsAlias(KEY_ALIAS) }.getOrDefault(false) ||
+            softwareKeyFile.baseFile.isFile
+        ) {
+            activeProtection = loadCurrentSigningKey().protection
+        }
         if (
             hasEnvelope ||
             runCatching { loadKeyStore().containsAlias(KEY_ALIAS) }.getOrDefault(false) ||
             softwareKeyFile.baseFile.isFile
         ) {
-            compromised("Audit store unavailable after checkpoint: $detail")
+            compromised("Audit mutations unavailable after checkpoint: $detail")
         } else {
             AuditCheckpointVerification(AuditCheckpointTrust.NotConfigured, detail = detail)
         }
@@ -408,7 +425,12 @@ class ModuleAuditCheckpointStore(context: Context) {
         val previousOperationIds = previous.operations.mapTo(mutableSetOf()) { it.operationId }
         for (operation in current.operations) {
             if (
-                operation.action !in setOf("rescan", "prune", "secure-remove") ||
+                operation.action !in setOf(
+                    "rescan",
+                    "prune",
+                    "secure-remove",
+                    "recover-sealed",
+                ) ||
                 operation.targets != operation.targets.sorted().distinct() ||
                 operation.completedTargets != operation.completedTargets.sorted().distinct() ||
                 !operation.targets.containsAll(operation.completedTargets) ||
@@ -606,7 +628,35 @@ class ModuleAuditCheckpointStore(context: Context) {
         previousEnvelopeHash = null
     }
 
-    fun signAuditAuthorization(rawChallenge: String): String {
+    fun signAuditAuthorization(rawChallenge: String): String = signAuditAuthorization(
+        rawChallenge,
+        trustedInventoryHash ?: error("Manager audit checkpoint has not been verified"),
+        loadCurrentSigningKey().privateKey,
+    )
+
+    fun signSealedRecoveryAuthorization(rawChallenge: String): String {
+        val envelopeText = readEnvelope() ?: error("Manager audit checkpoint is unavailable")
+        val envelope = parseEnvelope(envelopeText)
+        val signingKey = loadSigningKey(envelope.backend)
+        check(envelope.keyId == signingKey.publicKey.authorizationKeyId()) {
+            "Manager checkpoint key identity changed"
+        }
+        validateAuditKeyProtectionTransition(envelope.protection, signingKey.protection)
+        check(verifyEnvelope(envelope, signingKey.publicKey)) {
+            "Manager checkpoint signature is invalid"
+        }
+        return signAuditAuthorization(
+            rawChallenge,
+            parsePayload(envelope.payload).inventoryHash,
+            signingKey.privateKey,
+        )
+    }
+
+    private fun signAuditAuthorization(
+        rawChallenge: String,
+        expectedInventoryHash: String,
+        privateKey: PrivateKey,
+    ): String {
         val challenge = JSONObject(rawChallenge)
         check(challenge.getInt("schema_version") == AUTHORIZATION_SCHEMA_VERSION) {
             "Unsupported audit authorization challenge"
@@ -620,7 +670,7 @@ class ModuleAuditCheckpointStore(context: Context) {
         check(keyId == authorizationKeyId()) {
             "Audit authorization key does not match this Manager"
         }
-        check(inventoryHash == trustedInventoryHash) {
+        check(inventoryHash == expectedInventoryHash) {
             "Audit inventory changed before authorization"
         }
         check(action.matches(Regex("[a-z-]{1,64}"))) { "Invalid audit authorization action" }
@@ -637,7 +687,6 @@ class ModuleAuditCheckpointStore(context: Context) {
             append(challengeId).append('\n')
             append(createdAtUnixSeconds).append('\n')
         }.toByteArray(StandardCharsets.UTF_8)
-        val privateKey = loadCurrentSigningKey().privateKey
         val signature = Signature.getInstance(SIGNATURE_ALGORITHM).run {
             initSign(privateKey)
             update(message)

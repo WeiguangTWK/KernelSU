@@ -20,6 +20,8 @@ const NEXT_KEY_FILE: &str = ".hmac-key-next.json";
 const OPERATIONS_DIR: &str = "operations";
 const CHALLENGES_DIR: &str = "challenges";
 const OPERATION_TRASH_DIR: &str = "operation-trash";
+const SEALED_RECOVERY_DIR: &str = "sealed-recovery";
+const CONTAINMENT_DIR: &str = "containment";
 const AUTH_CHALLENGE_TTL_SECONDS: u64 = 5 * 60;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -121,11 +123,44 @@ struct AuthenticatedRecord<T> {
     hmac_sha256: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistentQuarantineRecord {
+    schema_version: u32,
+    module_id: String,
+    uncertain_ownership: bool,
+    planned_paths: Vec<String>,
+    completed_paths: Vec<String>,
+    updated_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainmentState {
+    PendingReboot,
+    Contained,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersistentScriptOwnership {
+    Attributed,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ModuleContainmentRecord {
+    schema_version: u32,
+    module_id: String,
+    state: ContainmentState,
+    updated_at_unix_seconds: u64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationState {
     Verified,
     Recovered,
+    Compromised,
     Empty,
 }
 
@@ -146,12 +181,19 @@ pub struct ModuleAuditStatus {
     pub head_hash: String,
     pub hmac_verified: bool,
     pub manager_checkpoint: CheckpointState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containment_state: Option<ContainmentState>,
+    pub quarantined_persistent_scripts: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistent_script_ownership: Option<PersistentScriptOwnership>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModuleAuditHistory {
     pub status: ModuleAuditStatus,
     pub events: Vec<AuditEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integrity_error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -322,6 +364,39 @@ pub struct ManagerAuditSealStatus {
     pub seal_hash: Option<String>,
     pub inventory_hash: Option<String>,
     pub key_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SealedIntegrityFailure {
+    pub module_id: String,
+    pub corrupted_from_sequence: u64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SealedIntegrityStatus {
+    pub seal_hash: String,
+    pub inventory_hash: String,
+    pub failures: Vec<SealedIntegrityFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub struct PersistentScriptContainmentPlan {
+    pub module_id: String,
+    pub paths: Vec<String>,
+    pub infer_unattributed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SealedRecoveryRecord {
+    schema_version: u32,
+    module_id: String,
+    operation_id: String,
+    seal_hash: String,
+    base_inventory_hash: String,
+    corrupted_from_sequence: u64,
+    reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -597,6 +672,7 @@ pub fn finish_manager_audit_operation(root: &Path, operation_id: &str) -> Result
     write_record(&operation_path(root, operation_id), operation, &key)
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 pub fn verify_module(root: &Path, module_id: &str, repair: bool) -> Result<ModuleAuditStatus> {
     let _lock = AuditLock::acquire(root, false)?;
     verify_module_unlocked(root, module_id, repair)
@@ -673,6 +749,8 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         .events
         .last()
         .map_or_else(|| GENESIS_HASH.to_owned(), |entry| entry.event_hash.clone());
+    let (quarantined_persistent_scripts, persistent_script_ownership) =
+        read_persistent_quarantine_summary(root, module_id, &key)?;
     Ok(ModuleAuditStatus {
         module_id: module_id.to_owned(),
         verification: chain.state,
@@ -686,6 +764,9 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         } else {
             CheckpointState::Sealed
         },
+        containment_state: read_containment_state(root, module_id, &key)?,
+        quarantined_persistent_scripts,
+        persistent_script_ownership,
     })
 }
 
@@ -699,6 +780,41 @@ pub fn module_requires_secure_removal(root: &Path, module_id: &str) -> Result<bo
     Ok(verify_module_unlocked(root, module_id, true)?.unresolved_risk)
 }
 
+/// Returns whether a module must be excluded from every execution path.
+///
+/// Unlike `module_requires_secure_removal`, this remains usable when a Manager-sealed
+/// event itself is damaged: the signed seal is then the evidence authorizing a
+/// fail-closed containment response.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn module_requires_containment(root: &Path, module_id: &str) -> Result<bool> {
+    validate_module_id(module_id)?;
+    if root.exists() {
+        let contained = {
+            let _lock = AuditLock::acquire(root, false)?;
+            let key = load_key(root, false)?;
+            read_containment_state(root, module_id, &key)?.is_some()
+        };
+        if contained {
+            return Ok(true);
+        }
+    }
+    if let Ok(status) = sealed_integrity_status(root)
+        && status
+            .failures
+            .iter()
+            .any(|failure| failure.module_id == module_id)
+    {
+        return Ok(true);
+    }
+    if !module_path(root, module_id).exists() {
+        return Ok(false);
+    }
+    Ok(read_module_history_resilient(root, module_id, false)?
+        .status
+        .unresolved_risk)
+}
+
+#[cfg(any(not(target_os = "android"), test))]
 pub fn list_modules(root: &Path, repair: bool) -> Result<Vec<ModuleAuditStatus>> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -745,14 +861,99 @@ pub fn read_module_history(
         .into_iter()
         .map(|entry| entry.event)
         .collect::<Vec<_>>();
-    Ok(ModuleAuditHistory { status, events })
+    Ok(ModuleAuditHistory {
+        status,
+        events,
+        integrity_error: None,
+    })
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 pub fn list_histories(root: &Path, repair: bool) -> Result<Vec<ModuleAuditHistory>> {
     list_modules(root, repair)?
         .into_iter()
         .map(|status| read_module_history(root, &status.module_id, false))
         .collect()
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn read_module_history_resilient(
+    root: &Path,
+    module_id: &str,
+    repair: bool,
+) -> Result<ModuleAuditHistory> {
+    match read_module_history(root, module_id, repair) {
+        Ok(history) => Ok(history),
+        Err(error) => compromised_sealed_history(root, module_id, &error),
+    }
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn list_histories_resilient(root: &Path, repair: bool) -> Result<Vec<ModuleAuditHistory>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let key = load_key(root, false)?;
+    verify_tombstones(root, &key)?;
+    let modules_dir = root.join("modules");
+    if !modules_dir.exists() {
+        return Ok(Vec::new());
+    }
+    audit_module_ids(&modules_dir)?
+        .into_iter()
+        .map(|module_id| read_module_history_resilient(root, &module_id, repair))
+        .collect()
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn list_modules_resilient(root: &Path, repair: bool) -> Result<Vec<ModuleAuditStatus>> {
+    Ok(list_histories_resilient(root, repair)?
+        .into_iter()
+        .map(|history| history.status)
+        .collect())
+}
+
+fn compromised_sealed_history(
+    root: &Path,
+    module_id: &str,
+    source: &anyhow::Error,
+) -> Result<ModuleAuditHistory> {
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?
+        .context("Manager audit authorization key is not configured")?;
+    let seal = load_verified_manager_seal(root, &registry)?
+        .context("Manager audit seal is not configured")?;
+    let module = seal
+        .payload
+        .modules
+        .iter()
+        .find(|module| module.module_id == module_id)
+        .context("failed audit module is not present in the Manager seal")?;
+    let failure = diagnose_sealed_module(root, module)?
+        .with_context(|| format!("audit history failed without sealed damage: {source:#}"))?;
+    let (quarantined_persistent_scripts, persistent_script_ownership) =
+        read_persistent_quarantine_summary(root, module_id, &key)?;
+    Ok(ModuleAuditHistory {
+        status: ModuleAuditStatus {
+            module_id: module_id.to_owned(),
+            verification: VerificationState::Compromised,
+            high_risk: true,
+            unresolved_risk: true,
+            event_count: module.event_hashes.len(),
+            head_hash: module.head_hash.clone(),
+            hmac_verified: false,
+            manager_checkpoint: CheckpointState::Sealed,
+            containment_state: read_containment_state(root, module_id, &key)?,
+            quarantined_persistent_scripts,
+            persistent_script_ownership,
+        },
+        events: Vec::new(),
+        integrity_error: Some(format!(
+            "Manager-sealed event {} failed verification: {}",
+            failure.corrupted_from_sequence, failure.reason
+        )),
+    })
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
@@ -1276,6 +1477,9 @@ fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
                     &operation.operation_id,
                     key,
                 )?,
+                "recover-sealed" => {
+                    operation_sealed_recovery_exists(root, target, &operation.operation_id, key)?
+                }
                 _ => false,
             };
             if completed {
@@ -1339,6 +1543,27 @@ fn operation_secure_removal_event_exists(
                 AuditEventKind::SecureRemovalCompleted { operation_id: recorded, .. }
                     if recorded == operation_id
             )
+        }))
+}
+
+fn operation_sealed_recovery_exists(
+    root: &Path,
+    module_id: &str,
+    operation_id: &str,
+    key: &[u8; 32],
+) -> Result<bool> {
+    let Some(recovery) = read_sealed_recovery(root, module_id, key)? else {
+        return Ok(false);
+    };
+    if recovery.operation_id != operation_id {
+        return Ok(false);
+    }
+    Ok(verify_chain(root, module_id, key, true)?
+        .events
+        .last()
+        .is_some_and(|entry| {
+            entry.event.sequence == recovery.corrupted_from_sequence
+                && matches!(entry.event.kind, AuditEventKind::IntegrityIncident { .. })
         }))
 }
 
@@ -1499,7 +1724,14 @@ pub fn commit_manager_audit_seal(
             envelope.generation == previous.envelope.generation.saturating_add(1),
             "Manager audit seal generation is not the next expected value"
         );
-        ensure_checkpoint_extends(&previous.payload, &payload, &registry)?;
+        ensure_checkpoint_extends(
+            root,
+            &key,
+            &previous.seal_hash,
+            &previous.payload,
+            &payload,
+            &registry,
+        )?;
     } else {
         for operation in &payload.operations {
             verify_checkpoint_operation_authorization(operation, &registry)?;
@@ -1513,6 +1745,7 @@ pub fn commit_manager_audit_seal(
             seal_hash: seal_hash.clone(),
         },
     )?;
+    finalize_sealed_recovery_records(root, &payload)?;
     complete_hmac_rotation(root, &key, &payload, &seal_hash)?;
     finalize_sealed_operation_trash(root, &payload)?;
     Ok(ManagerAuditSealStatus {
@@ -1522,6 +1755,22 @@ pub fn commit_manager_audit_seal(
         inventory_hash: Some(payload.inventory_hash),
         key_id: Some(envelope.key_id),
     })
+}
+
+fn finalize_sealed_recovery_records(root: &Path, payload: &CheckpointPayload) -> Result<()> {
+    for operation in &payload.operations {
+        if operation.action != "recover-sealed" || operation.state != AuditOperationState::Applied {
+            continue;
+        }
+        for module_id in &operation.completed_targets {
+            let path = sealed_recovery_path(root, module_id);
+            if path.exists() {
+                std::fs::remove_file(&path).context("finalize Manager-sealed audit recovery")?;
+                sync_dir(path.parent().context("sealed recovery has no parent")?)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn finalize_sealed_operation_trash(root: &Path, payload: &CheckpointPayload) -> Result<()> {
@@ -1579,16 +1828,446 @@ fn verified_sealed_event_hashes(
         );
         return Ok(Vec::new());
     }
-    let seal = load_verified_manager_seal(root, registry.as_ref().expect("checked above"))?;
-    Ok(seal
-        .and_then(|seal| {
-            seal.payload
-                .modules
-                .into_iter()
-                .find(|module| module.module_id == module_id)
-        })
-        .map(|module| module.event_hashes)
-        .unwrap_or_default())
+    let registry = registry.as_ref().expect("checked above");
+    let Some(seal) = load_verified_manager_seal(root, registry)? else {
+        return Ok(Vec::new());
+    };
+    let mut hashes = seal
+        .payload
+        .modules
+        .iter()
+        .find(|module| module.module_id == module_id)
+        .map(|module| module.event_hashes.clone())
+        .unwrap_or_default();
+    if let Some(recovery) = read_sealed_recovery(root, module_id, key)?
+        && recovery.seal_hash == seal.seal_hash
+    {
+        verify_sealed_recovery_record(&recovery, &seal, registry, root, key)?;
+        let retained = usize::try_from(recovery.corrupted_from_sequence.saturating_sub(1))?;
+        ensure!(
+            retained < hashes.len(),
+            "sealed recovery boundary is outside the seal"
+        );
+        hashes.truncate(retained);
+    }
+    Ok(hashes)
+}
+
+fn sealed_recovery_path(root: &Path, module_id: &str) -> PathBuf {
+    root.join(SEALED_RECOVERY_DIR)
+        .join(format!("{}.json", module_dir_name(module_id)))
+}
+
+fn read_sealed_recovery(
+    root: &Path,
+    module_id: &str,
+    key: &[u8; 32],
+) -> Result<Option<SealedRecoveryRecord>> {
+    let path = sealed_recovery_path(root, module_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let authenticated: AuthenticatedRecord<SealedRecoveryRecord> = read_json(&path)?;
+    verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+    ensure!(
+        authenticated.record.schema_version == SCHEMA_VERSION
+            && authenticated.record.module_id == module_id,
+        "invalid sealed recovery record"
+    );
+    Ok(Some(authenticated.record))
+}
+
+fn verify_sealed_recovery_record(
+    recovery: &SealedRecoveryRecord,
+    seal: &VerifiedManagerSeal,
+    registry: &ManagerAuditAuthRegistry,
+    root: &Path,
+    key: &[u8; 32],
+) -> Result<()> {
+    ensure!(
+        recovery.base_inventory_hash == seal.payload.inventory_hash,
+        "sealed recovery is not bound to the active inventory"
+    );
+    let operation = read_operation(root, &recovery.operation_id, key)?
+        .context("sealed recovery authorization operation is unavailable")?;
+    ensure!(
+        operation.action == "recover-sealed"
+            && operation.base_inventory_hash == seal.payload.inventory_hash
+            && operation.targets == [recovery.module_id.as_str()],
+        "sealed recovery operation identity mismatch"
+    );
+    let expected_arguments_hash = sealed_recovery_arguments_hash(
+        &recovery.seal_hash,
+        &recovery.base_inventory_hash,
+        &SealedIntegrityFailure {
+            module_id: recovery.module_id.clone(),
+            corrupted_from_sequence: recovery.corrupted_from_sequence,
+            reason: recovery.reason.clone(),
+        },
+    )?;
+    ensure!(
+        operation.arguments_hash == expected_arguments_hash,
+        "sealed recovery boundary is not Manager-authorized"
+    );
+    verify_checkpoint_operation_authorization(&operation.checkpoint(), registry)
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn sealed_integrity_status(root: &Path) -> Result<SealedIntegrityStatus> {
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    sealed_integrity_status_unlocked(root, &key)
+}
+
+fn sealed_integrity_status_unlocked(root: &Path, key: &[u8; 32]) -> Result<SealedIntegrityStatus> {
+    let registry = read_manager_auth_registry(root, key)?
+        .context("Manager audit authorization key is not configured")?;
+    let seal = load_verified_manager_seal(root, &registry)?
+        .context("Manager audit seal is not configured")?;
+    let mut failures = Vec::new();
+    for module in &seal.payload.modules {
+        if let Some(recovery) = read_sealed_recovery(root, &module.module_id, key)?
+            && recovery.seal_hash == seal.seal_hash
+        {
+            verify_sealed_recovery_record(&recovery, &seal, &registry, root, key)?;
+            verify_chain(root, &module.module_id, key, true)?;
+            continue;
+        }
+        if let Some(failure) = diagnose_sealed_module(root, module)? {
+            failures.push(failure);
+        }
+    }
+    failures.sort_by(|left, right| left.module_id.cmp(&right.module_id));
+    Ok(SealedIntegrityStatus {
+        seal_hash: seal.seal_hash,
+        inventory_hash: seal.payload.inventory_hash,
+        failures,
+    })
+}
+
+fn diagnose_sealed_module(
+    root: &Path,
+    module: &CheckpointModuleHead,
+) -> Result<Option<SealedIntegrityFailure>> {
+    let mut valid = Vec::new();
+    for (index, sealed_hash) in module.event_hashes.iter().enumerate() {
+        let sequence = u64::try_from(index)?.saturating_add(1);
+        let path = event_path(root, &module.module_id, sequence);
+        let result = if path.is_file() {
+            verify_event_file(
+                &path,
+                &module.module_id,
+                sequence,
+                &valid,
+                &[0_u8; 32],
+                Some(sealed_hash),
+            )
+        } else {
+            Err(anyhow::anyhow!("Manager-sealed audit event is missing"))
+        };
+        match result {
+            Ok(event) => valid.push(event),
+            Err(error) => {
+                return Ok(Some(SealedIntegrityFailure {
+                    module_id: module.module_id.clone(),
+                    corrupted_from_sequence: sequence,
+                    reason: format!("{error:#}"),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn persistent_paths_from_events(events: &[AuthenticatedEvent]) -> Vec<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for entry in events {
+        let report = match &entry.event.kind {
+            AuditEventKind::InstallAccepted { report, .. }
+            | AuditEventKind::InstalledRescan { report, .. } => Some(report),
+            _ => None,
+        };
+        if let Some(report) = report {
+            paths.extend(
+                report
+                    .findings
+                    .iter()
+                    .filter(|finding| finding.rule_id == "KSU-AUDIT-PERSIST-001")
+                    .map(|finding| finding.path.clone()),
+            );
+        }
+    }
+    paths.into_iter().collect()
+}
+
+/// Builds a fail-closed persistent-script plan only from events whose hashes are
+/// anchored in the active Manager seal. An empty verified prefix means ownership
+/// cannot be recovered and callers must use exclusion against other trusted logs.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn persistent_script_containment_plans(
+    root: &Path,
+) -> Result<Vec<PersistentScriptContainmentPlan>> {
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?
+        .context("Manager audit authorization key is not configured")?;
+    let seal = load_verified_manager_seal(root, &registry)?
+        .context("Manager audit seal is not configured")?;
+    let mut plans = Vec::new();
+    for module in &seal.payload.modules {
+        let Some(failure) = diagnose_sealed_module(root, module)? else {
+            continue;
+        };
+        let mut trusted = Vec::new();
+        for (index, sealed_hash) in module.event_hashes.iter().enumerate() {
+            let sequence = u64::try_from(index)?.saturating_add(1);
+            if sequence >= failure.corrupted_from_sequence {
+                break;
+            }
+            trusted.push(verify_event_file(
+                &event_path(root, &module.module_id, sequence),
+                &module.module_id,
+                sequence,
+                &trusted,
+                &[0_u8; 32],
+                Some(sealed_hash),
+            )?);
+        }
+        plans.push(PersistentScriptContainmentPlan {
+            module_id: module.module_id.clone(),
+            paths: persistent_paths_from_events(&trusted),
+            infer_unattributed: trusted.is_empty(),
+        });
+    }
+    Ok(plans)
+}
+
+/// Returns persistent paths attributable to intact Manager-sealed histories.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn trusted_persistent_script_paths(root: &Path) -> Result<Vec<String>> {
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?
+        .context("Manager audit authorization key is not configured")?;
+    let seal = load_verified_manager_seal(root, &registry)?
+        .context("Manager audit seal is not configured")?;
+    let mut paths = std::collections::BTreeSet::new();
+    for module in &seal.payload.modules {
+        if diagnose_sealed_module(root, module)?.is_some() {
+            continue;
+        }
+        let mut events = Vec::new();
+        for (index, sealed_hash) in module.event_hashes.iter().enumerate() {
+            let sequence = u64::try_from(index)?.saturating_add(1);
+            events.push(verify_event_file(
+                &event_path(root, &module.module_id, sequence),
+                &module.module_id,
+                sequence,
+                &events,
+                &[0_u8; 32],
+                Some(sealed_hash),
+            )?);
+        }
+        paths.extend(persistent_paths_from_events(&events));
+    }
+    Ok(paths.into_iter().collect())
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn persistent_quarantine_record_path(root: &Path, module_id: &str) -> PathBuf {
+    root.join(CONTAINMENT_DIR)
+        .join(module_dir_name(module_id))
+        .join("persistent.json")
+}
+
+fn read_persistent_quarantine_summary(
+    root: &Path,
+    module_id: &str,
+    key: &[u8; 32],
+) -> Result<(usize, Option<PersistentScriptOwnership>)> {
+    let path = persistent_quarantine_record_path(root, module_id);
+    if !path.exists() {
+        return Ok((0, None));
+    }
+    let authenticated: AuthenticatedRecord<PersistentQuarantineRecord> = read_json(&path)?;
+    verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+    ensure!(
+        authenticated.record.module_id == module_id,
+        "containment module id mismatch"
+    );
+    let count = authenticated.record.completed_paths.len();
+    Ok((
+        count,
+        (count > 0).then_some(if authenticated.record.uncertain_ownership {
+            PersistentScriptOwnership::Uncertain
+        } else {
+            PersistentScriptOwnership::Attributed
+        }),
+    ))
+}
+
+fn module_containment_record_path(root: &Path, module_id: &str) -> PathBuf {
+    root.join(CONTAINMENT_DIR)
+        .join(module_dir_name(module_id))
+        .join("state.json")
+}
+
+fn read_containment_state(
+    root: &Path,
+    module_id: &str,
+    key: &[u8; 32],
+) -> Result<Option<ContainmentState>> {
+    let path = module_containment_record_path(root, module_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let authenticated: AuthenticatedRecord<ModuleContainmentRecord> = read_json(&path)?;
+    verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+    ensure!(
+        authenticated.record.module_id == module_id,
+        "containment module id mismatch"
+    );
+    Ok(Some(authenticated.record.state))
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn set_containment_state(root: &Path, module_id: &str, state: ContainmentState) -> Result<()> {
+    validate_module_id(module_id)?;
+    let _lock = AuditLock::acquire(root, true)?;
+    let key = load_key(root, false)?;
+    let state = match (read_containment_state(root, module_id, &key)?, state) {
+        (Some(ContainmentState::Contained), ContainmentState::PendingReboot) => {
+            ContainmentState::Contained
+        }
+        (_, state) => state,
+    };
+    write_record(
+        &module_containment_record_path(root, module_id),
+        ModuleContainmentRecord {
+            schema_version: SCHEMA_VERSION,
+            module_id: module_id.to_owned(),
+            state,
+            updated_at_unix_seconds: now(),
+        },
+        &key,
+    )
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn persistent_quarantine_destination(
+    root: &Path,
+    module_id: &str,
+    source: &Path,
+) -> Result<PathBuf> {
+    const ROOTS: &[&str] = &[
+        "/data/adb/service.d",
+        "/data/adb/boot-completed.d",
+        "/data/adb/bootcompleted.d",
+    ];
+    let parent = source.parent().context("persistent script has no parent")?;
+    let root_index = ROOTS
+        .iter()
+        .position(|candidate| parent == Path::new(candidate))
+        .context("persistent script is outside an approved startup directory")?;
+    let name = source
+        .file_name()
+        .context("persistent script has no file name")?;
+    Ok(root
+        .join(CONTAINMENT_DIR)
+        .join(module_dir_name(module_id))
+        .join("persistent")
+        .join(root_index.to_string())
+        .join(name))
+}
+
+/// Reversibly quarantines startup scripts and authenticates the move journal.
+/// Re-running the operation resumes any move interrupted after the plan commit.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn quarantine_persistent_scripts(
+    root: &Path,
+    module_id: &str,
+    paths: &[String],
+    uncertain_ownership: bool,
+) -> Result<Vec<String>> {
+    validate_module_id(module_id)?;
+    let _lock = AuditLock::acquire(root, true)?;
+    let key = load_key(root, false)?;
+    let record_path = persistent_quarantine_record_path(root, module_id);
+    let mut record = if record_path.exists() {
+        let authenticated: AuthenticatedRecord<PersistentQuarantineRecord> =
+            read_json(&record_path)?;
+        verify_record(&authenticated.record, &authenticated.hmac_sha256, &key)?;
+        authenticated.record
+    } else {
+        PersistentQuarantineRecord {
+            schema_version: SCHEMA_VERSION,
+            module_id: module_id.to_owned(),
+            uncertain_ownership,
+            planned_paths: Vec::new(),
+            completed_paths: Vec::new(),
+            updated_at_unix_seconds: now(),
+        }
+    };
+    ensure!(
+        record.module_id == module_id,
+        "containment module id mismatch"
+    );
+    record.uncertain_ownership |= uncertain_ownership;
+    for path in paths {
+        let source = Path::new(path);
+        let _ = persistent_quarantine_destination(root, module_id, source)?;
+        if !source.exists() {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(source)?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "refuse to quarantine non-regular startup file {path}"
+        );
+        if !record.planned_paths.contains(path) {
+            record.planned_paths.push(path.clone());
+        }
+    }
+    record.planned_paths.sort();
+    record.updated_at_unix_seconds = now();
+    write_record(&record_path, record.clone(), &key)?;
+
+    for path in record.planned_paths.clone() {
+        if record.completed_paths.contains(&path) {
+            continue;
+        }
+        let source = Path::new(&path);
+        let destination = persistent_quarantine_destination(root, module_id, source)?;
+        if source.exists() {
+            let metadata = std::fs::symlink_metadata(source)?;
+            ensure!(
+                metadata.file_type().is_file(),
+                "refuse to quarantine non-regular startup file {path}"
+            );
+            ensure_dir(
+                destination
+                    .parent()
+                    .context("quarantine destination has no parent")?,
+            )?;
+            ensure!(
+                !destination.exists(),
+                "persistent quarantine destination already exists"
+            );
+            std::fs::rename(source, &destination)
+                .with_context(|| format!("quarantine persistent startup script {path}"))?;
+        } else {
+            ensure!(
+                destination.is_file(),
+                "planned persistent script disappeared: {path}"
+            );
+        }
+        record.completed_paths.push(path);
+        record.completed_paths.sort();
+        record.updated_at_unix_seconds = now();
+        write_record(&record_path, record.clone(), &key)?;
+    }
+    Ok(record.completed_paths)
 }
 
 fn verify_manager_checkpoint_envelope(
@@ -1711,6 +2390,9 @@ fn verify_checkpoint_operation_authorization(
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 fn ensure_checkpoint_extends(
+    root: &Path,
+    key: &[u8; 32],
+    previous_seal_hash: &str,
     previous: &CheckpointPayload,
     current: &CheckpointPayload,
     registry: &ManagerAuditAuthRegistry,
@@ -1741,13 +2423,40 @@ fn ensure_checkpoint_extends(
             .iter()
             .find(|module| module.module_id == old_module.module_id)
         {
-            ensure!(
-                new_module
-                    .event_hashes
-                    .starts_with(&old_module.event_hashes),
-                "Manager audit history no longer extends its sealed prefix: {}",
-                old_module.module_id
-            );
+            let extends_prefix = new_module
+                .event_hashes
+                .starts_with(&old_module.event_hashes);
+            if !extends_prefix {
+                let recovery = read_sealed_recovery(root, &old_module.module_id, key)?
+                    .context("Manager audit history changed without sealed recovery evidence")?;
+                ensure!(
+                    recovery.seal_hash == previous_seal_hash
+                        && recovery.base_inventory_hash == previous.inventory_hash,
+                    "sealed recovery is not bound to the previous Manager seal"
+                );
+                let operation = current
+                    .operations
+                    .iter()
+                    .find(|operation| operation.operation_id == recovery.operation_id)
+                    .context("sealed recovery operation is missing from the checkpoint")?;
+                ensure!(
+                    operation.action == "recover-sealed"
+                        && operation.targets == [old_module.module_id.as_str()]
+                        && operation.completed_targets == operation.targets
+                        && operation.state == AuditOperationState::Applied,
+                    "sealed recovery operation is incomplete"
+                );
+                verify_checkpoint_operation_authorization(operation, registry)?;
+                let retained = usize::try_from(recovery.corrupted_from_sequence.saturating_sub(1))?;
+                ensure!(
+                    retained < old_module.event_hashes.len()
+                        && new_module.event_hashes.len() == retained.saturating_add(1)
+                        && new_module.event_hashes[..retained]
+                            == old_module.event_hashes[..retained]
+                        && new_module.high_risk,
+                    "sealed recovery did not preserve the verified prefix and incident"
+                );
+            }
             ensure!(
                 !old_module.high_risk || new_module.high_risk,
                 "Manager audit seal attempted to clear a high-risk state: {}",
@@ -1837,7 +2546,7 @@ fn validate_checkpoint_operation(operation: &CheckpointOperation) -> Result<()> 
     ensure!(
         matches!(
             operation.action.as_str(),
-            "rescan" | "prune" | "secure-remove"
+            "rescan" | "prune" | "secure-remove" | "recover-sealed"
         ),
         "unsupported checkpoint audit operation"
     );
@@ -1907,14 +2616,24 @@ fn ensure_operation_extends(
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn manager_audit_auth_status(root: &Path) -> Result<ManagerAuditAuthStatus> {
-    let checkpoint = checkpoint_payload(root)?;
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
     let registry = read_manager_auth_registry(root, &key)?;
+    let inventory_hash = if let Ok(checkpoint) = checkpoint_payload_unlocked(root) {
+        checkpoint.inventory_hash
+    } else {
+        let registry = registry
+            .as_ref()
+            .context("Manager audit authorization key is not configured")?;
+        load_verified_manager_seal(root, registry)?
+            .context("audit inventory is unavailable")?
+            .payload
+            .inventory_hash
+    };
     Ok(ManagerAuditAuthStatus {
         configured: registry.is_some(),
         key_id: registry.map(|registry| registry.key_id),
-        inventory_hash: checkpoint.inventory_hash,
+        inventory_hash,
     })
 }
 
@@ -1981,21 +2700,39 @@ pub fn manager_audit_auth_challenge(
     let registry = read_manager_auth_registry(root, &key)?
         .context("Manager audit authorization key is not configured")?;
     let checkpoint = checkpoint_payload_unlocked(root)?;
+    manager_audit_auth_challenge_unlocked(
+        root,
+        action,
+        arguments_hash,
+        &checkpoint.inventory_hash,
+        &registry,
+        &key,
+    )
+}
+
+fn manager_audit_auth_challenge_unlocked(
+    root: &Path,
+    action: &str,
+    arguments_hash: &str,
+    inventory_hash: &str,
+    registry: &ManagerAuditAuthRegistry,
+    key: &[u8; 32],
+) -> Result<ManagerAuditAuthChallenge> {
     clear_authorization_challenges(root)?;
     let challenge_id = hex(&random_hmac_key()?);
     let challenge = AuditAuthorizationChallenge {
         schema_version: MANAGER_AUTH_SCHEMA_VERSION,
         action: action.to_owned(),
-        inventory_hash: checkpoint.inventory_hash,
+        inventory_hash: inventory_hash.to_owned(),
         arguments_hash: arguments_hash.to_owned(),
-        key_id: registry.key_id,
+        key_id: registry.key_id.clone(),
         challenge_id,
         created_at_unix_seconds: now(),
     };
     write_record(
         &challenge_path(root, &challenge.challenge_id),
         challenge.clone(),
-        &key,
+        key,
     )?;
     Ok(ManagerAuditAuthChallenge {
         schema_version: challenge.schema_version,
@@ -2008,6 +2745,109 @@ pub fn manager_audit_auth_challenge(
     })
 }
 
+fn sealed_recovery_arguments_hash(
+    seal_hash: &str,
+    inventory_hash: &str,
+    failure: &SealedIntegrityFailure,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(&(
+        "recover-sealed",
+        seal_hash,
+        inventory_hash,
+        &failure.module_id,
+        failure.corrupted_from_sequence,
+    ))?;
+    Ok(hex(&Sha256::digest(bytes)))
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn manager_sealed_recovery_challenge(
+    root: &Path,
+    module_id: &str,
+) -> Result<ManagerAuditAuthChallenge> {
+    validate_module_id(module_id)?;
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?
+        .context("Manager audit authorization key is not configured")?;
+    let status = sealed_integrity_status_unlocked(root, &key)?;
+    let failure = status
+        .failures
+        .iter()
+        .find(|failure| failure.module_id == module_id)
+        .context("module has no Manager-sealed integrity failure")?;
+    let arguments_hash =
+        sealed_recovery_arguments_hash(&status.seal_hash, &status.inventory_hash, failure)?;
+    manager_audit_auth_challenge_unlocked(
+        root,
+        "recover-sealed",
+        &arguments_hash,
+        &status.inventory_hash,
+        &registry,
+        &key,
+    )
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn recover_manager_sealed_module(
+    root: &Path,
+    module_id: &str,
+    encoded_authorization: &str,
+) -> Result<ModuleAuditStatus> {
+    validate_module_id(module_id)?;
+    let status = sealed_integrity_status(root)?;
+    let failure = status
+        .failures
+        .iter()
+        .find(|failure| failure.module_id == module_id)
+        .cloned()
+        .context("module has no Manager-sealed integrity failure")?;
+    let arguments_hash =
+        sealed_recovery_arguments_hash(&status.seal_hash, &status.inventory_hash, &failure)?;
+    let targets = vec![module_id.to_owned()];
+    let operation = begin_manager_audit_operation_at_inventory(
+        root,
+        encoded_authorization,
+        "recover-sealed",
+        &arguments_hash,
+        &targets,
+        Some(&status.inventory_hash),
+    )?;
+
+    let lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let recovery = SealedRecoveryRecord {
+        schema_version: SCHEMA_VERSION,
+        module_id: module_id.to_owned(),
+        operation_id: operation.operation_id.clone(),
+        seal_hash: status.seal_hash,
+        base_inventory_hash: status.inventory_hash,
+        corrupted_from_sequence: failure.corrupted_from_sequence,
+        reason: failure.reason,
+    };
+    let recovery_path = sealed_recovery_path(root, module_id);
+    if recovery_path.exists() {
+        let existing = read_sealed_recovery(root, module_id, &key)?
+            .context("sealed recovery record disappeared")?;
+        ensure!(existing == recovery, "sealed recovery record changed");
+    } else {
+        write_record(&recovery_path, recovery, &key)?;
+    }
+    let module_status = verify_module_unlocked(root, module_id, true)?;
+    let mut operation_record = read_operation(root, &operation.operation_id, &key)?
+        .context("sealed recovery operation disappeared")?;
+    operation_record.completed_targets = targets;
+    operation_record.updated_at_unix_seconds = now();
+    write_record(
+        &operation_path(root, &operation.operation_id),
+        operation_record,
+        &key,
+    )?;
+    drop(lock);
+    finish_manager_audit_operation(root, &operation.operation_id)?;
+    Ok(module_status)
+}
+
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn begin_manager_audit_operation(
     root: &Path,
@@ -2015,6 +2855,24 @@ pub fn begin_manager_audit_operation(
     expected_action: &str,
     expected_arguments_hash: &str,
     expected_targets: &[String],
+) -> Result<AuthorizedAuditOperation> {
+    begin_manager_audit_operation_at_inventory(
+        root,
+        encoded_authorization,
+        expected_action,
+        expected_arguments_hash,
+        expected_targets,
+        None,
+    )
+}
+
+fn begin_manager_audit_operation_at_inventory(
+    root: &Path,
+    encoded_authorization: &str,
+    expected_action: &str,
+    expected_arguments_hash: &str,
+    expected_targets: &[String],
+    expected_inventory_hash: Option<&str>,
 ) -> Result<AuthorizedAuditOperation> {
     let token_bytes = decode_hex(encoded_authorization)?;
     let token: SignedAuditAuthorization =
@@ -2087,9 +2945,12 @@ pub fn begin_manager_audit_operation(
             && challenge.record.created_at_unix_seconds == token.created_at_unix_seconds,
         "audit authorization does not match its ksud challenge"
     );
-    let checkpoint = checkpoint_payload_unlocked(root)?;
+    let inventory_hash = match expected_inventory_hash {
+        Some(expected) => expected.to_owned(),
+        None => checkpoint_payload_unlocked(root)?.inventory_hash,
+    };
     ensure!(
-        token.inventory_hash == checkpoint.inventory_hash,
+        token.inventory_hash == inventory_hash,
         "audit inventory changed after authorization"
     );
     let public_key = decode_hex(&registry.public_key_hex)?;
@@ -3046,7 +3907,27 @@ fn reauthenticate_audit_metadata(root: &Path, previous: &[u8; 32], next: &[u8; 3
         &root.join(CHALLENGES_DIR),
         previous,
         next,
-    )
+    )?;
+    rewrite_containment_records(root, previous, next)
+}
+
+fn rewrite_containment_records(root: &Path, previous: &[u8; 32], next: &[u8; 32]) -> Result<()> {
+    let directory = root.join(CONTAINMENT_DIR);
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let directory = entry?.path();
+        let persistent = directory.join("persistent.json");
+        if persistent.is_file() {
+            rewrite_authenticated_file::<PersistentQuarantineRecord>(&persistent, previous, next)?;
+        }
+        let state = directory.join("state.json");
+        if state.is_file() {
+            rewrite_authenticated_file::<ModuleContainmentRecord>(&state, previous, next)?;
+        }
+    }
+    Ok(())
 }
 
 fn rewrite_authenticated_directory<T>(
@@ -3302,6 +4183,30 @@ mod tests {
         hex(&serde_json::to_vec(&token).unwrap())
     }
 
+    fn sealed_recovery_token(root: &Path, signing_key: &SigningKey, module_id: &str) -> String {
+        let challenge = manager_sealed_recovery_challenge(root, module_id).unwrap();
+        let message = audit_authorization_message(
+            &challenge.action,
+            &challenge.inventory_hash,
+            &challenge.arguments_hash,
+            &challenge.key_id,
+            &challenge.challenge_id,
+            challenge.created_at_unix_seconds,
+        );
+        let signature: Signature = signing_key.sign(message.as_bytes());
+        let token = SignedAuditAuthorization {
+            schema_version: MANAGER_AUTH_SCHEMA_VERSION,
+            action: challenge.action,
+            inventory_hash: challenge.inventory_hash,
+            arguments_hash: challenge.arguments_hash,
+            key_id: challenge.key_id,
+            challenge_id: challenge.challenge_id,
+            created_at_unix_seconds: challenge.created_at_unix_seconds,
+            signature_der_hex: hex(signature.to_der().as_bytes()),
+        };
+        hex(&serde_json::to_vec(&token).unwrap())
+    }
+
     fn begin_test_operation(
         root: &Path,
         action: &str,
@@ -3373,6 +4278,74 @@ mod tests {
         };
         assert_eq!(*outcome, InstallOutcome::InstallationFailed);
         assert_eq!(error.as_deref(), Some("installer exited 1"));
+    }
+
+    #[test]
+    fn sealed_prefix_drives_persistent_script_containment_plan() {
+        let temp = TempDir::new().unwrap();
+        let mut audit_report = report("persistent.module", "ab");
+        audit_report.findings.push(Finding {
+            rule_id: "KSU-AUDIT-PERSIST-001".to_owned(),
+            severity: Severity::High,
+            path: "/data/adb/service.d/persistent-module.sh".to_owned(),
+            line: Some(4),
+            title: "persistent startup script".to_owned(),
+            evidence: "test".to_owned(),
+            provenance: Vec::new(),
+        });
+        let receipt = begin_install(temp.path(), audit_report).unwrap();
+        finish_install(temp.path(), receipt, InstallOutcome::Installed, None).unwrap();
+
+        let manager = signing_key(31);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(temp.path(), &checkpoint_envelope(temp.path(), &manager, 1))
+            .unwrap();
+        std::fs::write(event_path(temp.path(), "persistent.module", 2), b"damaged").unwrap();
+
+        let plans = persistent_script_containment_plans(temp.path()).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].module_id, "persistent.module");
+        assert_eq!(plans[0].paths, ["/data/adb/service.d/persistent-module.sh"]);
+        assert!(!plans[0].infer_unattributed);
+        assert!(module_requires_containment(temp.path(), "persistent.module").unwrap());
+    }
+
+    #[test]
+    fn first_sealed_event_loss_requires_unattributed_fallback() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "missing.module", "ab");
+        let manager = signing_key(32);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(temp.path(), &checkpoint_envelope(temp.path(), &manager, 1))
+            .unwrap();
+        std::fs::remove_file(event_path(temp.path(), "missing.module", 1)).unwrap();
+
+        let plans = persistent_script_containment_plans(temp.path()).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].paths.is_empty());
+        assert!(plans[0].infer_unattributed);
+    }
+
+    #[test]
+    fn containment_state_is_authenticated_and_never_downgraded() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "contained.module", "ab");
+        set_containment_state(temp.path(), "contained.module", ContainmentState::Contained)
+            .unwrap();
+        set_containment_state(
+            temp.path(),
+            "contained.module",
+            ContainmentState::PendingReboot,
+        )
+        .unwrap();
+        let status = verify_module(temp.path(), "contained.module", false).unwrap();
+        assert_eq!(status.containment_state, Some(ContainmentState::Contained));
+
+        let path = module_containment_record_path(temp.path(), "contained.module");
+        let mut record: AuthenticatedRecord<ModuleContainmentRecord> = read_json(&path).unwrap();
+        record.record.state = ContainmentState::PendingReboot;
+        atomic_write_json(&path, &record).unwrap();
+        assert!(verify_module(temp.path(), "contained.module", false).is_err());
     }
 
     #[test]
@@ -3712,6 +4685,142 @@ mod tests {
 
         let error = verify_module(temp.path(), "test.module", false).unwrap_err();
         assert!(error.to_string().contains("Manager-sealed"));
+    }
+
+    #[test]
+    fn manager_authorized_recovery_rebuilds_a_damaged_sealed_module_only() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        record(root, "module.alpha", "ab");
+        record(root, "module.beta", "cd");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(root, &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(root, &checkpoint_envelope(root, &manager, 1)).unwrap();
+
+        std::fs::write(event_path(root, "module.alpha", 2), b"corrupt").unwrap();
+        let failure = sealed_integrity_status(root).unwrap();
+        assert_eq!(failure.failures.len(), 1);
+        assert_eq!(failure.failures[0].module_id, "module.alpha");
+        assert_eq!(failure.failures[0].corrupted_from_sequence, 2);
+        assert!(verify_module(root, "module.alpha", true).is_err());
+        let resilient = list_histories_resilient(root, true).unwrap();
+        assert_eq!(resilient.len(), 2);
+        let alpha = resilient
+            .iter()
+            .find(|history| history.status.module_id == "module.alpha")
+            .unwrap();
+        assert_eq!(alpha.status.verification, VerificationState::Compromised);
+        assert!(alpha.status.unresolved_risk);
+        assert!(alpha.events.is_empty());
+        assert!(alpha.integrity_error.is_some());
+        let beta = resilient
+            .iter()
+            .find(|history| history.status.module_id == "module.beta")
+            .unwrap();
+        assert_eq!(beta.status.verification, VerificationState::Verified);
+        assert_eq!(beta.events.len(), 2);
+        assert!(beta.integrity_error.is_none());
+        let statuses = list_modules_resilient(root, true).unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|status| status.module_id == "module.alpha")
+                .unwrap()
+                .verification,
+            VerificationState::Compromised
+        );
+        assert_eq!(
+            verify_module(root, "module.beta", false)
+                .unwrap()
+                .verification,
+            VerificationState::Verified
+        );
+
+        let token = sealed_recovery_token(root, &manager, "module.alpha");
+        let recovered = recover_manager_sealed_module(root, "module.alpha", &token).unwrap();
+        assert!(recovered.unresolved_risk);
+        assert_eq!(recovered.verification, VerificationState::Recovered);
+        assert!(sealed_integrity_status(root).unwrap().failures.is_empty());
+
+        let payload = checkpoint_payload(root).unwrap();
+        let alpha = payload
+            .modules
+            .iter()
+            .find(|module| module.module_id == "module.alpha")
+            .unwrap();
+        assert_eq!(alpha.sequence, 2);
+        assert!(alpha.high_risk);
+        assert!(payload.operations.iter().any(|operation| {
+            operation.action == "recover-sealed"
+                && operation.targets == ["module.alpha"]
+                && operation.state == AuditOperationState::Applied
+        }));
+
+        commit_manager_audit_seal(root, &checkpoint_envelope(root, &manager, 2)).unwrap();
+        assert!(!sealed_recovery_path(root, "module.alpha").exists());
+        assert!(
+            verify_module(root, "module.alpha", false)
+                .unwrap()
+                .unresolved_risk
+        );
+        assert!(recover_manager_sealed_module(root, "module.alpha", &token).is_err());
+    }
+
+    #[test]
+    fn sealed_recovery_resumes_after_authorization_record_is_persisted() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        record(root, "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(root, &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(root, &checkpoint_envelope(root, &manager, 1)).unwrap();
+        std::fs::write(event_path(root, "test.module", 2), b"corrupt").unwrap();
+
+        let status = sealed_integrity_status(root).unwrap();
+        let failure = status.failures[0].clone();
+        let token_hex = sealed_recovery_token(root, &manager, "test.module");
+        let token: SignedAuditAuthorization =
+            serde_json::from_slice(&decode_hex(&token_hex).unwrap()).unwrap();
+        let targets = vec!["test.module".to_owned()];
+        let operation = begin_manager_audit_operation_at_inventory(
+            root,
+            &token_hex,
+            "recover-sealed",
+            &token.arguments_hash,
+            &targets,
+            Some(&status.inventory_hash),
+        )
+        .unwrap();
+        let key = load_key(root, false).unwrap();
+        write_record(
+            &sealed_recovery_path(root, "test.module"),
+            SealedRecoveryRecord {
+                schema_version: SCHEMA_VERSION,
+                module_id: "test.module".to_owned(),
+                operation_id: operation.operation_id.clone(),
+                seal_hash: status.seal_hash,
+                base_inventory_hash: status.inventory_hash,
+                corrupted_from_sequence: failure.corrupted_from_sequence,
+                reason: failure.reason,
+            },
+            &key,
+        )
+        .unwrap();
+
+        let checkpoint = checkpoint_payload(root).unwrap();
+        let operation = checkpoint
+            .operations
+            .iter()
+            .find(|entry| entry.operation_id == operation.operation_id)
+            .unwrap();
+        assert_eq!(operation.state, AuditOperationState::Applied);
+        assert_eq!(operation.completed_targets, targets);
+        assert!(
+            verify_module(root, "test.module", false)
+                .unwrap()
+                .unresolved_risk
+        );
     }
 
     #[test]

@@ -187,18 +187,40 @@ suspend fun registerModuleAuditAuthorizationKey(
 
 suspend fun getModuleAuditAuthorizationChallenge(action: String, moduleId: String? = null): String =
     withContext(Dispatchers.IO) {
-        check(action == "rescan" || action == "prune" || action == "secure-remove") {
+        check(
+            action == "rescan" || action == "prune" || action == "secure-remove" ||
+                action == "recover-sealed"
+        ) {
             "Unsupported audit authorization action"
         }
         check(moduleId == null || moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) {
             "Invalid module id"
         }
-        check((action == "secure-remove") == (moduleId != null)) {
-            "Secure removal authorization must target exactly one module"
+        check((action == "secure-remove" || action == "recover-sealed") == (moduleId != null)) {
+            "Module-specific audit authorization must target exactly one module"
         }
         runModuleAuditCommand(
             "audit-auth challenge $action" + (moduleId?.let { " --id $it" } ?: ""),
             "Unable to obtain Manager audit authorization challenge",
+        )
+    }
+
+suspend fun getModuleAuditRecoveryStatus(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-recovery-status --json",
+        "Unable to diagnose Manager-sealed audit history",
+    )
+}
+
+suspend fun recoverManagerSealedAudit(moduleId: String, authorization: String): String =
+    withContext(Dispatchers.IO) {
+        check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
+        check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+            "Invalid Manager audit authorization token"
+        }
+        runModuleAuditCommand(
+            "audit-recover-sealed $moduleId --json --authorization $authorization",
+            "Unable to recover Manager-sealed audit history",
         )
     }
 

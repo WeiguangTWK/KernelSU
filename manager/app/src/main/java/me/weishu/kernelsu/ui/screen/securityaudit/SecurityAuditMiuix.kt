@@ -213,8 +213,12 @@ fun SecurityAuditModuleMiuix(
             history == null && !state.isLoading -> item { AuditEmptyMiuix(stringResource(R.string.security_audit_empty_result)) }
             history != null -> {
                 item { AuditIntegrityMiuix(history) }
+                history.integrityError?.let { error ->
+                    item { AuditMessageCardMiuix(error, true) }
+                }
                 if (
                     history.status.unresolvedRisk &&
+                    history.integrityError == null &&
                     moduleId !in state.staleModuleIds
                 ) {
                     item {
@@ -500,6 +504,10 @@ private fun AuditModuleLinkMiuix(moduleId: String, onClick: () -> Unit) {
 
 @Composable
 private fun AuditCategorySummaryMiuix(history: AuditHistory) {
+    history.integrityError?.let { error ->
+        Text(error, fontSize = 13.sp, color = colorScheme.error)
+        return
+    }
     val groups = history.categoryGroups()
     if (groups.isEmpty()) {
         Text(stringResource(R.string.security_audit_no_findings), fontSize = 13.sp, color = colorScheme.onSurfaceVariantSummary)
@@ -529,6 +537,34 @@ private fun AuditIntegrityMiuix(history: AuditHistory) {
                 fontSize = 12.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )
+            history.status.containmentState?.let { state ->
+                Text(
+                    stringResource(
+                        if (state == "contained") R.string.security_audit_containment_active
+                        else R.string.security_audit_containment_pending
+                    ),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = colorScheme.error,
+                )
+            }
+            if (history.status.quarantinedPersistentScripts > 0) {
+                Text(
+                    stringResource(
+                        R.string.security_audit_persistent_quarantined,
+                        history.status.quarantinedPersistentScripts,
+                    ),
+                    fontSize = 12.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+            }
+            if (history.status.persistentScriptOwnership == "uncertain") {
+                Text(
+                    stringResource(R.string.security_audit_persistent_uncertain),
+                    fontSize = 12.sp,
+                    color = colorScheme.error,
+                )
+            }
             history.packageFingerprint()?.let { Text(stringResource(R.string.security_audit_package_hash, it), fontSize = 12.sp) }
         }
     }
