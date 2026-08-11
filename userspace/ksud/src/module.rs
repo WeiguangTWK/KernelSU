@@ -12,7 +12,6 @@ use is_executable::is_executable;
 use java_properties::PropertiesIter;
 use log::{debug, error, info, warn};
 use regex_lite::Regex;
-use sha2::Digest;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -155,10 +154,7 @@ pub fn foreach_module(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            match module_audit_log::module_requires_containment(
-                Path::new(defs::MODULE_AUDIT_DIR),
-                module_id,
-            ) {
+            match crate::module_response::requires_containment(module_id) {
                 Ok(true) => {
                     warn!("{} is audit-contained, skip", path.display());
                     continue;
@@ -334,16 +330,8 @@ pub fn prune_modules() -> Result<()> {
         }
 
         let module_id = module.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        match module_audit_log::module_requires_secure_removal(
-            Path::new(defs::MODULE_AUDIT_DIR),
-            module_id,
-        ) {
+        match crate::module_response::intercept_unsafe_normal_uninstall(module) {
             Ok(true) => {
-                warn!(
-                    "refusing normal uninstall scripts for untrusted module {module_id}; use Security & Audit Center"
-                );
-                ensure_file_exists(module.join(defs::DISABLE_FILE_NAME))?;
-                std::fs::remove_file(module.join(defs::REMOVE_FILE_NAME))?;
                 return Ok(());
             }
             Ok(false) => {}
@@ -596,7 +584,7 @@ fn install_module_to_system(zip: &str) -> Result<()> {
     // Validate module_id format
     validate_module_id(module_id)
         .with_context(|| format!("Invalid module ID in module.prop: '{module_id}'"))?;
-    ensure_normal_module_action_allowed(module_id, "update")?;
+    crate::module_response::ensure_action_allowed(module_id, "update")?;
 
     // Check if this module is a metamodule
     let is_metamodule = metamodule::is_metamodule(&module_prop);
@@ -754,7 +742,7 @@ pub fn install_module(zip: &str) -> Result<()> {
 
 pub fn undo_uninstall_module(id: &str) -> Result<()> {
     validate_module_id(id)?;
-    ensure_normal_module_action_allowed(id, "undo uninstall")?;
+    crate::module_response::ensure_action_allowed(id, "undo uninstall")?;
 
     let module_path = Path::new(defs::MODULE_DIR).join(id);
     ensure!(module_path.exists(), "Module {id} not found");
@@ -776,7 +764,7 @@ pub fn undo_uninstall_module(id: &str) -> Result<()> {
 
 pub fn uninstall_module(id: &str) -> Result<()> {
     validate_module_id(id)?;
-    ensure_normal_module_action_allowed(id, "uninstall")?;
+    crate::module_response::ensure_action_allowed(id, "uninstall")?;
 
     let module_path = Path::new(defs::MODULE_DIR).join(id);
     ensure!(module_path.exists(), "Module {id} not found");
@@ -796,7 +784,7 @@ pub fn uninstall_module(id: &str) -> Result<()> {
 
 pub fn run_action(id: &str) -> Result<()> {
     validate_module_id(id)?;
-    ensure_normal_module_action_allowed(id, "run module action")?;
+    crate::module_response::ensure_action_allowed(id, "run module action")?;
     ksucalls::ensure_uapi_version_matched()?;
 
     let action_script_path = format!("/data/adb/modules/{id}/action.sh");
@@ -805,7 +793,7 @@ pub fn run_action(id: &str) -> Result<()> {
 
 pub fn enable_module(id: &str) -> Result<()> {
     validate_module_id(id)?;
-    ensure_normal_module_action_allowed(id, "enable")?;
+    crate::module_response::ensure_action_allowed(id, "enable")?;
 
     let module_path = Path::new(defs::MODULE_DIR).join(id);
     ensure!(module_path.exists(), "Module {id} not found");
@@ -839,171 +827,6 @@ pub fn disable_module(id: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn ensure_normal_module_action_allowed(id: &str, action: &str) -> Result<()> {
-    ensure!(
-        !module_audit_log::module_requires_secure_removal(Path::new(defs::MODULE_AUDIT_DIR), id,)?,
-        "Module {id} has an unresolved audit integrity incident; cannot {action}. Use Security & Audit Center"
-    );
-    Ok(())
-}
-
-pub fn contain_module_for_secure_removal(id: &str) -> Result<()> {
-    validate_module_id(id)?;
-    ensure!(
-        module_audit_log::module_requires_containment(Path::new(defs::MODULE_AUDIT_DIR), id,)?,
-        "Module {id} does not require secure removal"
-    );
-    let mut found = false;
-    for root in [defs::MODULE_DIR, defs::MODULE_UPDATE_DIR] {
-        let module_path = Path::new(root).join(id);
-        if !module_path.exists() {
-            continue;
-        }
-        found = true;
-        ensure_file_exists(module_path.join(defs::DISABLE_FILE_NAME))?;
-        let remove_path = module_path.join(defs::REMOVE_FILE_NAME);
-        if remove_path.exists() {
-            std::fs::remove_file(&remove_path)
-                .with_context(|| format!("cancel unsafe normal uninstall for module '{id}'"))?;
-        }
-    }
-    ensure!(found, "Module {id} content not found");
-    module_audit_log::set_containment_state(
-        Path::new(defs::MODULE_AUDIT_DIR),
-        id,
-        module_audit_log::ContainmentState::PendingReboot,
-    )?;
-    regenerate_preinit_rc()?;
-    info!("Module {id} contained for KernelSU safe-mode removal");
-    Ok(())
-}
-
-/// Materialize authenticated audit containment into KernelSU's conventional
-/// module-disable markers. The audit state remains authoritative, so deleting a
-/// marker cannot make the module active again.
-pub fn enforce_audit_containment(boot_enforcement: bool) -> Result<Vec<String>> {
-    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    if !audit_root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut ids = std::collections::BTreeSet::new();
-    if let Ok(status) = module_audit_log::sealed_integrity_status(audit_root) {
-        ids.extend(status.failures.into_iter().map(|failure| failure.module_id));
-    }
-    if let Ok(statuses) = module_audit_log::list_modules_resilient(audit_root, false) {
-        ids.extend(
-            statuses
-                .into_iter()
-                .filter(|status| status.unresolved_risk)
-                .map(|status| status.module_id),
-        );
-    }
-
-    // Exclude the module first. Auxiliary persistent-script quarantine must not
-    // be able to weaken the primary response if a malicious filesystem object
-    // makes an individual move fail.
-    let mut changed = false;
-    for id in &ids {
-        module_audit_log::set_containment_state(
-            audit_root,
-            id,
-            module_audit_log::ContainmentState::PendingReboot,
-        )?;
-        for root in [defs::MODULE_DIR, defs::MODULE_UPDATE_DIR] {
-            let module_path = Path::new(root).join(id);
-            if !module_path.is_dir() {
-                continue;
-            }
-            let disable = module_path.join(defs::DISABLE_FILE_NAME);
-            if !disable.exists() {
-                ensure_file_exists(&disable)?;
-                changed = true;
-            }
-            let remove = module_path.join(defs::REMOVE_FILE_NAME);
-            if remove.exists() {
-                std::fs::remove_file(&remove)
-                    .with_context(|| format!("cancel unsafe uninstall for module '{id}'"))?;
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        regenerate_preinit_rc()?;
-    }
-
-    // Quarantine persistent startup scripts using only Manager-sealed evidence.
-    // Exact ownership is preferred. If a damaged module has no surviving event,
-    // preserve paths attributed by every other intact history and quarantine the
-    // remaining files as explicitly uncertain ownership.
-    let persistent_result = (|| -> Result<()> {
-        let mut plans = module_audit_log::persistent_script_containment_plans(audit_root)?;
-        plans.sort_by(|left, right| left.module_id.cmp(&right.module_id));
-        for plan in plans.iter().filter(|plan| !plan.paths.is_empty()) {
-            module_audit_log::quarantine_persistent_scripts(
-                audit_root,
-                &plan.module_id,
-                &plan.paths,
-                false,
-            )?;
-        }
-        if let Some(owner) = plans.iter().find(|plan| plan.infer_unattributed) {
-            let trusted = module_audit_log::trusted_persistent_script_paths(audit_root)?
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>();
-            let mut unknown = Vec::new();
-            for directory in [
-                "/data/adb/service.d",
-                "/data/adb/boot-completed.d",
-                "/data/adb/bootcompleted.d",
-            ] {
-                let directory = Path::new(directory);
-                if !directory.is_dir() {
-                    continue;
-                }
-                for entry in std::fs::read_dir(directory)? {
-                    let entry = entry?;
-                    if !entry.file_type()?.is_file() {
-                        continue;
-                    }
-                    let path = entry.path().to_string_lossy().into_owned();
-                    if !trusted.contains(&path) {
-                        unknown.push(path);
-                    }
-                }
-            }
-            unknown.sort();
-            if !unknown.is_empty() {
-                warn!(
-                    "audit history for {} has no trusted persistent-script inventory; quarantining {} unattributed startup scripts",
-                    owner.module_id,
-                    unknown.len()
-                );
-                module_audit_log::quarantine_persistent_scripts(
-                    audit_root,
-                    &owner.module_id,
-                    &unknown,
-                    true,
-                )?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = persistent_result {
-        warn!("persistent startup script containment is incomplete: {error:#}");
-    } else if boot_enforcement {
-        for id in &ids {
-            module_audit_log::set_containment_state(
-                audit_root,
-                id,
-                module_audit_log::ContainmentState::Contained,
-            )?;
-        }
-    }
-
-    Ok(ids.into_iter().collect())
 }
 
 pub fn disable_all_modules() -> Result<()> {
@@ -1220,7 +1043,7 @@ struct InstalledAuditScanResult {
 
 pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
     let targets = audit_rescan_targets()?;
-    let arguments_hash = audit_operation_arguments_hash("rescan", &targets)?;
+    let arguments_hash = module_audit_log::manager_operation_arguments_hash("rescan", &targets)?;
     let operation = module_audit_log::begin_manager_audit_operation(
         Path::new(defs::MODULE_AUDIT_DIR),
         authorization,
@@ -1320,7 +1143,7 @@ pub fn prune_module_audit_histories(
         }
     } else {
         let targets = audit_prune_targets(module_id)?;
-        let arguments_hash = audit_operation_arguments_hash("prune", &targets)?;
+        let arguments_hash = module_audit_log::manager_operation_arguments_hash("prune", &targets)?;
         let operation = module_audit_log::begin_manager_audit_operation(
             audit_root,
             authorization.context("Manager authorization is required for audit cleanup")?,
@@ -1349,7 +1172,7 @@ pub fn prune_module_audit_histories(
 }
 
 pub fn audit_rescan_arguments_hash() -> Result<String> {
-    audit_operation_arguments_hash("rescan", &audit_rescan_targets()?)
+    module_audit_log::manager_operation_arguments_hash("rescan", &audit_rescan_targets()?)
 }
 
 fn audit_rescan_targets() -> Result<Vec<String>> {
@@ -1363,94 +1186,7 @@ fn audit_rescan_targets() -> Result<Vec<String>> {
 }
 
 pub fn audit_prune_arguments_hash(module_id: Option<&str>) -> Result<String> {
-    audit_operation_arguments_hash("prune", &audit_prune_targets(module_id)?)
-}
-
-pub fn audit_secure_remove_arguments_hash(module_id: &str) -> Result<String> {
-    validate_module_id(module_id)?;
-    let targets = audit_secure_remove_targets(module_id)?;
-    audit_operation_arguments_hash("secure-remove", &targets)
-}
-
-fn audit_secure_remove_targets(module_id: &str) -> Result<Vec<String>> {
-    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    if let Some(targets) =
-        module_audit_log::active_manager_audit_operation_targets(audit_root, "secure-remove")?
-    {
-        ensure!(
-            targets == [module_id],
-            "requested module does not match the active secure removal operation"
-        );
-        return Ok(targets);
-    }
-    ensure!(
-        module_audit_log::module_requires_secure_removal(audit_root, module_id)?,
-        "Module {module_id} does not have an unresolved audit integrity incident"
-    );
-    Ok(vec![module_id.to_owned()])
-}
-
-pub fn secure_remove_module(module_id: &str, authorization: &str) -> Result<()> {
-    validate_module_id(module_id)?;
-    ensure!(
-        ksucalls::check_kernel_safemode(),
-        "Secure module removal requires KernelSU safe mode"
-    );
-    let targets = audit_secure_remove_targets(module_id)?;
-    let arguments_hash = audit_operation_arguments_hash("secure-remove", &targets)?;
-    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    let operation = module_audit_log::begin_manager_audit_operation(
-        audit_root,
-        authorization,
-        "secure-remove",
-        &arguments_hash,
-        &targets,
-    )?;
-    if operation.applied {
-        return Ok(());
-    }
-
-    let metamodule_link = Path::new(defs::METAMODULE_DIR.trim_end_matches('/'));
-    let was_metamodule = metamodule::get_metamodule_id().as_deref() == Some(module_id)
-        || std::fs::read_link(metamodule_link).is_ok_and(|target| {
-            target.file_name().and_then(|name| name.to_str()) == Some(module_id)
-        });
-    let removed_paths = module_audit_log::quarantine_module_for_secure_removal(
-        audit_root,
-        Path::new(defs::MODULE_DIR),
-        Path::new(defs::MODULE_UPDATE_DIR),
-        &operation.operation_id,
-        module_id,
-    )?;
-    if was_metamodule {
-        metamodule::remove_symlink().context("remove quarantined metamodule symlink")?;
-    }
-    crate::module_config::clear_module_configs(module_id)
-        .context("clear securely removed module configuration")?;
-    regenerate_preinit_rc()?;
-    module_audit_log::complete_secure_module_removal(
-        audit_root,
-        &operation.operation_id,
-        module_id,
-        removed_paths,
-    )?;
-    module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
-}
-
-pub fn recover_manager_sealed_audit(
-    module_id: &str,
-    authorization: &str,
-) -> Result<module_audit_log::ModuleAuditStatus> {
-    validate_module_id(module_id)?;
-    ensure!(
-        ksucalls::check_kernel_safemode(),
-        "Manager-sealed audit recovery requires KernelSU safe mode"
-    );
-    module_audit_log::recover_manager_sealed_module(
-        Path::new(defs::MODULE_AUDIT_DIR),
-        module_id,
-        authorization,
-    )
+    module_audit_log::manager_operation_arguments_hash("prune", &audit_prune_targets(module_id)?)
 }
 
 fn audit_prune_targets(module_id: Option<&str>) -> Result<Vec<String>> {
@@ -1504,11 +1240,6 @@ fn installed_module_ids() -> Result<Vec<String>> {
     }
     module_ids.sort();
     Ok(module_ids)
-}
-
-fn audit_operation_arguments_hash(action: &str, targets: &[String]) -> Result<String> {
-    let bytes = serde_json::to_vec(&(action, targets))?;
-    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
 }
 
 /// Get all managed features from active modules

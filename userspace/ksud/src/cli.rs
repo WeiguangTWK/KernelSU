@@ -698,7 +698,7 @@ pub fn run() -> Result<()> {
                 }
                 Module::AuditStatus { json } => {
                     let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
-                    crate::module::enforce_audit_containment(false)?;
+                    crate::module_response::enforce_containment(false)?;
                     let statuses = crate::module_audit_log::list_modules_resilient(root, true)?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&statuses)?);
@@ -778,7 +778,7 @@ pub fn run() -> Result<()> {
                                     let id = id
                                         .as_deref()
                                         .context("secure-remove authorization requires --id")?;
-                                    module::audit_secure_remove_arguments_hash(id)?
+                                    crate::module_response::secure_remove_arguments_hash(id)?
                                 }
                                 "recover-sealed" => {
                                     let id = id
@@ -845,13 +845,15 @@ pub fn run() -> Result<()> {
                     json,
                     authorization.as_deref(),
                 ),
-                Module::AuditContain { id } => module::contain_module_for_secure_removal(&id),
+                Module::AuditContain { id } => {
+                    crate::module_response::contain_for_secure_removal(&id)
+                }
                 Module::AuditSecureRemove {
                     id,
                     json,
                     authorization,
                 } => {
-                    module::secure_remove_module(&id, &authorization)?;
+                    crate::module_response::secure_remove(&id, &authorization)?;
                     if json {
                         println!(
                             "{{\"module_id\":{},\"removed\":true}}",
@@ -867,7 +869,8 @@ pub fn run() -> Result<()> {
                     json,
                     authorization,
                 } => {
-                    let status = module::recover_manager_sealed_audit(&id, &authorization)?;
+                    let status =
+                        crate::module_response::recover_manager_sealed_audit(&id, &authorization)?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&status)?);
                     } else {

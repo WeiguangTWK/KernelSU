@@ -46,7 +46,7 @@ pub fn on_post_data_fs() -> Result<()> {
 
     // Resolve and materialize audit containment before any persistent or
     // module-controlled startup script is allowed to run.
-    if let Err(e) = crate::module::enforce_audit_containment(true) {
+    if let Err(e) = crate::module_response::enforce_containment(true) {
         warn!("enforce module audit containment failed: {e:#}");
     }
 
@@ -152,7 +152,7 @@ pub fn run_stage(stage: &str, block: bool) {
         return;
     }
 
-    if let Err(e) = crate::module::enforce_audit_containment(true) {
+    if let Err(e) = crate::module_response::enforce_containment(true) {
         warn!("refresh module audit containment before {stage}: {e:#}");
     }
 

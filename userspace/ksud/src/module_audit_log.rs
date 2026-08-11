@@ -2866,6 +2866,15 @@ pub fn begin_manager_audit_operation(
     )
 }
 
+/// Canonical digest bound into Manager authorization challenges for an audit
+/// mutation. Keeping this encoding in the authenticated store avoids response
+/// and module-management code implementing subtly different contracts.
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn manager_operation_arguments_hash(action: &str, targets: &[String]) -> Result<String> {
+    let bytes = serde_json::to_vec(&(action, targets))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 fn begin_manager_audit_operation_at_inventory(
     root: &Path,
     encoded_authorization: &str,
@@ -5403,6 +5412,18 @@ mod tests {
         assert_eq!(
             hex(&hmac_sha256(&key, b"Hi There")),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+    }
+
+    #[test]
+    fn manager_operation_hash_uses_the_authorization_contract() {
+        let targets = vec!["first.module".to_owned(), "second.module".to_owned()];
+        let expected = hex(&Sha256::digest(
+            serde_json::to_vec(&("secure-remove", &targets)).unwrap(),
+        ));
+        assert_eq!(
+            manager_operation_arguments_hash("secure-remove", &targets).unwrap(),
+            expected
         );
     }
 }
