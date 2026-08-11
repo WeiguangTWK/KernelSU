@@ -65,6 +65,25 @@ internal fun validateAuditKeyProtectionTransition(
     )
 }
 
+internal fun requiresAuditSealCommit(
+    configured: Boolean,
+    sealedHash: String?,
+    currentHash: String,
+    previousHash: String?,
+): Boolean {
+    if (configured && sealedHash == currentHash) return false
+    if (configured) {
+        check(sealedHash == previousHash) {
+            "Manager audit seal disappeared, changed, or rolled back"
+        }
+    } else {
+        check(previousHash == null || previousHash == currentHash) {
+            "Manager audit seal is missing during an unsealed checkpoint transition"
+        }
+    }
+    return true
+}
+
 internal fun isAuthenticatedAuditChainRebuild(
     previousHashes: List<String>,
     currentHashes: List<String>,
@@ -108,6 +127,10 @@ class ModuleAuditCheckpointStore(context: Context) {
     private var trustedInventoryHash: String? = null
     @Volatile
     private var activeProtection = AuditKeyProtection.Unavailable
+    @Volatile
+    private var previousEnvelopeHash: String? = null
+    @Volatile
+    private var currentEnvelopeHash: String? = null
 
     fun reconcile(
         rawPayload: String,
@@ -118,7 +141,7 @@ class ModuleAuditCheckpointStore(context: Context) {
             check(current.schemaVersion == CHECKPOINT_SCHEMA_VERSION) {
                 "Unsupported current audit checkpoint payload schema"
             }
-            check(current.inventoryHash?.isSha256Hex() == true) {
+            check(current.inventoryHash.isSha256Hex()) {
                 "Current audit checkpoint has no valid inventory hash"
             }
             val envelopeText = readEnvelope()
@@ -138,6 +161,8 @@ class ModuleAuditCheckpointStore(context: Context) {
                         throw error
                     }
                     trustedInventoryHash = current.inventoryHash
+                    previousEnvelopeHash = null
+                    currentEnvelopeHash = readEnvelope()?.sha256Hex()
                     AuditCheckpointVerification(
                         AuditCheckpointTrust.Initialized,
                         protection = signingKey.protection,
@@ -154,10 +179,7 @@ class ModuleAuditCheckpointStore(context: Context) {
                     }
                     val signingKey = loadSigningKey(envelope.backend)
                     activeProtection = signingKey.protection
-                    if (
-                        envelope.keyId != null &&
-                        envelope.keyId != signingKey.publicKey.keyId()
-                    ) {
+                    if (envelope.keyId != signingKey.publicKey.keyId()) {
                         return@runCatching compromised("Manager checkpoint key identity changed")
                     }
                     validateAuditKeyProtectionTransition(
@@ -167,6 +189,7 @@ class ModuleAuditCheckpointStore(context: Context) {
                     if (!verifyEnvelope(envelope, signingKey.publicKey)) {
                         return@runCatching compromised("Manager checkpoint signature is invalid")
                     }
+                    previousEnvelopeHash = envelopeText.sha256Hex()
                     val previous = parsePayload(envelope.payload)
                     val transition = analyzePayloadTransition(
                         previous,
@@ -188,6 +211,7 @@ class ModuleAuditCheckpointStore(context: Context) {
                         )
                     }
                     trustedInventoryHash = current.inventoryHash
+                    currentEnvelopeHash = readEnvelope()?.sha256Hex()
                     AuditCheckpointVerification(
                         AuditCheckpointTrust.Verified,
                         protection = signingKey.protection,
@@ -212,6 +236,8 @@ class ModuleAuditCheckpointStore(context: Context) {
         }
     }.getOrElse { compromised("Unable to inspect Manager checkpoint: ${it.message ?: detail}") }
 
+    fun externalIntegrityFailure(detail: String): AuditCheckpointVerification = compromised(detail)
+
     fun acceptRecoveredChain(
         rawPayload: String,
         rawHistories: String,
@@ -220,10 +246,11 @@ class ModuleAuditCheckpointStore(context: Context) {
         check(current.schemaVersion == CHECKPOINT_SCHEMA_VERSION) {
             "Unsupported current audit checkpoint payload schema"
         }
-        check(current.inventoryHash?.isSha256Hex() == true) {
+        check(current.inventoryHash.isSha256Hex()) {
             "Current audit checkpoint has no valid inventory hash"
         }
-        val envelope = parseEnvelope(readEnvelope() ?: error("Manager checkpoint data is missing"))
+        val envelopeText = readEnvelope() ?: error("Manager checkpoint data is missing")
+        val envelope = parseEnvelope(envelopeText)
         val hasAndroidKey = runCatching {
             loadKeyStore().containsAlias(KEY_ALIAS)
         }.getOrDefault(false)
@@ -232,10 +259,8 @@ class ModuleAuditCheckpointStore(context: Context) {
         }
         val signingKey = loadSigningKey(envelope.backend)
         activeProtection = signingKey.protection
-        envelope.keyId?.let {
-            check(it == signingKey.publicKey.keyId()) {
-                "Manager checkpoint key identity changed"
-            }
+        check(envelope.keyId == signingKey.publicKey.keyId()) {
+            "Manager checkpoint key identity changed"
         }
         validateAuditKeyProtectionTransition(envelope.protection, signingKey.protection)
         check(verifyEnvelope(envelope, signingKey.publicKey)) {
@@ -257,6 +282,8 @@ class ModuleAuditCheckpointStore(context: Context) {
             signingKey,
         )
         trustedInventoryHash = current.inventoryHash
+        previousEnvelopeHash = envelopeText.sha256Hex()
+        currentEnvelopeHash = readEnvelope()?.sha256Hex()
         AuditCheckpointVerification(
             trust = AuditCheckpointTrust.Verified,
             detail = "Accepted rebuilt audit chains: " +
@@ -272,15 +299,22 @@ class ModuleAuditCheckpointStore(context: Context) {
         current: CheckpointPayload,
         evidence: Map<String, RecoveryEvidence>,
     ): PayloadTransition {
-        if (
-            previous.schemaVersion != current.schemaVersion &&
-            !(previous.schemaVersion == LEGACY_CHECKPOINT_SCHEMA_VERSION &&
-                current.schemaVersion == CHECKPOINT_SCHEMA_VERSION)
-        ) {
+        if (previous.schemaVersion != current.schemaVersion) {
             return PayloadTransition("Audit checkpoint schema changed unexpectedly")
         }
-        if (previous.hmacKeyId != current.hmacKeyId) {
-            return PayloadTransition("Audit HMAC key identity changed")
+        if (
+            previous.hmacKeyId != current.hmacKeyId &&
+            previous.nextHmacKeyId != current.hmacKeyId
+        ) {
+            return PayloadTransition("Audit HMAC key identity changed unexpectedly")
+        }
+        if (
+            previous.hmacKeyId == current.hmacKeyId &&
+            previous.nextHmacKeyId != current.nextHmacKeyId &&
+            previous.modules == current.modules &&
+            previous.tombstones == current.tombstones
+        ) {
+            return PayloadTransition("Pending audit HMAC key changed unexpectedly")
         }
 
         val currentTombstones = current.tombstones.toSet()
@@ -300,9 +334,6 @@ class ModuleAuditCheckpointStore(context: Context) {
                 val authorizedCleanup = current.tombstones.any { tombstone ->
                     if (tombstone.moduleId != oldModule.moduleId) {
                         false
-                    } else if (tombstone.previousEventHashes.isEmpty()) {
-                        tombstone.previousEventCount == oldModule.sequence &&
-                            tombstone.previousHeadHash == oldModule.headHash
                     } else {
                         tombstone.previousEventCount >= oldModule.sequence &&
                             tombstone.previousEventHashes.hashAt(oldModule.sequence) == oldModule.headHash
@@ -395,6 +426,16 @@ class ModuleAuditCheckpointStore(context: Context) {
     fun authorizationKeyId(): String = MessageDigest.getInstance("SHA-256")
         .digest(authorizationPublicKeyHex().hexToBytes())
         .toHex()
+
+    fun currentSealEnvelopeHex(): String =
+        (readEnvelope() ?: error("Manager audit checkpoint is unavailable"))
+            .toByteArray(StandardCharsets.UTF_8)
+            .toHex()
+
+    fun currentSealHash(): String = currentEnvelopeHash
+        ?: error("Manager audit checkpoint has not been verified")
+
+    fun acceptablePreviousSealHash(): String? = previousEnvelopeHash
 
     fun signAuditAuthorization(rawChallenge: String): String {
         val challenge = JSONObject(rawChallenge)
@@ -543,7 +584,7 @@ class ModuleAuditCheckpointStore(context: Context) {
             ?: error("Manager audit checkpoint is unavailable")
         return loadSigningKey(envelope.backend).also { signingKey ->
             validateAuditKeyProtectionTransition(envelope.protection, signingKey.protection)
-            envelope.keyId?.let { check(it == signingKey.publicKey.keyId()) }
+            check(envelope.keyId == signingKey.publicKey.keyId())
         }
     }
 
@@ -662,10 +703,7 @@ class ModuleAuditCheckpointStore(context: Context) {
     private fun parseEnvelope(raw: String): CheckpointEnvelope {
         val json = JSONObject(raw)
         val schemaVersion = json.getInt("schema_version")
-        check(
-            schemaVersion == LEGACY_ENVELOPE_SCHEMA_VERSION ||
-                schemaVersion == ENVELOPE_SCHEMA_VERSION
-        ) {
+        check(schemaVersion == ENVELOPE_SCHEMA_VERSION) {
             "Unsupported Manager checkpoint schema"
         }
         val generation = json.getLong("generation")
@@ -675,23 +713,11 @@ class ModuleAuditCheckpointStore(context: Context) {
         return CheckpointEnvelope(
             schemaVersion = schemaVersion,
             generation = generation,
-            backend = if (schemaVersion == LEGACY_ENVELOPE_SCHEMA_VERSION) {
-                AuditKeyBackend.AndroidKeyStore
-            } else {
-                AuditKeyBackend.fromWireName(json.getString("key_backend"))
-            },
-            protection = if (schemaVersion == LEGACY_ENVELOPE_SCHEMA_VERSION) {
-                null
-            } else {
-                AuditKeyProtection.entries.firstOrNull {
-                    it.wireName == json.getString("key_protection")
-                } ?: error("Unknown Manager checkpoint protection level")
-            },
-            keyId = if (schemaVersion == LEGACY_ENVELOPE_SCHEMA_VERSION) {
-                null
-            } else {
-                json.getString("key_id").also { check(it.isSha256Hex()) }
-            },
+            backend = AuditKeyBackend.fromWireName(json.getString("key_backend")),
+            protection = AuditKeyProtection.entries.firstOrNull {
+                it.wireName == json.getString("key_protection")
+            } ?: error("Unknown Manager checkpoint protection level"),
+            keyId = json.getString("key_id").also { check(it.isSha256Hex()) },
             payloadBase64 = payloadBase64,
             payload = payload,
             signatureBase64 = json.getString("signature"),
@@ -701,16 +727,18 @@ class ModuleAuditCheckpointStore(context: Context) {
     private fun parsePayload(raw: String): CheckpointPayload {
         val json = JSONObject(raw)
         val schemaVersion = json.getInt("schema_version")
-        check(
-            schemaVersion == LEGACY_CHECKPOINT_SCHEMA_VERSION ||
-                schemaVersion == CHECKPOINT_SCHEMA_VERSION
-        ) {
+        check(schemaVersion == CHECKPOINT_SCHEMA_VERSION) {
             "Unsupported audit checkpoint payload schema"
         }
         return CheckpointPayload(
             schemaVersion = schemaVersion,
             hmacKeyId = json.getString("hmac_key_id"),
-            inventoryHash = json.optString("inventory_hash").takeIf(String::isNotBlank),
+            nextHmacKeyId = json.getString("next_hmac_key_id").also {
+                check(it.isSha256Hex())
+            },
+            inventoryHash = json.getString("inventory_hash").also {
+                check(it.isSha256Hex())
+            },
             modules = json.getJSONArray("modules").mapObjects { module ->
                 CheckpointModule(
                     moduleId = module.getString("module_id"),
@@ -735,9 +763,8 @@ class ModuleAuditCheckpointStore(context: Context) {
                     clearedAtUnixSeconds = tombstone.getLong("cleared_at_unix_seconds"),
                     previousEventCount = tombstone.getLong("previous_event_count"),
                     previousHeadHash = tombstone.getString("previous_head_hash"),
-                    previousEventHashes = tombstone.optJSONArray("previous_event_hashes")
-                        ?.mapStrings()
-                        .orEmpty(),
+                    previousEventHashes = tombstone.getJSONArray("previous_event_hashes")
+                        .mapStrings(),
                     hadIntegrityIncident = tombstone.getBoolean("had_integrity_incident"),
                 )
             }.orEmpty(),
@@ -770,22 +797,20 @@ class ModuleAuditCheckpointStore(context: Context) {
         schemaVersion: Int,
         generation: Long,
         backend: AuditKeyBackend,
-        protection: AuditKeyProtection?,
-        keyId: String?,
+        protection: AuditKeyProtection,
+        keyId: String,
         payloadBase64: String,
-    ): ByteArray = if (schemaVersion == LEGACY_ENVELOPE_SCHEMA_VERSION) {
-        "$LEGACY_ENVELOPE_SCHEMA_VERSION\n$generation\n$payloadBase64"
+    ): ByteArray =
+        "$schemaVersion\n$generation\n${backend.wireName}\n${protection.wireName}\n$keyId\n$payloadBase64"
             .toByteArray(StandardCharsets.UTF_8)
-    } else {
-        "$schemaVersion\n$generation\n${backend.wireName}\n${protection?.wireName}\n$keyId\n$payloadBase64"
-            .toByteArray(StandardCharsets.UTF_8)
-    }
 
     private fun compromised(
         detail: String,
         recoverableModules: List<String> = emptyList(),
     ): AuditCheckpointVerification {
         trustedInventoryHash = null
+        previousEnvelopeHash = null
+        currentEnvelopeHash = null
         return AuditCheckpointVerification(
             trust = AuditCheckpointTrust.Compromised,
             detail = detail,
@@ -814,8 +839,8 @@ class ModuleAuditCheckpointStore(context: Context) {
         val schemaVersion: Int,
         val generation: Long,
         val backend: AuditKeyBackend,
-        val protection: AuditKeyProtection?,
-        val keyId: String?,
+        val protection: AuditKeyProtection,
+        val keyId: String,
         val payloadBase64: String,
         val payload: String,
         val signatureBase64: String,
@@ -824,7 +849,8 @@ class ModuleAuditCheckpointStore(context: Context) {
     private data class CheckpointPayload(
         val schemaVersion: Int,
         val hmacKeyId: String,
-        val inventoryHash: String?,
+        val nextHmacKeyId: String,
+        val inventoryHash: String,
         val modules: List<CheckpointModule>,
         val tombstones: List<CheckpointTombstone>,
     )
@@ -896,6 +922,10 @@ class ModuleAuditCheckpointStore(context: Context) {
 
     private fun String.isSha256Hex(): Boolean = length == 64 && all { it.isHexDigit() }
 
+    private fun String.sha256Hex(): String = MessageDigest.getInstance("SHA-256")
+        .digest(toByteArray(StandardCharsets.UTF_8))
+        .toHex()
+
     private fun PublicKey.keyId(): String = MessageDigest.getInstance("SHA-256")
         .digest(encoded)
         .toHex()
@@ -909,11 +939,9 @@ class ModuleAuditCheckpointStore(context: Context) {
         const val SIGNATURE_ALGORITHM = "SHA256withECDSA"
         const val CHECKPOINT_FILE_NAME = "module_audit_checkpoint.json"
         const val SOFTWARE_KEY_FILE_NAME = "module_audit_emergency_key.json"
-        const val LEGACY_ENVELOPE_SCHEMA_VERSION = 1
         const val ENVELOPE_SCHEMA_VERSION = 2
         const val SOFTWARE_KEY_SCHEMA_VERSION = 1
-        const val LEGACY_CHECKPOINT_SCHEMA_VERSION = 2
-        const val CHECKPOINT_SCHEMA_VERSION = 3
+        const val CHECKPOINT_SCHEMA_VERSION = 4
         const val AUTHORIZATION_SCHEMA_VERSION = 1
         const val AUTHORIZATION_NONCE_BYTES = 32
         const val P256_COORDINATE_BYTES = 32

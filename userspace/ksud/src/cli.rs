@@ -316,6 +316,12 @@ enum Module {
         command: AuditAuth,
     },
 
+    /// Persist and verify Manager Keystore-signed audit checkpoints
+    AuditSeal {
+        #[command(subcommand)]
+        command: AuditSeal,
+    },
+
     /// Rescan every installed module and append authenticated audit events
     AuditRescan {
         /// print structured JSON results
@@ -408,6 +414,18 @@ enum AuditAuth {
         /// optional stale module id for a targeted prune
         #[arg(long)]
         id: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuditSeal {
+    /// Show the latest verified Manager seal
+    Status,
+    /// Commit the current Manager checkpoint envelope as the next seal
+    Commit {
+        /// file containing the UTF-8 checkpoint envelope encoded as hexadecimal
+        #[arg(long)]
+        file: std::path::PathBuf,
     },
 }
 
@@ -689,6 +707,29 @@ pub fn run() -> Result<()> {
                             Ok(())
                         }
                     }
+                }
+                Module::AuditSeal { command } => {
+                    let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
+                    let status = match command {
+                        AuditSeal::Status => {
+                            crate::module_audit_log::manager_audit_seal_status(root)?
+                        }
+                        AuditSeal::Commit { file } => {
+                            let metadata = std::fs::metadata(&file)?;
+                            anyhow::ensure!(metadata.is_file(), "audit seal input is not a file");
+                            anyhow::ensure!(
+                                metadata.len() <= 16 * 1024 * 1024,
+                                "audit seal input is too large"
+                            );
+                            let envelope = std::fs::read_to_string(file)?;
+                            crate::module_audit_log::commit_manager_audit_seal(
+                                root,
+                                envelope.trim(),
+                            )?
+                        }
+                    };
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                    Ok(())
                 }
                 Module::AuditRescan {
                     json,

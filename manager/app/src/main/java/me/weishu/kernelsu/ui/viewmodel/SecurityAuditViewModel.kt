@@ -16,15 +16,18 @@ import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.AuditCheckpointTrust
 import me.weishu.kernelsu.security.AuditCheckpointVerification
 import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
+import me.weishu.kernelsu.security.requiresAuditSealCommit
 import me.weishu.kernelsu.ui.screen.securityaudit.AuditHistory
 import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditUiState
 import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
 import me.weishu.kernelsu.ui.screen.securityaudit.parseStaleAuditModuleIds
+import me.weishu.kernelsu.ui.util.commitModuleAuditSeal
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
 import me.weishu.kernelsu.ui.util.getModuleAuditCheckpoint
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationChallenge
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationStatus
+import me.weishu.kernelsu.ui.util.getModuleAuditSealStatus
 import me.weishu.kernelsu.ui.util.getStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
@@ -62,7 +65,7 @@ class SecurityAuditViewModel : ViewModel() {
                 val historyResult = rawHistoryResult.mapCatching(::parseAuditHistories)
                 checkpointResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
                 historyResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
-                val checkpoint = checkpointResult.fold(
+                var checkpoint = checkpointResult.fold(
                     onSuccess = { payload ->
                         checkpointStore.reconcile(payload, rawHistoryResult.getOrNull())
                     },
@@ -101,13 +104,23 @@ class SecurityAuditViewModel : ViewModel() {
                 authorizationResult.exceptionOrNull()?.let {
                     if (it is CancellationException) throw it
                 }
+                val sealResult = authorizationResult.mapCatching { authorizationReady ->
+                    if (authorizationReady) ensureAuditSeal() else false
+                }
+                sealResult.exceptionOrNull()?.let { error ->
+                    if (error is CancellationException) throw error
+                    checkpoint = checkpointStore.externalIntegrityFailure(
+                        error.message ?: error::class.java.simpleName
+                    )
+                }
                 AuditLoadResult(
                     histories = histories,
                     staleModuleIds = staleResult.getOrDefault(emptyList()),
                     checkpoint = checkpoint,
-                    authorizationReady = authorizationResult.getOrDefault(false),
+                    authorizationReady = sealResult.getOrDefault(false),
                     error = historyResult.exceptionOrNull()
                         ?: staleResult.exceptionOrNull()
+                        ?: sealResult.exceptionOrNull()
                         ?: authorizationResult.exceptionOrNull(),
                 )
             }.onSuccess { result ->
@@ -196,6 +209,26 @@ class SecurityAuditViewModel : ViewModel() {
         checkpointStore.signAuditAuthorization(
             getModuleAuditAuthorizationChallenge(action)
         )
+
+    private suspend fun ensureAuditSeal(): Boolean {
+        val status = JSONObject(getModuleAuditSealStatus())
+        val configured = status.optBoolean("configured", false)
+        val sealedHash = status.optString("seal_hash").takeIf(String::isNotBlank)
+        val currentHash = checkpointStore.currentSealHash()
+        val previousHash = checkpointStore.acceptablePreviousSealHash()
+        if (!requiresAuditSealCommit(configured, sealedHash, currentHash, previousHash)) return true
+
+        val committed = JSONObject(
+            commitModuleAuditSeal(checkpointStore.currentSealEnvelopeHex())
+        )
+        check(committed.optBoolean("configured", false)) {
+            "ksud did not persist the Manager audit seal"
+        }
+        check(committed.optString("seal_hash") == currentHash) {
+            "ksud persisted an unexpected Manager audit seal"
+        }
+        return true
+    }
 
     fun recoverCheckpointAfterChainRebuild() {
         while (true) {

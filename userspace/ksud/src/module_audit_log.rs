@@ -10,10 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: u32 = 1;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 const MANAGER_AUTH_SCHEMA_VERSION: u32 = 1;
 const KEY_FILE: &str = ".hmac-key";
 const MANAGER_AUTH_FILE: &str = "manager-auth.json";
+const MANAGER_SEAL_FILE: &str = "manager-seal.json";
+const MANAGER_SEAL_SCHEMA_VERSION: u32 = 2;
+const NEXT_KEY_FILE: &str = ".hmac-key-next.json";
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -97,7 +100,6 @@ struct PrunedHistoryTombstone {
     cleared_at_unix_seconds: u64,
     previous_event_count: usize,
     previous_head_hash: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     previous_event_hashes: Vec<String>,
     had_integrity_incident: bool,
     reason: String,
@@ -121,6 +123,7 @@ pub enum VerificationState {
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointState {
     NotConfigured,
+    Sealed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -182,12 +185,14 @@ pub struct CheckpointPayload {
     pub schema_version: u32,
     pub created_at_unix_seconds: u64,
     pub hmac_key_id: String,
+    pub next_hmac_key_id: String,
     pub inventory_hash: String,
     pub modules: Vec<CheckpointModuleHead>,
     pub tombstones: Vec<CheckpointTombstone>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub struct ManagerAuditAuthStatus {
     pub configured: bool,
     pub key_id: Option<String>,
@@ -195,6 +200,7 @@ pub struct ManagerAuditAuthStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub struct ManagerAuditAuthChallenge {
     pub schema_version: u32,
     pub action: String,
@@ -211,6 +217,7 @@ struct ManagerAuditAuthRegistry {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 struct SignedAuditAuthorization {
     schema_version: u32,
     action: String,
@@ -218,6 +225,53 @@ struct SignedAuditAuthorization {
     arguments_hash: String,
     nonce_hex: String,
     signature_der_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub struct ManagerAuditSealStatus {
+    pub configured: bool,
+    pub generation: Option<u64>,
+    pub seal_hash: Option<String>,
+    pub inventory_hash: Option<String>,
+    pub key_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ManagerCheckpointEnvelope {
+    schema_version: u32,
+    generation: u64,
+    key_backend: String,
+    key_protection: String,
+    key_id: String,
+    payload: String,
+    signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StoredManagerSeal {
+    envelope_hex: String,
+    seal_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PendingHmacKey {
+    schema_version: u32,
+    current_key_id: String,
+    next_key_hex: String,
+}
+
+impl PendingHmacKey {
+    fn next_key(&self) -> Result<[u8; 32]> {
+        let bytes = decode_hex(&self.next_key_hex)?;
+        bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid pending HMAC key length"))
+    }
+
+    fn next_key_id(&self) -> Result<String> {
+        Ok(hex(&Sha256::digest(self.next_key()?)))
+    }
 }
 
 struct VerifiedChain {
@@ -359,6 +413,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
     if let Some(error) = &identity_failure {
         ensure!(repair, "audit identity integrity failure: {error:#}");
     }
+    let sealed = verified_sealed_event_hashes(root, module_id, &key)?;
     let mut chain = verify_chain(root, module_id, &key, repair)?;
     if let Some(error) = identity_failure {
         let identity_path = module_path(root, module_id).join("identity.json");
@@ -413,7 +468,11 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         event_count: chain.events.len(),
         head_hash,
         hmac_verified: true,
-        manager_checkpoint: CheckpointState::NotConfigured,
+        manager_checkpoint: if sealed.is_empty() {
+            CheckpointState::NotConfigured
+        } else {
+            CheckpointState::Sealed
+        },
     })
 }
 
@@ -620,18 +679,16 @@ fn verified_tombstones(root: &Path, key: &[u8; 32]) -> Result<Vec<PrunedHistoryT
                 tombstone.record.module_id == module_id,
                 "audit tombstone module id mismatch"
             );
-            if !tombstone.record.previous_event_hashes.is_empty() {
-                ensure!(
-                    tombstone.record.previous_event_hashes.len()
-                        == tombstone.record.previous_event_count,
-                    "audit tombstone event hash count mismatch"
-                );
-                ensure!(
-                    tombstone.record.previous_event_hashes.last()
-                        == Some(&tombstone.record.previous_head_hash),
-                    "audit tombstone head hash mismatch"
-                );
-            }
+            ensure!(
+                tombstone.record.previous_event_hashes.len()
+                    == tombstone.record.previous_event_count,
+                "audit tombstone event hash count mismatch"
+            );
+            ensure!(
+                tombstone.record.previous_event_hashes.last()
+                    == Some(&tombstone.record.previous_head_hash),
+                "audit tombstone head hash mismatch"
+            );
             tombstones.push(tombstone.record);
         }
     }
@@ -649,6 +706,10 @@ fn verified_tombstones(root: &Path, key: &[u8; 32]) -> Result<Vec<PrunedHistoryT
 
 pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
     let _lock = AuditLock::acquire(root, false)?;
+    checkpoint_payload_unlocked(root)
+}
+
+fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
     let key = load_key(root, false)?;
     let tombstones = verified_tombstones(root, &key)?
         .into_iter()
@@ -687,19 +748,45 @@ pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
         Vec::new()
     };
     let hmac_key_id = hex(&Sha256::digest(key));
-    let inventory_hash = checkpoint_inventory_hash(&hmac_key_id, &modules, &tombstones)?;
+    let next_hmac_key_id = next_hmac_key_id_for_checkpoint(root, &key, &modules, &tombstones)?;
+    let inventory_hash =
+        checkpoint_inventory_hash(&hmac_key_id, &next_hmac_key_id, &modules, &tombstones)?;
     Ok(CheckpointPayload {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
         created_at_unix_seconds: now(),
         hmac_key_id,
+        next_hmac_key_id,
         inventory_hash,
         modules,
         tombstones,
     })
 }
 
+fn next_hmac_key_id_for_checkpoint(
+    root: &Path,
+    key: &[u8; 32],
+    modules: &[CheckpointModuleHead],
+    tombstones: &[CheckpointTombstone],
+) -> Result<String> {
+    let current_key_id = hmac_key_id(key);
+    let registry = read_manager_auth_registry(root, key)?;
+    let seal = match registry {
+        Some(registry) => load_verified_manager_seal(root, &registry)?,
+        None => None,
+    };
+    let has_unsealed_state = seal.map_or(!modules.is_empty() || !tombstones.is_empty(), |seal| {
+        seal.payload.modules != modules || seal.payload.tombstones != tombstones
+    });
+    if has_unsealed_state {
+        pending_hmac_key(root, key, true)?.next_key_id()
+    } else {
+        Ok(current_key_id)
+    }
+}
+
 fn checkpoint_inventory_hash(
     hmac_key_id: &str,
+    next_hmac_key_id: &str,
     modules: &[CheckpointModuleHead],
     tombstones: &[CheckpointTombstone],
 ) -> Result<String> {
@@ -707,6 +794,7 @@ fn checkpoint_inventory_hash(
     struct Inventory<'a> {
         schema_version: u32,
         hmac_key_id: &'a str,
+        next_hmac_key_id: &'a str,
         modules: &'a [CheckpointModuleHead],
         tombstones: &'a [CheckpointTombstone],
     }
@@ -714,12 +802,292 @@ fn checkpoint_inventory_hash(
     let bytes = serde_json::to_vec(&Inventory {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
         hmac_key_id,
+        next_hmac_key_id,
         modules,
         tombstones,
     })?;
     Ok(hex(&Sha256::digest(bytes)))
 }
 
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+struct VerifiedManagerSeal {
+    envelope: ManagerCheckpointEnvelope,
+    payload: CheckpointPayload,
+    seal_hash: String,
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn manager_audit_seal_status(root: &Path) -> Result<ManagerAuditSealStatus> {
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?;
+    let seal = match &registry {
+        Some(registry) => load_verified_manager_seal(root, registry)?,
+        None => None,
+    };
+    Ok(match seal {
+        Some(seal) => ManagerAuditSealStatus {
+            configured: true,
+            generation: Some(seal.envelope.generation),
+            seal_hash: Some(seal.seal_hash),
+            inventory_hash: Some(seal.payload.inventory_hash),
+            key_id: Some(seal.envelope.key_id),
+        },
+        None => ManagerAuditSealStatus {
+            configured: false,
+            generation: None,
+            seal_hash: None,
+            inventory_hash: None,
+            key_id: registry.map(|registry| registry.key_id),
+        },
+    })
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn commit_manager_audit_seal(
+    root: &Path,
+    encoded_envelope: &str,
+) -> Result<ManagerAuditSealStatus> {
+    let envelope_bytes = decode_hex(encoded_envelope)?;
+    let envelope: ManagerCheckpointEnvelope = serde_json::from_slice(&envelope_bytes)
+        .context("parse Manager audit checkpoint envelope")?;
+    let envelope_hex = hex(&envelope_bytes);
+    let seal_hash = hex(&Sha256::digest(&envelope_bytes));
+
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?
+        .context("Manager audit authorization key is not configured")?;
+    let payload = verify_manager_checkpoint_envelope(&envelope, &registry)?;
+    let current = checkpoint_payload_unlocked(root)?;
+    ensure!(
+        payload.inventory_hash == current.inventory_hash
+            && payload.hmac_key_id == current.hmac_key_id
+            && payload.next_hmac_key_id == current.next_hmac_key_id
+            && payload.modules == current.modules
+            && payload.tombstones == current.tombstones,
+        "Manager audit seal does not describe the current verified inventory"
+    );
+
+    if let Some(previous) = load_verified_manager_seal(root, &registry)? {
+        if previous.seal_hash == seal_hash {
+            complete_hmac_rotation(root, &key, &previous.payload, &previous.seal_hash)?;
+            return Ok(ManagerAuditSealStatus {
+                configured: true,
+                generation: Some(previous.envelope.generation),
+                seal_hash: Some(previous.seal_hash),
+                inventory_hash: Some(previous.payload.inventory_hash),
+                key_id: Some(previous.envelope.key_id),
+            });
+        }
+        ensure!(
+            envelope.generation == previous.envelope.generation.saturating_add(1),
+            "Manager audit seal generation is not the next expected value"
+        );
+        ensure_checkpoint_extends(&previous.payload, &payload)?;
+    }
+
+    atomic_write_json(
+        &manager_seal_path(root),
+        &StoredManagerSeal {
+            envelope_hex,
+            seal_hash: seal_hash.clone(),
+        },
+    )?;
+    complete_hmac_rotation(root, &key, &payload, &seal_hash)?;
+    Ok(ManagerAuditSealStatus {
+        configured: true,
+        generation: Some(envelope.generation),
+        seal_hash: Some(seal_hash),
+        inventory_hash: Some(payload.inventory_hash),
+        key_id: Some(envelope.key_id),
+    })
+}
+
+fn load_verified_manager_seal(
+    root: &Path,
+    registry: &ManagerAuditAuthRegistry,
+) -> Result<Option<VerifiedManagerSeal>> {
+    let path = manager_seal_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stored: StoredManagerSeal = read_json(&path)?;
+    let envelope_bytes = decode_hex(&stored.envelope_hex)?;
+    ensure!(
+        stored.seal_hash == hex(&Sha256::digest(&envelope_bytes)),
+        "Manager audit seal hash mismatch"
+    );
+    let envelope: ManagerCheckpointEnvelope = serde_json::from_slice(&envelope_bytes)
+        .context("parse stored Manager audit checkpoint envelope")?;
+    let payload = verify_manager_checkpoint_envelope(&envelope, registry)?;
+    Ok(Some(VerifiedManagerSeal {
+        envelope,
+        payload,
+        seal_hash: stored.seal_hash,
+    }))
+}
+
+fn verified_sealed_event_hashes(
+    root: &Path,
+    module_id: &str,
+    key: &[u8; 32],
+) -> Result<Vec<String>> {
+    let registry = read_manager_auth_registry(root, key)?;
+    if registry.is_none() {
+        ensure!(
+            !manager_seal_path(root).exists(),
+            "Manager audit seal exists without a registered Manager key"
+        );
+        return Ok(Vec::new());
+    }
+    let seal = load_verified_manager_seal(root, registry.as_ref().expect("checked above"))?;
+    Ok(seal
+        .and_then(|seal| {
+            seal.payload
+                .modules
+                .into_iter()
+                .find(|module| module.module_id == module_id)
+        })
+        .map(|module| module.event_hashes)
+        .unwrap_or_default())
+}
+
+fn verify_manager_checkpoint_envelope(
+    envelope: &ManagerCheckpointEnvelope,
+    registry: &ManagerAuditAuthRegistry,
+) -> Result<CheckpointPayload> {
+    ensure!(
+        envelope.schema_version == MANAGER_SEAL_SCHEMA_VERSION,
+        "unsupported Manager audit seal schema"
+    );
+    ensure!(
+        envelope.generation > 0,
+        "invalid Manager audit seal generation"
+    );
+    ensure!(
+        matches!(
+            envelope.key_backend.as_str(),
+            "android_keystore" | "software_file"
+        ),
+        "invalid Manager audit seal key backend"
+    );
+    ensure!(
+        matches!(
+            envelope.key_protection.as_str(),
+            "hardware" | "degraded" | "emergency"
+        ),
+        "invalid Manager audit seal protection level"
+    );
+    ensure!(
+        envelope.key_id == registry.key_id,
+        "Manager audit seal key identity mismatch"
+    );
+    let payload_bytes =
+        decode_base64(&envelope.payload).context("decode Manager audit seal payload")?;
+    let payload: CheckpointPayload =
+        serde_json::from_slice(&payload_bytes).context("parse Manager audit seal payload")?;
+    ensure!(
+        payload.schema_version == CHECKPOINT_SCHEMA_VERSION,
+        "unsupported Manager audit seal payload schema"
+    );
+    validate_sha256_hex(&payload.hmac_key_id, "HMAC key id")?;
+    validate_sha256_hex(&payload.next_hmac_key_id, "next HMAC key id")?;
+    validate_sha256_hex(&payload.inventory_hash, "inventory hash")?;
+    ensure!(
+        checkpoint_inventory_hash(
+            &payload.hmac_key_id,
+            &payload.next_hmac_key_id,
+            &payload.modules,
+            &payload.tombstones,
+        )? == payload.inventory_hash,
+        "Manager audit seal inventory hash mismatch"
+    );
+
+    let public_key = decode_hex(&registry.public_key_hex)?;
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(&public_key).context("invalid registered Manager key")?;
+    let signature_bytes =
+        decode_base64(&envelope.signature).context("decode Manager audit seal signature")?;
+    let signature =
+        Signature::from_der(&signature_bytes).context("invalid Manager audit seal signature")?;
+    let signable = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        envelope.schema_version,
+        envelope.generation,
+        envelope.key_backend,
+        envelope.key_protection,
+        envelope.key_id,
+        envelope.payload,
+    );
+    verifying_key
+        .verify(signable.as_bytes(), &signature)
+        .context("Manager audit seal signature rejected")?;
+    Ok(payload)
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+fn ensure_checkpoint_extends(
+    previous: &CheckpointPayload,
+    current: &CheckpointPayload,
+) -> Result<()> {
+    let same_hmac_key = previous.hmac_key_id == current.hmac_key_id;
+    let authorized_hmac_rotation = previous.next_hmac_key_id == current.hmac_key_id;
+    ensure!(
+        same_hmac_key || authorized_hmac_rotation,
+        "Manager audit seal HMAC key identity changed unexpectedly"
+    );
+    ensure!(
+        !same_hmac_key
+            || previous.next_hmac_key_id == current.next_hmac_key_id
+            || previous.modules != current.modules
+            || previous.tombstones != current.tombstones,
+        "pending HMAC key changed without completing its sealed rotation"
+    );
+    for old_tombstone in &previous.tombstones {
+        ensure!(
+            current.tombstones.contains(old_tombstone),
+            "Manager audit seal lost an authenticated tombstone"
+        );
+    }
+    for old_module in &previous.modules {
+        if let Some(new_module) = current
+            .modules
+            .iter()
+            .find(|module| module.module_id == old_module.module_id)
+        {
+            ensure!(
+                new_module
+                    .event_hashes
+                    .starts_with(&old_module.event_hashes),
+                "Manager audit history no longer extends its sealed prefix: {}",
+                old_module.module_id
+            );
+            ensure!(
+                !old_module.high_risk || new_module.high_risk,
+                "Manager audit seal attempted to clear a high-risk state: {}",
+                old_module.module_id
+            );
+            continue;
+        }
+        let compacted = current.tombstones.iter().any(|tombstone| {
+            tombstone.module_id == old_module.module_id
+                && tombstone.previous_event_count >= old_module.event_hashes.len()
+                && tombstone
+                    .previous_event_hashes
+                    .starts_with(&old_module.event_hashes)
+                && (!old_module.high_risk || tombstone.had_integrity_incident)
+        });
+        ensure!(
+            compacted,
+            "Manager audit history disappeared without a matching tombstone: {}",
+            old_module.module_id
+        );
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn manager_audit_auth_status(root: &Path) -> Result<ManagerAuditAuthStatus> {
     let checkpoint = checkpoint_payload(root)?;
     let _lock = AuditLock::acquire(root, false)?;
@@ -732,6 +1100,7 @@ pub fn manager_audit_auth_status(root: &Path) -> Result<ManagerAuditAuthStatus> 
     })
 }
 
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn register_manager_audit_auth_key(
     root: &Path,
     public_key_hex: &str,
@@ -781,6 +1150,7 @@ pub fn register_manager_audit_auth_key(
     manager_audit_auth_status(root)
 }
 
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn manager_audit_auth_challenge(
     root: &Path,
     action: &str,
@@ -801,6 +1171,7 @@ pub fn manager_audit_auth_challenge(
     })
 }
 
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn verify_manager_audit_authorization(
     root: &Path,
     encoded_authorization: &str,
@@ -877,6 +1248,33 @@ fn read_manager_auth_registry(
     Ok(Some(authenticated.record))
 }
 
+fn read_manager_auth_registry_during_rotation(
+    root: &Path,
+    previous: &[u8; 32],
+    next: &[u8; 32],
+) -> Result<Option<ManagerAuditAuthRegistry>> {
+    let path = manager_auth_path(root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let authenticated: AuthenticatedRecord<ManagerAuditAuthRegistry> = read_json(&path)?;
+    if verify_record(&authenticated.record, &authenticated.hmac_sha256, previous).is_err() {
+        verify_record(&authenticated.record, &authenticated.hmac_sha256, next)?;
+    }
+    ensure!(
+        authenticated.record.schema_version == MANAGER_AUTH_SCHEMA_VERSION,
+        "unsupported Manager audit authorization registry schema"
+    );
+    let public_key = decode_hex(&authenticated.record.public_key_hex)?;
+    ensure!(
+        authenticated.record.key_id == hex(&Sha256::digest(&public_key)),
+        "Manager audit authorization key id mismatch"
+    );
+    VerifyingKey::from_sec1_bytes(&public_key).context("invalid registered Manager key")?;
+    Ok(Some(authenticated.record))
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 fn audit_authorization_message(
     action: &str,
     inventory_hash: &str,
@@ -888,6 +1286,7 @@ fn audit_authorization_message(
     )
 }
 
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 fn validate_authorization_field(value: &str, name: &str) -> Result<()> {
     ensure!(
         !value.is_empty()
@@ -925,8 +1324,86 @@ fn decode_hex(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+fn decode_base64(value: &str) -> Result<Vec<u8>> {
+    ensure!(value.len().is_multiple_of(4), "invalid base64 length");
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    let chunks = value.as_bytes().chunks_exact(4);
+    let chunk_count = chunks.len();
+    for (index, chunk) in chunks.enumerate() {
+        let last = index + 1 == chunk_count;
+        let padding = match (chunk[2], chunk[3]) {
+            (b'=', b'=') => 2,
+            (_, b'=') => 1,
+            (b'=', _) => bail!("invalid base64 padding"),
+            _ => 0,
+        };
+        ensure!(last || padding == 0, "invalid base64 padding");
+        let a = base64_value(chunk[0])?;
+        let b = base64_value(chunk[1])?;
+        let c = if padding == 2 {
+            0
+        } else {
+            base64_value(chunk[2])?
+        };
+        let d = if padding >= 1 {
+            0
+        } else {
+            base64_value(chunk[3])?
+        };
+        output.push((a << 2) | (b >> 4));
+        if padding < 2 {
+            output.push((b << 4) | (c >> 2));
+        }
+        if padding == 0 {
+            output.push((c << 6) | d);
+        }
+    }
+    Ok(output)
+}
+
+fn base64_value(value: u8) -> Result<u8> {
+    match value {
+        b'A'..=b'Z' => Ok(value - b'A'),
+        b'a'..=b'z' => Ok(value - b'a' + 26),
+        b'0'..=b'9' => Ok(value - b'0' + 52),
+        b'+' => Ok(62),
+        b'/' => Ok(63),
+        _ => bail!("invalid base64 character"),
+    }
+}
+
+#[cfg(test)]
+fn encode_base64(value: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(value.len().div_ceil(3) * 4);
+    for chunk in value.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        output.push(char::from(ALPHABET[usize::from(a >> 2)]));
+        output.push(char::from(
+            ALPHABET[usize::from(((a & 0x03) << 4) | (b >> 4))],
+        ));
+        output.push(if chunk.len() > 1 {
+            char::from(ALPHABET[usize::from(((b & 0x0f) << 2) | (c >> 6))])
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            char::from(ALPHABET[usize::from(c & 0x3f)])
+        } else {
+            '='
+        });
+    }
+    output
+}
+
 fn manager_auth_path(root: &Path) -> PathBuf {
     root.join(MANAGER_AUTH_FILE)
+}
+
+fn manager_seal_path(root: &Path) -> PathBuf {
+    root.join(MANAGER_SEAL_FILE)
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
@@ -961,8 +1438,13 @@ fn verify_chain(
     key: &[u8; 32],
     repair: bool,
 ) -> Result<VerifiedChain> {
+    let sealed_event_hashes = verified_sealed_event_hashes(root, module_id, key)?;
     let events_dir = module_path(root, module_id).join("events");
     if !events_dir.exists() {
+        ensure!(
+            sealed_event_hashes.is_empty(),
+            "Manager-sealed audit history is missing"
+        );
         return Ok(VerifiedChain {
             events: Vec::new(),
             state: VerificationState::Empty,
@@ -979,14 +1461,23 @@ fn verify_chain(
         })
         .collect::<Vec<_>>();
     paths.sort();
+    ensure!(
+        paths.len() >= sealed_event_hashes.len(),
+        "Manager-sealed audit history was truncated"
+    );
 
     let mut valid = Vec::new();
     let mut failure = None;
     for (index, path) in paths.iter().enumerate() {
         let expected_sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
-        let result = verify_event_file(path, module_id, expected_sequence, &valid, key);
+        let sealed_hash = sealed_event_hashes.get(index).map(String::as_str);
+        let result =
+            verify_event_file(path, module_id, expected_sequence, &valid, key, sealed_hash);
         match result {
             Ok(event) => valid.push(event),
+            Err(error) if sealed_hash.is_some() => {
+                return Err(error).context("Manager-sealed audit event integrity failure");
+            }
             Err(error) => {
                 failure = Some((index, expected_sequence, format!("{error:#}")));
                 break;
@@ -1083,7 +1574,9 @@ fn append_incident(
     };
     write_event(root, module_id, key, incident)?;
     let path = event_path(root, module_id, sequence);
-    events.push(verify_event_file(&path, module_id, sequence, events, key)?);
+    events.push(verify_event_file(
+        &path, module_id, sequence, events, key, None,
+    )?);
     Ok(())
 }
 
@@ -1093,6 +1586,7 @@ fn verify_event_file(
     expected_sequence: u64,
     preceding: &[AuthenticatedEvent],
     key: &[u8; 32],
+    sealed_hash: Option<&str>,
 ) -> Result<AuthenticatedEvent> {
     let entry: AuthenticatedEvent = read_json(path)?;
     ensure!(
@@ -1122,13 +1616,20 @@ fn verify_event_file(
         ),
         "event hash mismatch"
     );
-    ensure!(
-        constant_time_eq(
-            entry.hmac_sha256.as_bytes(),
-            hex(&hmac_sha256(key, &bytes)).as_bytes()
-        ),
-        "event authentication mismatch"
-    );
+    if let Some(sealed_hash) = sealed_hash {
+        ensure!(
+            constant_time_eq(entry.event_hash.as_bytes(), sealed_hash.as_bytes()),
+            "event does not match its Manager seal"
+        );
+    } else {
+        ensure!(
+            constant_time_eq(
+                entry.hmac_sha256.as_bytes(),
+                hex(&hmac_sha256(key, &bytes)).as_bytes()
+            ),
+            "event authentication mismatch"
+        );
+    }
     Ok(entry)
 }
 
@@ -1326,7 +1827,7 @@ fn load_key(root: &Path, create: bool) -> Result<[u8; 32]> {
             file.read(&mut extra)? == 0,
             "invalid module audit authentication key length"
         );
-        return Ok(key);
+        return recover_pending_hmac_rotation(root, key);
     }
     ensure!(create, "module audit authentication key is unavailable");
     ensure!(
@@ -1341,6 +1842,191 @@ fn load_key(root: &Path, create: bool) -> Result<[u8; 32]> {
         .context("generate module audit authentication key")?;
     atomic_write(&path, &key)?;
     Ok(key)
+}
+
+fn hmac_key_id(key: &[u8; 32]) -> String {
+    hex(&Sha256::digest(key))
+}
+
+fn pending_hmac_key(root: &Path, key: &[u8; 32], create: bool) -> Result<PendingHmacKey> {
+    let path = root.join(NEXT_KEY_FILE);
+    if path.exists() {
+        let pending: AuthenticatedRecord<PendingHmacKey> = read_json(&path)?;
+        verify_record(&pending.record, &pending.hmac_sha256, key)?;
+        validate_pending_hmac_key(&pending.record, key)?;
+        return Ok(pending.record);
+    }
+    ensure!(create, "pending module audit HMAC key is unavailable");
+    let next_key = random_hmac_key()?;
+    let pending = PendingHmacKey {
+        schema_version: SCHEMA_VERSION,
+        current_key_id: hmac_key_id(key),
+        next_key_hex: hex(&next_key),
+    };
+    write_record(&path, pending.clone(), key)?;
+    Ok(pending)
+}
+
+fn validate_pending_hmac_key(pending: &PendingHmacKey, current: &[u8; 32]) -> Result<()> {
+    ensure!(
+        pending.schema_version == SCHEMA_VERSION,
+        "unsupported pending HMAC key schema"
+    );
+    ensure!(
+        pending.current_key_id == hmac_key_id(current),
+        "pending HMAC key does not match the current key"
+    );
+    let next = pending.next_key()?;
+    ensure!(next != *current, "pending HMAC key did not rotate");
+    Ok(())
+}
+
+fn random_hmac_key() -> Result<[u8; 32]> {
+    let mut key = [0_u8; 32];
+    File::open("/dev/urandom")
+        .context("open system random source")?
+        .read_exact(&mut key)
+        .context("generate module audit authentication key")?;
+    Ok(key)
+}
+
+fn recover_pending_hmac_rotation(root: &Path, current: [u8; 32]) -> Result<[u8; 32]> {
+    let path = root.join(NEXT_KEY_FILE);
+    if !path.exists() {
+        return Ok(current);
+    }
+    let pending: AuthenticatedRecord<PendingHmacKey> = read_json(&path)?;
+    let current_id = hmac_key_id(&current);
+    if pending.record.current_key_id == current_id {
+        verify_record(&pending.record, &pending.hmac_sha256, &current)?;
+        validate_pending_hmac_key(&pending.record, &current)?;
+        let next = pending.record.next_key()?;
+        let registry = read_manager_auth_registry_during_rotation(root, &current, &next)
+            .ok()
+            .flatten();
+        let seal = match registry {
+            Some(registry) => load_verified_manager_seal(root, &registry)?,
+            None => None,
+        };
+        if let Some(seal) = seal
+            && seal.payload.hmac_key_id == current_id
+            && seal.payload.next_hmac_key_id == pending.record.next_key_id()?
+        {
+            complete_hmac_rotation(root, &current, &seal.payload, &seal.seal_hash)?;
+            return pending_hmac_key_after_rotation(root, &pending.record);
+        }
+        return Ok(current);
+    }
+    if pending.record.next_key_id()? == current_id {
+        std::fs::remove_file(&path).context("finish module audit HMAC key rotation")?;
+        sync_dir(root)?;
+        return Ok(current);
+    }
+    bail!("module audit HMAC key rotation state is inconsistent")
+}
+
+fn pending_hmac_key_after_rotation(root: &Path, pending: &PendingHmacKey) -> Result<[u8; 32]> {
+    ensure!(
+        !root.join(NEXT_KEY_FILE).exists(),
+        "module audit HMAC key rotation did not finish"
+    );
+    pending.next_key()
+}
+
+fn complete_hmac_rotation(
+    root: &Path,
+    current: &[u8; 32],
+    sealed: &CheckpointPayload,
+    seal_hash: &str,
+) -> Result<()> {
+    if sealed.next_hmac_key_id == sealed.hmac_key_id {
+        return Ok(());
+    }
+    let pending = pending_hmac_key(root, current, false)?;
+    ensure!(
+        sealed.hmac_key_id == hmac_key_id(current),
+        "seal HMAC key mismatch"
+    );
+    ensure!(
+        sealed.next_hmac_key_id == pending.next_key_id()?,
+        "seal did not authorize the pending HMAC key"
+    );
+    let next = pending.next_key()?;
+    let registry = read_manager_auth_registry_during_rotation(root, current, &next)?
+        .context("Manager audit authorization key is not configured")?;
+    let stored_seal = load_verified_manager_seal(root, &registry)?
+        .context("Manager audit seal is unavailable during HMAC rotation")?;
+    ensure!(
+        stored_seal.seal_hash == seal_hash,
+        "HMAC rotation seal mismatch"
+    );
+    reauthenticate_audit_metadata(root, current, &next)?;
+    atomic_write(&root.join(KEY_FILE), &next)?;
+    std::fs::remove_file(root.join(NEXT_KEY_FILE))
+        .context("remove completed HMAC rotation marker")?;
+    sync_dir(root)
+}
+
+fn reauthenticate_audit_metadata(root: &Path, previous: &[u8; 32], next: &[u8; 32]) -> Result<()> {
+    rewrite_authenticated_file::<ManagerAuditAuthRegistry>(
+        &manager_auth_path(root),
+        previous,
+        next,
+    )?;
+    let modules = root.join("modules");
+    if modules.exists() {
+        for module_id in audit_module_ids(&modules)? {
+            let module = module_path(root, &module_id);
+            rewrite_authenticated_file::<ModuleIdentity>(
+                &module.join("identity.json"),
+                previous,
+                next,
+            )?;
+            let head = module.join("head.json");
+            if head.exists() {
+                rewrite_authenticated_file::<HeadRecord>(&head, previous, next)?;
+            }
+        }
+    }
+    rewrite_authenticated_directory::<RiskRecord>(&root.join("risk"), previous, next)?;
+    rewrite_authenticated_directory::<PrunedHistoryTombstone>(
+        &root.join("tombstones"),
+        previous,
+        next,
+    )
+}
+
+fn rewrite_authenticated_directory<T>(
+    directory: &Path,
+    previous: &[u8; 32],
+    next: &[u8; 32],
+) -> Result<()>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            rewrite_authenticated_directory::<T>(&entry.path(), previous, next)?;
+        } else {
+            rewrite_authenticated_file::<T>(&entry.path(), previous, next)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_authenticated_file<T>(path: &Path, previous: &[u8; 32], next: &[u8; 32]) -> Result<()>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    let authenticated: AuthenticatedRecord<T> = read_json(path)?;
+    if verify_record(&authenticated.record, &authenticated.hmac_sha256, previous).is_err() {
+        verify_record(&authenticated.record, &authenticated.hmac_sha256, next)?;
+    }
+    write_record(path, authenticated.record, next)
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1567,6 +2253,31 @@ mod tests {
         hex(&serde_json::to_vec(&token).unwrap())
     }
 
+    fn checkpoint_envelope(root: &Path, signing_key: &SigningKey, generation: u64) -> String {
+        let payload = checkpoint_payload(root).unwrap();
+        let payload_base64 = encode_base64(&serde_json::to_vec(&payload).unwrap());
+        let key_id = hex(&Sha256::digest(
+            signing_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        ));
+        let signable = format!(
+            "{MANAGER_SEAL_SCHEMA_VERSION}\n{generation}\nandroid_keystore\nhardware\n{key_id}\n{payload_base64}"
+        );
+        let signature: Signature = signing_key.sign(signable.as_bytes());
+        let envelope = ManagerCheckpointEnvelope {
+            schema_version: MANAGER_SEAL_SCHEMA_VERSION,
+            generation,
+            key_backend: "android_keystore".to_owned(),
+            key_protection: "hardware".to_owned(),
+            key_id,
+            payload: payload_base64,
+            signature: encode_base64(signature.to_der().as_bytes()),
+        };
+        hex(&serde_json::to_vec(&envelope).unwrap())
+    }
+
     #[test]
     fn records_and_verifies_an_authenticated_install_event() {
         let temp = TempDir::new().unwrap();
@@ -1773,6 +2484,102 @@ mod tests {
     }
 
     #[test]
+    fn manager_seal_authenticates_the_verified_event_prefix() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        let before = checkpoint_payload(temp.path()).unwrap();
+        let envelope = checkpoint_envelope(temp.path(), &manager, 1);
+        let status = commit_manager_audit_seal(temp.path(), &envelope).unwrap();
+        assert!(status.configured);
+        assert_eq!(status.generation, Some(1));
+        assert_eq!(manager_audit_seal_status(temp.path()).unwrap(), status);
+        let after = checkpoint_payload(temp.path()).unwrap();
+        assert_eq!(after.hmac_key_id, before.next_hmac_key_id);
+        assert_eq!(after.next_hmac_key_id, after.hmac_key_id);
+        assert!(!temp.path().join(NEXT_KEY_FILE).exists());
+        assert_eq!(
+            verify_module(temp.path(), "test.module", false)
+                .unwrap()
+                .manager_checkpoint,
+            CheckpointState::Sealed
+        );
+
+        let key = load_key(temp.path(), false).unwrap();
+        let path = event_path(temp.path(), "test.module", 1);
+        let mut event: AuthenticatedEvent = read_json(&path).unwrap();
+        event.event.timestamp_unix_seconds = event.event.timestamp_unix_seconds.saturating_add(1);
+        let bytes = serde_json::to_vec(&event.event).unwrap();
+        event.event_hash = hex(&Sha256::digest(&bytes));
+        event.hmac_sha256 = hex(&hmac_sha256(&key, &bytes));
+        atomic_write_json(&path, &event).unwrap();
+
+        let error = verify_module(temp.path(), "test.module", false).unwrap_err();
+        assert!(error.to_string().contains("Manager-sealed"));
+    }
+
+    #[test]
+    fn manager_seal_only_advances_from_the_previous_sealed_inventory() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        let first = checkpoint_envelope(temp.path(), &manager, 1);
+        let first_status = commit_manager_audit_seal(temp.path(), &first).unwrap();
+
+        record(temp.path(), "test.module", "cd");
+        let second = checkpoint_envelope(temp.path(), &manager, 2);
+        let second_status = commit_manager_audit_seal(temp.path(), &second).unwrap();
+        assert_ne!(first_status.seal_hash, second_status.seal_hash);
+        assert_eq!(second_status.generation, Some(2));
+
+        assert!(commit_manager_audit_seal(temp.path(), &first).is_err());
+    }
+
+    #[test]
+    fn persisted_seal_recovers_an_interrupted_hmac_rotation() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        let old_key = load_key(temp.path(), false).unwrap();
+        let envelope_hex = checkpoint_envelope(temp.path(), &manager, 1);
+        let envelope_bytes = decode_hex(&envelope_hex).unwrap();
+        let envelope: ManagerCheckpointEnvelope = serde_json::from_slice(&envelope_bytes).unwrap();
+        let registry = read_manager_auth_registry(temp.path(), &old_key)
+            .unwrap()
+            .unwrap();
+        let payload = verify_manager_checkpoint_envelope(&envelope, &registry).unwrap();
+        let seal_hash = hex(&Sha256::digest(&envelope_bytes));
+        atomic_write_json(
+            &manager_seal_path(temp.path()),
+            &StoredManagerSeal {
+                envelope_hex,
+                seal_hash,
+            },
+        )
+        .unwrap();
+        let pending = pending_hmac_key(temp.path(), &old_key, false).unwrap();
+        rewrite_authenticated_file::<ManagerAuditAuthRegistry>(
+            &manager_auth_path(temp.path()),
+            &old_key,
+            &pending.next_key().unwrap(),
+        )
+        .unwrap();
+
+        let recovered = load_key(temp.path(), false).unwrap();
+        assert_eq!(hmac_key_id(&recovered), payload.next_hmac_key_id);
+        assert!(!temp.path().join(NEXT_KEY_FILE).exists());
+        assert_eq!(
+            verify_module(temp.path(), "test.module", false)
+                .unwrap()
+                .manager_checkpoint,
+            CheckpointState::Sealed
+        );
+    }
+
+    #[test]
     fn manager_key_replacement_requires_explicit_recovery() {
         let temp = TempDir::new().unwrap();
         record(temp.path(), "test.module", "ab");
@@ -1841,45 +2648,6 @@ mod tests {
             recovered.key_id,
             manager_audit_auth_status(temp.path()).unwrap().key_id
         );
-    }
-
-    #[test]
-    fn checkpoint_accepts_legacy_tombstone_without_event_hashes() {
-        #[derive(Serialize)]
-        struct LegacyTombstone {
-            schema_version: u32,
-            module_id: String,
-            cleared_at_unix_seconds: u64,
-            previous_event_count: usize,
-            previous_head_hash: String,
-            had_integrity_incident: bool,
-            reason: String,
-        }
-
-        let temp = TempDir::new().unwrap();
-        record(temp.path(), "active.module", "ab");
-        let key = load_key(temp.path(), false).unwrap();
-        let legacy = LegacyTombstone {
-            schema_version: SCHEMA_VERSION,
-            module_id: "legacy.module".to_owned(),
-            cleared_at_unix_seconds: 1,
-            previous_event_count: 3,
-            previous_head_hash: "ab".repeat(32),
-            had_integrity_incident: false,
-            reason: "user_cleanup".to_owned(),
-        };
-        let bytes = serde_json::to_vec(&legacy).unwrap();
-        let authenticated = AuthenticatedRecord {
-            record: legacy,
-            hmac_sha256: hex(&hmac_sha256(&key, &bytes)),
-        };
-        let path = temp.path().join("tombstones/legacy.module/legacy.json");
-        ensure_dir(path.parent().unwrap()).unwrap();
-        atomic_write_json(&path, &authenticated).unwrap();
-
-        let payload = checkpoint_payload(temp.path()).unwrap();
-        assert_eq!(payload.tombstones.len(), 1);
-        assert!(payload.tombstones[0].previous_event_hashes.is_empty());
     }
 
     #[test]

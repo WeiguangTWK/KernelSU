@@ -189,6 +189,32 @@ suspend fun getModuleAuditAuthorizationChallenge(action: String): String =
         )
     }
 
+suspend fun getModuleAuditSealStatus(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-seal status",
+        "Unable to read Manager audit seal status",
+    )
+}
+
+suspend fun commitModuleAuditSeal(envelopeHex: String): String = withContext(Dispatchers.IO) {
+    check(envelopeHex.isNotEmpty() && envelopeHex.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit seal envelope"
+    }
+    val input = File.createTempFile("module-audit-seal-", ".hex", ksuApp.cacheDir)
+    try {
+        input.writeText(envelopeHex, Charsets.US_ASCII)
+        check(input.absolutePath.all { it.isLetterOrDigit() || it in "/._-" }) {
+            "Unsafe Manager audit seal path"
+        }
+        runModuleAuditCommand(
+            "audit-seal commit --file ${input.absolutePath}",
+            "Unable to commit Manager audit seal",
+        )
+    } finally {
+        input.delete()
+    }
+}
+
 suspend fun rescanInstalledModules(authorization: String): String = withContext(Dispatchers.IO) {
     check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
         "Invalid Manager audit authorization token"
