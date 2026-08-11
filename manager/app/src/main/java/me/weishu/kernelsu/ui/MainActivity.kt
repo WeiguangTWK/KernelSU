@@ -194,7 +194,11 @@ class MainActivity : ComponentActivity() {
                                 entry<Route.SecurityAudit> { SecurityAuditScreen() }
                                 entry<Route.SecurityAuditCategory> { key -> SecurityAuditCategoryScreen(key.category) }
                                 entry<Route.SecurityAuditModule> { key ->
-                                    SecurityAuditModuleScreen(key.moduleId, key.focusCategory)
+                                    SecurityAuditModuleScreen(
+                                        key.moduleId,
+                                        key.focusCategory,
+                                        key.requestSecureRemoval,
+                                    )
                                 }
                                 entry<Route.ModuleRepoDetail> { key -> ModuleRepoDetailScreen(key.module) }
                                 entry<Route.Install> { InstallScreen() }

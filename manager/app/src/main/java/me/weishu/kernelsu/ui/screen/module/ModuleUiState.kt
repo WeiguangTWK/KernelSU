@@ -74,6 +74,7 @@ data class ModuleActions(
     val onOpenRepo: () -> Unit,
     val onOpenSecurityAudit: () -> Unit,
     val onOpenModuleAudit: (String) -> Unit,
+    val onRequestSecureRemoval: (String) -> Unit,
     val onToggleSortActionFirst: () -> Unit,
     val onToggleSortEnabledFirst: () -> Unit,
     val onOpenWebUi: (Module) -> Unit,

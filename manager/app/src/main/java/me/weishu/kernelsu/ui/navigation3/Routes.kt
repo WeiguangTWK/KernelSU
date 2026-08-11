@@ -88,6 +88,7 @@ sealed interface Route : NavKey, Parcelable {
     data class SecurityAuditModule(
         val moduleId: String,
         val focusCategory: String? = null,
+        val requestSecureRemoval: Boolean = false,
     ) : Route
 
     @Parcelize

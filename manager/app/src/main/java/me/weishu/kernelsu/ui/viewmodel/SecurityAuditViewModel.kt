@@ -20,6 +20,7 @@ import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
 import me.weishu.kernelsu.security.requiresAuditSealCommit
 import me.weishu.kernelsu.ui.screen.securityaudit.AuditHistory
 import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditUiState
+import me.weishu.kernelsu.ui.screen.securityaudit.SecureRemovalPhase
 import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
 import me.weishu.kernelsu.ui.screen.securityaudit.parseStaleAuditModuleIds
@@ -32,6 +33,7 @@ import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationChallenge
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationStatus
 import me.weishu.kernelsu.ui.util.getModuleAuditSealStatus
 import me.weishu.kernelsu.ui.util.getStaleModuleAuditHistories
+import me.weishu.kernelsu.ui.util.listModules
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.recoverManagerSealedAudit
@@ -50,7 +52,7 @@ class SecurityAuditViewModel : ViewModel() {
         refreshJob?.cancel()
         while (true) {
             val state = _uiState.value
-            if (state.isRescanning || state.isPruning) return
+            if (state.isRescanning || state.isPruning || state.secureRemovalInProgress) return
             if (
                 _uiState.compareAndSet(
                     state,
@@ -309,29 +311,7 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                ensureAuditAuthorization()
-                for (moduleId in _uiState.value.sealedRecoveryModuleIds) {
-                    val challenge = getModuleAuditAuthorizationChallenge(
-                        "recover-sealed",
-                        moduleId,
-                    )
-                    val authorization = checkpointStore
-                        .signSealedRecoveryAuthorization(challenge)
-                    recoverManagerSealedAudit(moduleId, authorization)
-                }
-                val recovery = checkpointStore.acceptRecoveredChain(
-                    getModuleAuditCheckpoint(),
-                    getModuleAuditHistories(),
-                )
-                check(recovery.trust == AuditCheckpointTrust.Verified) {
-                    recovery.detail ?: "Unable to accept rebuilt audit chain"
-                }
-                check(ensureAuditAuthorization()) {
-                    "Manager audit authorization is unavailable after recovery"
-                }
-                check(ensureAuditSeal()) {
-                    "Unable to anchor the recovered audit chain"
-                }
+                recoverSealedHistories(_uiState.value.sealedRecoveryModuleIds)
             }.onFailure { error ->
                 if (error is CancellationException) throw error
                 _uiState.update {
@@ -436,29 +416,101 @@ class SecurityAuditViewModel : ViewModel() {
     }
 
     fun securelyRemoveModule(moduleId: String) {
+        var sealedRecoveryModuleIds = emptyList<String>()
         while (true) {
             val state = _uiState.value
             val history = state.histories.firstOrNull { it.status.moduleId == moduleId }
+            val canRecoverSealedDamage =
+                state.checkpointCompromised && moduleId in state.sealedRecoveryModuleIds
             if (
-                state.secureRemovalModuleId != null || state.auditMutationBlocked ||
+                state.secureRemovalModuleId != null || state.isLoading || state.isRefreshing ||
+                state.isRecovering ||
                 !state.recoverySafeMode || history?.status?.unresolvedRisk != true ||
-                moduleId in state.staleModuleIds
+                moduleId in state.staleModuleIds ||
+                (state.checkpointCompromised && !canRecoverSealedDamage) ||
+                (!state.auditAuthorizationReady && !canRecoverSealedDamage)
             ) {
                 return
             }
-            if (_uiState.compareAndSet(state, state.copy(secureRemovalModuleId = moduleId))) break
+            sealedRecoveryModuleIds = if (canRecoverSealedDamage) {
+                state.sealedRecoveryModuleIds
+            } else {
+                emptyList()
+            }
+            val initialPhase = if (sealedRecoveryModuleIds.isNotEmpty()) {
+                SecureRemovalPhase.RecoveringAudit
+            } else {
+                SecureRemovalPhase.RemovingModule
+            }
+            if (
+                _uiState.compareAndSet(
+                    state,
+                    state.copy(
+                        secureRemovalModuleId = moduleId,
+                        secureRemovalPhase = initialPhase,
+                        errorMessage = null,
+                    ),
+                )
+            ) break
         }
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
+            val result = runCatching {
+                if (sealedRecoveryModuleIds.isNotEmpty()) {
+                    recoverSealedHistories(sealedRecoveryModuleIds, trackSecureRemoval = true)
+                }
+                _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RemovingModule) }
                 runSecureModuleRemoval(moduleId, createAuthorization("secure-remove", moduleId))
+                _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RefreshingModules) }
+                val modules = JSONArray(listModules())
+                check((0 until modules.length()).none { index ->
+                    modules.getJSONObject(index).optString("id") == moduleId
+                }) {
+                    "Secure removal completed but the module is still present"
+                }
+            }
+            result.onSuccess {
+                _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.Completed) }
             }.onFailure { error ->
                 if (error is CancellationException) throw error
                 _uiState.update {
-                    it.copy(errorMessage = error.message ?: error::class.java.simpleName)
+                    it.copy(
+                        secureRemovalModuleId = null,
+                        secureRemovalPhase = null,
+                        errorMessage = error.message ?: error::class.java.simpleName,
+                    )
                 }
             }
-            _uiState.update { it.copy(secureRemovalModuleId = null) }
-            refresh()
+        }
+    }
+
+    private suspend fun recoverSealedHistories(
+        moduleIds: List<String>,
+        trackSecureRemoval: Boolean = false,
+    ) {
+        if (trackSecureRemoval) {
+            _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RecoveringAudit) }
+        }
+        ensureAuditAuthorization()
+        for (moduleId in moduleIds) {
+            val challenge = getModuleAuditAuthorizationChallenge("recover-sealed", moduleId)
+            val authorization = checkpointStore.signSealedRecoveryAuthorization(challenge)
+            recoverManagerSealedAudit(moduleId, authorization)
+        }
+        if (trackSecureRemoval) {
+            _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.AnchoringAudit) }
+        }
+        val recovery = checkpointStore.acceptRecoveredChain(
+            getModuleAuditCheckpoint(),
+            getModuleAuditHistories(),
+        )
+        check(recovery.trust == AuditCheckpointTrust.Verified) {
+            recovery.detail ?: "Unable to accept rebuilt audit chain"
+        }
+        check(ensureAuditAuthorization()) {
+            "Manager audit authorization is unavailable after recovery"
+        }
+        check(ensureAuditSeal()) {
+            "Unable to anchor the recovered audit chain"
         }
     }
 }

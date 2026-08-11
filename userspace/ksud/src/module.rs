@@ -150,6 +150,26 @@ pub fn foreach_module(
             info!("{} is disabled, skip", path.display());
             continue;
         }
+        if module_type == Active {
+            let module_id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            match module_audit_log::module_requires_containment(
+                Path::new(defs::MODULE_AUDIT_DIR),
+                module_id,
+            ) {
+                Ok(true) => {
+                    warn!("{} is audit-contained, skip", path.display());
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => warn!(
+                    "cannot determine audit containment for {}: {error:#}",
+                    path.display()
+                ),
+            }
+        }
         if module_type == Active && path.join(defs::REMOVE_FILE_NAME).exists() {
             warn!("{} is removed, skip", path.display());
             continue;
@@ -832,7 +852,7 @@ fn ensure_normal_module_action_allowed(id: &str, action: &str) -> Result<()> {
 pub fn contain_module_for_secure_removal(id: &str) -> Result<()> {
     validate_module_id(id)?;
     ensure!(
-        module_audit_log::module_requires_secure_removal(Path::new(defs::MODULE_AUDIT_DIR), id,)?,
+        module_audit_log::module_requires_containment(Path::new(defs::MODULE_AUDIT_DIR), id,)?,
         "Module {id} does not require secure removal"
     );
     let mut found = false;
@@ -850,9 +870,140 @@ pub fn contain_module_for_secure_removal(id: &str) -> Result<()> {
         }
     }
     ensure!(found, "Module {id} content not found");
+    module_audit_log::set_containment_state(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        id,
+        module_audit_log::ContainmentState::PendingReboot,
+    )?;
     regenerate_preinit_rc()?;
     info!("Module {id} contained for KernelSU safe-mode removal");
     Ok(())
+}
+
+/// Materialize authenticated audit containment into KernelSU's conventional
+/// module-disable markers. The audit state remains authoritative, so deleting a
+/// marker cannot make the module active again.
+pub fn enforce_audit_containment(boot_enforcement: bool) -> Result<Vec<String>> {
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    if !audit_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut ids = std::collections::BTreeSet::new();
+    if let Ok(status) = module_audit_log::sealed_integrity_status(audit_root) {
+        ids.extend(status.failures.into_iter().map(|failure| failure.module_id));
+    }
+    if let Ok(statuses) = module_audit_log::list_modules_resilient(audit_root, false) {
+        ids.extend(
+            statuses
+                .into_iter()
+                .filter(|status| status.unresolved_risk)
+                .map(|status| status.module_id),
+        );
+    }
+
+    // Exclude the module first. Auxiliary persistent-script quarantine must not
+    // be able to weaken the primary response if a malicious filesystem object
+    // makes an individual move fail.
+    let mut changed = false;
+    for id in &ids {
+        module_audit_log::set_containment_state(
+            audit_root,
+            id,
+            module_audit_log::ContainmentState::PendingReboot,
+        )?;
+        for root in [defs::MODULE_DIR, defs::MODULE_UPDATE_DIR] {
+            let module_path = Path::new(root).join(id);
+            if !module_path.is_dir() {
+                continue;
+            }
+            let disable = module_path.join(defs::DISABLE_FILE_NAME);
+            if !disable.exists() {
+                ensure_file_exists(&disable)?;
+                changed = true;
+            }
+            let remove = module_path.join(defs::REMOVE_FILE_NAME);
+            if remove.exists() {
+                std::fs::remove_file(&remove)
+                    .with_context(|| format!("cancel unsafe uninstall for module '{id}'"))?;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        regenerate_preinit_rc()?;
+    }
+
+    // Quarantine persistent startup scripts using only Manager-sealed evidence.
+    // Exact ownership is preferred. If a damaged module has no surviving event,
+    // preserve paths attributed by every other intact history and quarantine the
+    // remaining files as explicitly uncertain ownership.
+    let persistent_result = (|| -> Result<()> {
+        let mut plans = module_audit_log::persistent_script_containment_plans(audit_root)?;
+        plans.sort_by(|left, right| left.module_id.cmp(&right.module_id));
+        for plan in plans.iter().filter(|plan| !plan.paths.is_empty()) {
+            module_audit_log::quarantine_persistent_scripts(
+                audit_root,
+                &plan.module_id,
+                &plan.paths,
+                false,
+            )?;
+        }
+        if let Some(owner) = plans.iter().find(|plan| plan.infer_unattributed) {
+            let trusted = module_audit_log::trusted_persistent_script_paths(audit_root)?
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut unknown = Vec::new();
+            for directory in [
+                "/data/adb/service.d",
+                "/data/adb/boot-completed.d",
+                "/data/adb/bootcompleted.d",
+            ] {
+                let directory = Path::new(directory);
+                if !directory.is_dir() {
+                    continue;
+                }
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
+                        continue;
+                    }
+                    let path = entry.path().to_string_lossy().into_owned();
+                    if !trusted.contains(&path) {
+                        unknown.push(path);
+                    }
+                }
+            }
+            unknown.sort();
+            if !unknown.is_empty() {
+                warn!(
+                    "audit history for {} has no trusted persistent-script inventory; quarantining {} unattributed startup scripts",
+                    owner.module_id,
+                    unknown.len()
+                );
+                module_audit_log::quarantine_persistent_scripts(
+                    audit_root,
+                    &owner.module_id,
+                    &unknown,
+                    true,
+                )?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = persistent_result {
+        warn!("persistent startup script containment is incomplete: {error:#}");
+    } else if boot_enforcement {
+        for id in &ids {
+            module_audit_log::set_containment_state(
+                audit_root,
+                id,
+                module_audit_log::ContainmentState::Contained,
+            )?;
+        }
+    }
+
+    Ok(ids.into_iter().collect())
 }
 
 pub fn disable_all_modules() -> Result<()> {
@@ -1284,6 +1435,22 @@ pub fn secure_remove_module(module_id: &str, authorization: &str) -> Result<()> 
         removed_paths,
     )?;
     module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
+}
+
+pub fn recover_manager_sealed_audit(
+    module_id: &str,
+    authorization: &str,
+) -> Result<module_audit_log::ModuleAuditStatus> {
+    validate_module_id(module_id)?;
+    ensure!(
+        ksucalls::check_kernel_safemode(),
+        "Manager-sealed audit recovery requires KernelSU safe mode"
+    );
+    module_audit_log::recover_manager_sealed_module(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        module_id,
+        authorization,
+    )
 }
 
 fn audit_prune_targets(module_id: Option<&str>) -> Result<Vec<String>> {

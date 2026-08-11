@@ -490,6 +490,7 @@ fun ModulePagerMiuix(
                     updateInfoMap = uiState.updateInfo,
                     secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                     secureRemovalStates = uiState.secureRemovalStates,
+                    isSafeMode = uiState.isSafeMode,
                     actions = actions,
                     onModuleAddShortcut = ::onModuleAddShortcut,
                     contentPadding = PaddingValues(
@@ -597,6 +598,7 @@ fun ModulePagerMiuix(
                             updateInfoMap = uiState.updateInfo,
                             secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                             secureRemovalStates = uiState.secureRemovalStates,
+                            isSafeMode = uiState.isSafeMode,
                             actions = actions,
                             onModuleAddShortcut = { module, type ->
                                 onModuleAddShortcut(module, type)
@@ -754,6 +756,7 @@ private fun ModuleList(
     updateInfoMap: Map<String, ModuleUpdateInfo>,
     secureRemovalModuleIds: Set<String>,
     secureRemovalStates: Map<String, String>,
+    isSafeMode: Boolean,
     actions: ModuleActions,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
     contentPadding: PaddingValues,
@@ -779,10 +782,15 @@ private fun ModuleList(
                     module = module,
                     requiresSecureRemoval = module.id in secureRemovalModuleIds,
                     containmentState = secureRemovalStates[module.id],
+                    secureRemovalAvailable = isSafeMode,
                     updateUrl = moduleUpdateInfo.downloadUrl,
                     onUninstall = {
                         if (module.id in secureRemovalModuleIds) {
-                            actions.onOpenModuleAudit(module.id)
+                            if (isSafeMode) {
+                                actions.onRequestSecureRemoval(module.id)
+                            } else {
+                                actions.onOpenModuleAudit(module.id)
+                            }
                         } else {
                             actions.onRequestUninstallConfirmation(currentModuleState.value)
                         }
@@ -831,6 +839,7 @@ fun ModuleItem(
     module: Module,
     requiresSecureRemoval: Boolean,
     containmentState: String?,
+    secureRemovalAvailable: Boolean,
     updateUrl: String,
     onUndoUninstall: () -> Unit,
     onUninstall: () -> Unit,
@@ -1146,7 +1155,9 @@ fun ModuleItem(
                             modifier = Modifier.padding(start = 4.dp, end = 3.dp),
                             text = stringResource(
                                 when {
-                                    requiresSecureRemoval -> R.string.security_audit_secure_remove_confirm
+                                    requiresSecureRemoval && secureRemovalAvailable ->
+                                        R.string.security_audit_secure_remove_confirm
+                                    requiresSecureRemoval -> R.string.security_audit_view_audit
                                     module.remove -> R.string.undo
                                     else -> R.string.uninstall
                                 }

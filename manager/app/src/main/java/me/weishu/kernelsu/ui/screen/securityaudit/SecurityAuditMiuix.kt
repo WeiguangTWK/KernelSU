@@ -99,6 +99,9 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
             }
         }
         state.errorMessage?.let { item { AuditMessageCardMiuix(it, true) } }
+        state.secureRemovalPhase
+            ?.takeUnless { it == SecureRemovalPhase.Completed }
+            ?.let { phase -> item { AuditSecureRemovalProgressMiuix(phase) } }
         if (state.histories.isEmpty() && !state.isLoading) {
             item { AuditEmptyMiuix(stringResource(R.string.security_audit_empty)) }
         } else if (state.histories.isNotEmpty()) {
@@ -108,6 +111,41 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
             }
         }
     }
+}
+
+@Composable
+private fun AuditSecureRemovalProgressMiuix(phase: SecureRemovalPhase) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            CircularProgressIndicator(Modifier.size(24.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    stringResource(secureRemovalPhaseLabelMiuix(phase)),
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    stringResource(R.string.security_audit_removal_wait),
+                    fontSize = 12.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+            }
+        }
+    }
+}
+
+private fun secureRemovalPhaseLabelMiuix(phase: SecureRemovalPhase): Int = when (phase) {
+    SecureRemovalPhase.RecoveringAudit -> R.string.security_audit_removal_recovering
+    SecureRemovalPhase.AnchoringAudit -> R.string.security_audit_removal_anchoring
+    SecureRemovalPhase.RemovingModule -> R.string.security_audit_removal_removing
+    SecureRemovalPhase.RefreshingModules,
+    SecureRemovalPhase.Completed -> R.string.security_audit_removal_refreshing
 }
 
 @Composable
@@ -209,12 +247,20 @@ fun SecurityAuditModuleMiuix(
             item { AuditMessageCardMiuix(stringResource(R.string.security_audit_checkpoint_incident, it), true) }
         }
         state.errorMessage?.let { item { AuditMessageCardMiuix(it, true) } }
+        state.secureRemovalPhase
+            ?.takeUnless { it == SecureRemovalPhase.Completed }
+            ?.let { phase -> item { AuditSecureRemovalProgressMiuix(phase) } }
         when {
             history == null && !state.isLoading -> item { AuditEmptyMiuix(stringResource(R.string.security_audit_empty_result)) }
             history != null -> {
                 item { AuditIntegrityMiuix(history) }
-                history.integrityError?.let { error ->
-                    item { AuditMessageCardMiuix(error, true) }
+                if (history.status.unresolvedRisk) {
+                    item {
+                        AuditMessageCardMiuix(
+                            stringResource(R.string.security_audit_isolation_reason),
+                            true,
+                        )
+                    }
                 }
                 if (
                     history.status.unresolvedRisk &&

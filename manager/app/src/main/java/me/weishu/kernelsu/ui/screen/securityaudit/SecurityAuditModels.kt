@@ -24,6 +24,14 @@ data class AuditStatus(
     val persistentScriptOwnership: String? = null,
 )
 
+enum class SecureRemovalPhase {
+    RecoveringAudit,
+    AnchoringAudit,
+    RemovingModule,
+    RefreshingModules,
+    Completed,
+}
+
 data class AuditEvent(
     val schemaVersion: Int,
     val moduleId: String,
@@ -72,6 +80,7 @@ data class SecurityAuditUiState(
     val isPruning: Boolean = false,
     val isRecovering: Boolean = false,
     val secureRemovalModuleId: String? = null,
+    val secureRemovalPhase: SecureRemovalPhase? = null,
     val histories: List<AuditHistory> = emptyList(),
     val staleModuleIds: List<String> = emptyList(),
     val checkpointCompromised: Boolean = false,
@@ -86,7 +95,10 @@ data class SecurityAuditUiState(
     val auditMutationBlocked: Boolean
         get() =
             checkpointCompromised || !auditAuthorizationReady || isLoading || isRefreshing ||
-                isRecovering
+                isRecovering || secureRemovalInProgress
+
+    val secureRemovalInProgress: Boolean
+        get() = secureRemovalPhase != null && secureRemovalPhase != SecureRemovalPhase.Completed
 
     val highRiskModules: Int
         get() = histories.count { it.isHighRisk() }

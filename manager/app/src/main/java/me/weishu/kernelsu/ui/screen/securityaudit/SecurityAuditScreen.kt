@@ -1,8 +1,12 @@
 package me.weishu.kernelsu.ui.screen.securityaudit
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.dropUnlessResumed
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -110,7 +114,11 @@ fun SecurityAuditCategoryScreen(categoryKey: String) {
 }
 
 @Composable
-fun SecurityAuditModuleScreen(moduleId: String, focusCategoryKey: String? = null) {
+fun SecurityAuditModuleScreen(
+    moduleId: String,
+    focusCategoryKey: String? = null,
+    requestSecureRemoval: Boolean = false,
+) {
     val navigator = LocalNavigator.current
     val viewModel = viewModel<SecurityAuditViewModel>()
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -142,8 +150,30 @@ fun SecurityAuditModuleScreen(moduleId: String, focusCategoryKey: String? = null
             R.string.security_audit_secure_remove_reboot
         }
     )
+    var removalPromptShown by remember(moduleId, requestSecureRemoval) { mutableStateOf(false) }
+    LaunchedEffect(requestSecureRemoval, state.isLoading, state.recoverySafeMode) {
+        if (
+            requestSecureRemoval && !removalPromptShown &&
+            !state.isLoading && state.recoverySafeMode
+        ) {
+            removalPromptShown = true
+            secureRemovalDialog.showConfirm(
+                title = secureRemovalTitle,
+                content = secureRemovalMessage,
+                confirm = secureRemovalConfirm,
+            )
+        }
+    }
+    BackHandler(enabled = state.secureRemovalInProgress) {}
+    LaunchedEffect(state.secureRemovalPhase) {
+        if (state.secureRemovalPhase == SecureRemovalPhase.Completed) {
+            navigator.pop()
+        }
+    }
     val actions = SecurityAuditActions(
-        onBack = dropUnlessResumed { navigator.pop() },
+        onBack = dropUnlessResumed {
+            if (!state.secureRemovalInProgress) navigator.pop()
+        },
         onRefresh = viewModel::refresh,
         onRescan = viewModel::rescanInstalledModules,
         onPrune = {},

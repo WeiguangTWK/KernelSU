@@ -365,6 +365,7 @@ fun ModulePagerMaterial(
                         updateInfoMap = uiState.updateInfo,
                         secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                         secureRemovalStates = uiState.secureRemovalStates,
+                        isSafeMode = uiState.isSafeMode,
                         actions = actions,
                         onClickModule = { module ->
                             if (module.hasWebUi) {
@@ -478,6 +479,7 @@ fun ModulePagerMaterial(
                 updateInfoMap = uiState.updateInfo,
                 secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                 secureRemovalStates = uiState.secureRemovalStates,
+                isSafeMode = uiState.isSafeMode,
                 actions = actions,
                 onClickModule = { module ->
                     if (module.hasWebUi) {
@@ -514,6 +516,7 @@ private fun ModuleList(
     updateInfoMap: Map<String, ModuleUpdateInfo>,
     secureRemovalModuleIds: Set<String>,
     secureRemovalStates: Map<String, String>,
+    isSafeMode: Boolean,
     actions: ModuleActions,
     onClickModule: (Module) -> Unit,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
@@ -538,10 +541,15 @@ private fun ModuleList(
                 module = module,
                 requiresSecureRemoval = module.id in secureRemovalModuleIds,
                 containmentState = secureRemovalStates[module.id],
+                secureRemovalAvailable = isSafeMode,
                 updateUrl = moduleUpdateInfo.downloadUrl,
                 onUninstallClicked = {
                     if (module.id in secureRemovalModuleIds) {
-                        actions.onOpenModuleAudit(module.id)
+                        if (isSafeMode) {
+                            actions.onRequestSecureRemoval(module.id)
+                        } else {
+                            actions.onOpenModuleAudit(module.id)
+                        }
                     } else if (module.remove) {
                         actions.onUndoUninstallModule(module)
                     } else {
@@ -727,6 +735,7 @@ private fun ModuleItem(
     module: Module,
     requiresSecureRemoval: Boolean,
     containmentState: String?,
+    secureRemovalAvailable: Boolean,
     updateUrl: String,
     onUninstallClicked: () -> Unit,
     onCheckChanged: (Boolean) -> Unit,
@@ -1026,7 +1035,9 @@ private fun ModuleItem(
                             fontSize = MaterialTheme.typography.labelMedium.fontSize,
                             text = stringResource(
                                 when {
-                                    requiresSecureRemoval -> R.string.security_audit_secure_remove_confirm
+                                    requiresSecureRemoval && secureRemovalAvailable ->
+                                        R.string.security_audit_secure_remove_confirm
+                                    requiresSecureRemoval -> R.string.security_audit_view_audit
                                     module.remove -> R.string.undo
                                     else -> R.string.uninstall
                                 }

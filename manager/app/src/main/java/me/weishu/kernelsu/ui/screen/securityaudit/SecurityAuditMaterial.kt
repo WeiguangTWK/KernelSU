@@ -91,6 +91,9 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
             }
         }
         state.errorMessage?.let { item { AuditErrorMaterial(it) } }
+        state.secureRemovalPhase
+            ?.takeUnless { it == SecureRemovalPhase.Completed }
+            ?.let { phase -> item { AuditSecureRemovalProgressMaterial(phase) } }
         if (state.histories.isEmpty() && !state.isLoading) {
             item { AuditEmptyMaterial() }
         } else if (state.histories.isNotEmpty()) {
@@ -100,6 +103,38 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
             }
         }
     }
+}
+
+@Composable
+private fun AuditSecureRemovalProgressMaterial(phase: SecureRemovalPhase) {
+    TonalCard(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    stringResource(secureRemovalPhaseLabel(phase)),
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    stringResource(R.string.security_audit_removal_wait),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+private fun secureRemovalPhaseLabel(phase: SecureRemovalPhase): Int = when (phase) {
+    SecureRemovalPhase.RecoveringAudit -> R.string.security_audit_removal_recovering
+    SecureRemovalPhase.AnchoringAudit -> R.string.security_audit_removal_anchoring
+    SecureRemovalPhase.RemovingModule -> R.string.security_audit_removal_removing
+    SecureRemovalPhase.RefreshingModules,
+    SecureRemovalPhase.Completed -> R.string.security_audit_removal_refreshing
 }
 
 @Composable
@@ -204,12 +239,17 @@ fun SecurityAuditModuleMaterial(
             item { AuditErrorMaterial(stringResource(R.string.security_audit_checkpoint_incident, it)) }
         }
         state.errorMessage?.let { item { AuditErrorMaterial(it) } }
+        state.secureRemovalPhase
+            ?.takeUnless { it == SecureRemovalPhase.Completed }
+            ?.let { phase -> item { AuditSecureRemovalProgressMaterial(phase) } }
         when {
             history == null && !state.isLoading -> item { AuditEmptyResultMaterial() }
             history != null -> {
                 item { AuditIntegrityMaterial(history) }
-                history.integrityError?.let { error ->
-                    item { AuditErrorMaterial(error) }
+                if (history.status.unresolvedRisk) {
+                    item {
+                        AuditErrorMaterial(stringResource(R.string.security_audit_isolation_reason))
+                    }
                 }
                 if (
                     history.status.unresolvedRisk &&

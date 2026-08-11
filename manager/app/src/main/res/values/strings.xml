@@ -101,6 +101,13 @@
     <string name="security_audit_integrity_compromised">Audit integrity compromised · Open Security &amp; Audit Center</string>
     <string name="security_audit_persistent_quarantined">Quarantined persistent scripts: %1$d</string>
     <string name="security_audit_persistent_uncertain">Ownership could not be verified. Unattributed startup scripts were quarantined by exclusion and should be reviewed before restoration.</string>
+    <string name="security_audit_view_audit">View audit</string>
+    <string name="security_audit_isolation_reason">Isolation reason: the module audit history failed integrity verification.</string>
+    <string name="security_audit_removal_recovering">Recovering trusted audit history…</string>
+    <string name="security_audit_removal_anchoring">Re-establishing the security checkpoint…</string>
+    <string name="security_audit_removal_removing">Quarantining and removing the module…</string>
+    <string name="security_audit_removal_refreshing">Confirming module removal…</string>
+    <string name="security_audit_removal_wait">Secure removal in progress. Do not leave this screen.</string>
     <string name="security_audit_authorization_unavailable">Manager audit authorization is unavailable. Reboot into KernelSU safe mode and reopen Security &amp; Audit Center to recover it.</string>
     <string name="security_audit_authorization_changed">Manager audit authorization key changed. Reboot into KernelSU safe mode and reopen Security &amp; Audit Center to recover it.</string>
     <string name="security_audit_event_accepted">Installation accepted</string>
