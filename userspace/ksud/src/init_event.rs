@@ -38,6 +38,12 @@ pub fn on_post_data_fs() -> Result<()> {
         return Ok(());
     }
 
+    if let Err(e) = crate::module_audit_log::recover_interrupted_installs(std::path::Path::new(
+        defs::MODULE_AUDIT_DIR,
+    )) {
+        warn!("recover interrupted module audit installs failed: {e:#}");
+    }
+
     let safe_mode = crate::utils::is_safe_mode();
 
     if safe_mode {

@@ -10,13 +10,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCHEMA_VERSION: u32 = 1;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 4;
-const MANAGER_AUTH_SCHEMA_VERSION: u32 = 1;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 5;
+const MANAGER_AUTH_SCHEMA_VERSION: u32 = 2;
 const KEY_FILE: &str = ".hmac-key";
 const MANAGER_AUTH_FILE: &str = "manager-auth.json";
 const MANAGER_SEAL_FILE: &str = "manager-seal.json";
 const MANAGER_SEAL_SCHEMA_VERSION: u32 = 2;
 const NEXT_KEY_FILE: &str = ".hmac-key-next.json";
+const OPERATIONS_DIR: &str = "operations";
+const CHALLENGES_DIR: &str = "challenges";
+const OPERATION_TRASH_DIR: &str = "operation-trash";
+const AUTH_CHALLENGE_TTL_SECONDS: u64 = 5 * 60;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -40,9 +44,11 @@ pub enum AuditEventKind {
         error: Option<String>,
     },
     InstalledRescan {
+        operation_id: String,
         report: AuditReport,
     },
     InstalledRescanFailed {
+        operation_id: String,
         error: String,
     },
     IntegrityIncident {
@@ -178,6 +184,27 @@ pub struct CheckpointTombstone {
     pub had_integrity_incident: bool,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOperationState {
+    Applying,
+    Applied,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CheckpointOperation {
+    pub operation_id: String,
+    pub action: String,
+    pub base_inventory_hash: String,
+    pub arguments_hash: String,
+    pub authorization_hex: String,
+    pub targets: Vec<String>,
+    pub completed_targets: Vec<String>,
+    pub state: AuditOperationState,
+    pub error: Option<String>,
+}
+
 /// Canonical payload intended to be signed by the Manager's Android Keystore key.
 /// Signature storage and verification deliberately remain a Manager integration concern.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -189,6 +216,7 @@ pub struct CheckpointPayload {
     pub inventory_hash: String,
     pub modules: Vec<CheckpointModuleHead>,
     pub tombstones: Vec<CheckpointTombstone>,
+    pub operations: Vec<CheckpointOperation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -207,6 +235,8 @@ pub struct ManagerAuditAuthChallenge {
     pub inventory_hash: String,
     pub arguments_hash: String,
     pub key_id: String,
+    pub challenge_id: String,
+    pub created_at_unix_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -223,8 +253,60 @@ struct SignedAuditAuthorization {
     action: String,
     inventory_hash: String,
     arguments_hash: String,
-    nonce_hex: String,
+    key_id: String,
+    challenge_id: String,
+    created_at_unix_seconds: u64,
     signature_der_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AuditAuthorizationChallenge {
+    schema_version: u32,
+    action: String,
+    inventory_hash: String,
+    arguments_hash: String,
+    key_id: String,
+    challenge_id: String,
+    created_at_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AuditOperationRecord {
+    schema_version: u32,
+    operation_id: String,
+    action: String,
+    base_inventory_hash: String,
+    arguments_hash: String,
+    authorization_hex: String,
+    targets: Vec<String>,
+    completed_targets: Vec<String>,
+    state: AuditOperationState,
+    error: Option<String>,
+    started_at_unix_seconds: u64,
+    updated_at_unix_seconds: u64,
+}
+
+impl AuditOperationRecord {
+    fn checkpoint(&self) -> CheckpointOperation {
+        CheckpointOperation {
+            operation_id: self.operation_id.clone(),
+            action: self.action.clone(),
+            base_inventory_hash: self.base_inventory_hash.clone(),
+            arguments_hash: self.arguments_hash.clone(),
+            authorization_hex: self.authorization_hex.clone(),
+            targets: self.targets.clone(),
+            completed_targets: self.completed_targets.clone(),
+            state: self.state,
+            error: self.error.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedAuditOperation {
+    pub operation_id: String,
+    pub completed_targets: Vec<String>,
+    pub applied: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -379,26 +461,135 @@ pub fn finish_install(
     verify_module_unlocked(root, &receipt.module_id, true)
 }
 
+/// Close install attempts that survived into a new boot without a result.
+/// Installer scripts are deliberately never resumed because they are not idempotent.
+#[allow(dead_code)]
+pub fn recover_interrupted_installs(root: &Path) -> Result<Vec<String>> {
+    if !root.join("modules").exists() {
+        return Ok(Vec::new());
+    }
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let mut recovered = Vec::new();
+    for module_id in audit_module_ids(&root.join("modules"))? {
+        let chain = verify_chain(root, &module_id, &key, true)?;
+        let mut pending = Vec::new();
+        let mut completed = Vec::new();
+        for entry in chain.events {
+            match entry.event.kind {
+                AuditEventKind::InstallAccepted { attempt_id, .. } => pending.push(attempt_id),
+                AuditEventKind::InstallResult { attempt_id, .. } => completed.push(attempt_id),
+                _ => {}
+            }
+        }
+        for attempt_id in pending {
+            if completed.contains(&attempt_id) {
+                continue;
+            }
+            append_event(
+                root,
+                &module_id,
+                AuditEventKind::InstallResult {
+                    attempt_id,
+                    outcome: InstallOutcome::InstallationFailed,
+                    error: Some(
+                        "installation was interrupted before ksud recorded a result".to_owned(),
+                    ),
+                },
+            )?;
+            if !recovered.contains(&module_id) {
+                recovered.push(module_id.clone());
+            }
+        }
+    }
+    Ok(recovered)
+}
+
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn record_installed_rescan(
     root: &Path,
+    operation_id: &str,
     module_id: &str,
     result: std::result::Result<AuditReport, String>,
 ) -> Result<ModuleAuditStatus> {
     let _lock = AuditLock::acquire(root, true)?;
+    validate_sha256_hex(operation_id, "operation id")?;
     validate_module_id(module_id)?;
+    let key = load_key(root, false)?;
+    let mut operation = read_operation(root, operation_id, &key)?
+        .context("rescan audit operation is unavailable")?;
+    ensure!(
+        operation.action == "rescan" && operation.state == AuditOperationState::Applying,
+        "rescan audit operation is not active"
+    );
+    ensure!(
+        operation.targets.iter().any(|target| target == module_id),
+        "module is not part of the authorized rescan"
+    );
+    if operation
+        .completed_targets
+        .iter()
+        .any(|target| target == module_id)
+    {
+        return verify_module_unlocked(root, module_id, true);
+    }
+    let already_recorded = verify_chain(root, module_id, &key, true)?
+        .events
+        .iter()
+        .any(|entry| match &entry.event.kind {
+            AuditEventKind::InstalledRescan {
+                operation_id: recorded,
+                ..
+            }
+            | AuditEventKind::InstalledRescanFailed {
+                operation_id: recorded,
+                ..
+            } => recorded == operation_id,
+            _ => false,
+        });
     let kind = match result {
         Ok(report) => {
             ensure!(
                 report.module_id.as_deref() == Some(module_id),
                 "installed module id does not match module.prop"
             );
-            AuditEventKind::InstalledRescan { report }
+            AuditEventKind::InstalledRescan {
+                operation_id: operation_id.to_owned(),
+                report,
+            }
         }
-        Err(error) => AuditEventKind::InstalledRescanFailed { error },
+        Err(error) => AuditEventKind::InstalledRescanFailed {
+            operation_id: operation_id.to_owned(),
+            error,
+        },
     };
-    append_event(root, module_id, kind)?;
+    if !already_recorded {
+        append_event(root, module_id, kind)?;
+    }
+    operation.completed_targets.push(module_id.to_owned());
+    operation.completed_targets.sort();
+    operation.updated_at_unix_seconds = now();
+    write_record(&operation_path(root, operation_id), operation, &key)?;
     verify_module_unlocked(root, module_id, true)
+}
+
+#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+pub fn finish_manager_audit_operation(root: &Path, operation_id: &str) -> Result<()> {
+    validate_sha256_hex(operation_id, "operation id")?;
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let mut operation =
+        read_operation(root, operation_id, &key)?.context("audit operation is unavailable")?;
+    if operation.state == AuditOperationState::Applied {
+        return Ok(());
+    }
+    ensure!(
+        operation.completed_targets == operation.targets,
+        "audit operation still has incomplete targets"
+    );
+    operation.state = AuditOperationState::Applied;
+    operation.updated_at_unix_seconds = now();
+    write_record(&operation_path(root, operation_id), operation, &key)
 }
 
 pub fn verify_module(root: &Path, module_id: &str, repair: bool) -> Result<ModuleAuditStatus> {
@@ -563,73 +754,111 @@ pub fn prune_stale_histories(
     root: &Path,
     installed_modules_root: &Path,
     pending_modules_root: &Path,
-    requested_module_id: Option<&str>,
+    operation_id: &str,
 ) -> Result<Vec<PrunedAuditHistory>> {
-    if !root.exists() || !root.join("modules").exists() {
-        return Ok(Vec::new());
-    }
-    if let Some(module_id) = requested_module_id {
-        validate_module_id(module_id)?;
-    }
+    validate_sha256_hex(operation_id, "operation id")?;
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
     verify_tombstones(root, &key)?;
-    let mut module_ids = audit_module_ids(&root.join("modules"))?;
-    if let Some(module_id) = requested_module_id {
-        ensure!(
-            module_ids.iter().any(|candidate| candidate == module_id),
-            "module audit history not found"
-        );
-        module_ids.retain(|candidate| candidate == module_id);
-    }
+    let mut operation = read_operation(root, operation_id, &key)?
+        .context("cleanup audit operation is unavailable")?;
+    ensure!(
+        operation.action == "prune" && operation.state == AuditOperationState::Applying,
+        "cleanup audit operation is not active"
+    );
 
     let mut pruned = Vec::new();
-    for module_id in module_ids {
-        if installed_module_exists(installed_modules_root, pending_modules_root, &module_id) {
-            ensure!(
-                requested_module_id.is_none(),
-                "cannot clear audit history for an installed module"
-            );
+    for module_id in operation.targets.clone() {
+        if operation.completed_targets.contains(&module_id) {
             continue;
         }
-        let status = verify_module_unlocked(root, &module_id, true)?;
-        let event_hashes = verify_chain(root, &module_id, &key, false)?
-            .events
-            .into_iter()
-            .map(|event| event.event_hash)
-            .collect();
-        // Recheck immediately before committing the authenticated tombstone to
-        // narrow the race with a concurrent module installation.
-        ensure!(
-            !installed_module_exists(installed_modules_root, pending_modules_root, &module_id),
-            "module was reinstalled while its audit history was being cleared"
-        );
-        let tombstone_path = new_tombstone_path(root, &module_id, &status.head_hash);
-        let tombstone = PrunedHistoryTombstone {
-            schema_version: SCHEMA_VERSION,
-            module_id: module_id.clone(),
-            cleared_at_unix_seconds: now(),
-            previous_event_count: status.event_count,
-            previous_head_hash: status.head_hash,
-            previous_event_hashes: event_hashes,
-            had_integrity_incident: status.high_risk,
-            reason: "user_cleanup".to_owned(),
+        validate_module_id(&module_id)?;
+        if installed_module_exists(installed_modules_root, pending_modules_root, &module_id) {
+            let error = "module was installed while its audit history was being cleared";
+            operation.state = AuditOperationState::Interrupted;
+            operation.error = Some(error.to_owned());
+            operation.updated_at_unix_seconds = now();
+            write_record(&operation_path(root, operation_id), operation, &key)?;
+            bail!(error);
+        }
+        let live = module_path(root, &module_id);
+        let trash = operation_trash_path(root, operation_id, &module_id);
+        let tombstone_path = operation_tombstone_path(root, &module_id, operation_id);
+        let tombstone = if tombstone_path.exists() {
+            let authenticated: AuthenticatedRecord<PrunedHistoryTombstone> =
+                read_json(&tombstone_path)?;
+            verify_record(&authenticated.record, &authenticated.hmac_sha256, &key)?;
+            ensure!(
+                authenticated.record.module_id == module_id
+                    && authenticated.record.reason == format!("user_cleanup:{operation_id}"),
+                "cleanup tombstone does not match its operation"
+            );
+            authenticated.record
+        } else {
+            ensure!(
+                live.exists(),
+                "module audit history is unavailable for cleanup"
+            );
+            let status = verify_module_unlocked(root, &module_id, true)?;
+            let event_hashes = verify_chain(root, &module_id, &key, false)?
+                .events
+                .into_iter()
+                .map(|event| event.event_hash)
+                .collect();
+            let tombstone = PrunedHistoryTombstone {
+                schema_version: SCHEMA_VERSION,
+                module_id: module_id.clone(),
+                cleared_at_unix_seconds: now(),
+                previous_event_count: status.event_count,
+                previous_head_hash: status.head_hash,
+                previous_event_hashes: event_hashes,
+                had_integrity_incident: status.high_risk,
+                reason: format!("user_cleanup:{operation_id}"),
+            };
+            write_record(&tombstone_path, tombstone.clone(), &key)?;
+            tombstone
         };
-        write_record(&tombstone_path, tombstone, &key)?;
 
-        std::fs::remove_dir_all(module_path(root, &module_id))
-            .with_context(|| format!("remove audit history for {module_id}"))?;
+        if installed_module_exists(installed_modules_root, pending_modules_root, &module_id) {
+            let error = "module was reinstalled while its audit history was being cleared";
+            operation.state = AuditOperationState::Interrupted;
+            operation.error = Some(error.to_owned());
+            operation.updated_at_unix_seconds = now();
+            write_record(&operation_path(root, operation_id), operation, &key)?;
+            bail!(error);
+        }
+        if live.exists() {
+            ensure!(!trash.exists(), "cleanup trash destination already exists");
+            ensure_dir(trash.parent().context("cleanup trash has no parent")?)?;
+            std::fs::rename(&live, &trash)
+                .with_context(|| format!("quarantine audit history for {module_id}"))?;
+            sync_dir(live.parent().context("audit history has no parent")?)?;
+            sync_dir(trash.parent().context("cleanup trash has no parent")?)?;
+        } else {
+            ensure!(
+                trash.exists(),
+                "cleaned audit history and its quarantine are missing"
+            );
+        }
         let risk = risk_path(root, &module_id);
         if risk.exists() {
-            std::fs::remove_file(&risk)
-                .with_context(|| format!("remove compacted risk record for {module_id}"))?;
+            let trash_risk = trash.join("risk.json");
+            ensure!(
+                !trash_risk.exists(),
+                "cleanup risk quarantine already exists"
+            );
+            std::fs::rename(&risk, &trash_risk)
+                .with_context(|| format!("quarantine risk record for {module_id}"))?;
             sync_dir(risk.parent().context("risk record has no parent")?)?;
         }
-        sync_dir(&root.join("modules"))?;
+        operation.completed_targets.push(module_id.clone());
+        operation.completed_targets.sort();
+        operation.updated_at_unix_seconds = now();
+        write_record(&operation_path(root, operation_id), operation.clone(), &key)?;
         pruned.push(PrunedAuditHistory {
             module_id,
-            removed_event_count: status.event_count,
-            retained_integrity_incident: status.high_risk,
+            removed_event_count: tombstone.previous_event_count,
+            retained_integrity_incident: tombstone.had_integrity_incident,
         });
     }
     Ok(pruned)
@@ -648,6 +877,97 @@ fn installed_module_exists(
 
 fn verify_tombstones(root: &Path, key: &[u8; 32]) -> Result<()> {
     verified_tombstones(root, key).map(|_| ())
+}
+
+fn verified_operations(root: &Path, key: &[u8; 32]) -> Result<Vec<CheckpointOperation>> {
+    let mut operations = read_operation_records(root, key)?
+        .into_iter()
+        .map(|operation| operation.checkpoint())
+        .collect::<Vec<_>>();
+    operations.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(operations)
+}
+
+fn read_operation_records(root: &Path, key: &[u8; 32]) -> Result<Vec<AuditOperationRecord>> {
+    let directory = root.join(OPERATIONS_DIR);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut operations = Vec::new();
+    for entry in std::fs::read_dir(&directory).context("read audit operation directory")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file()
+            || entry.path().extension().is_none()
+            || entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension != "json")
+        {
+            continue;
+        }
+        let authenticated: AuthenticatedRecord<AuditOperationRecord> = read_json(&entry.path())?;
+        verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+        validate_operation_record(&authenticated.record)?;
+        operations.push(authenticated.record);
+    }
+    operations.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(operations)
+}
+
+fn validate_operation_record(operation: &AuditOperationRecord) -> Result<()> {
+    ensure!(
+        operation.schema_version == SCHEMA_VERSION,
+        "unsupported audit operation schema"
+    );
+    validate_sha256_hex(&operation.operation_id, "operation id")?;
+    validate_sha256_hex(&operation.base_inventory_hash, "base inventory hash")?;
+    validate_sha256_hex(&operation.arguments_hash, "operation arguments hash")?;
+    ensure!(
+        !operation.authorization_hex.is_empty()
+            && operation.authorization_hex.len() <= 64 * 1024
+            && operation
+                .authorization_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "invalid audit operation authorization"
+    );
+    validate_authorization_field(&operation.action, "action")?;
+    ensure!(
+        operation
+            .completed_targets
+            .iter()
+            .all(|target| operation.targets.contains(target)),
+        "audit operation completed an unknown target"
+    );
+    ensure!(
+        operation
+            .completed_targets
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "audit operation completed targets are not canonical"
+    );
+    ensure!(
+        operation.targets.windows(2).all(|pair| pair[0] < pair[1]),
+        "audit operation targets are not canonical"
+    );
+    if operation.state == AuditOperationState::Applied {
+        ensure!(
+            operation.completed_targets == operation.targets,
+            "applied audit operation is incomplete"
+        );
+    }
+    ensure!(
+        (operation.state == AuditOperationState::Interrupted) == operation.error.is_some(),
+        "audit operation interruption state is inconsistent"
+    );
+    ensure!(
+        operation
+            .error
+            .as_ref()
+            .is_none_or(|error| !error.is_empty() && error.len() <= 4096),
+        "invalid audit operation error"
+    );
+    Ok(())
 }
 
 fn verified_tombstones(root: &Path, key: &[u8; 32]) -> Result<Vec<PrunedHistoryTombstone>> {
@@ -711,6 +1031,7 @@ pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
 
 fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
     let key = load_key(root, false)?;
+    recover_operation_progress(root, &key)?;
     let tombstones = verified_tombstones(root, &key)?
         .into_iter()
         .map(|tombstone| CheckpointTombstone {
@@ -747,10 +1068,17 @@ fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
     } else {
         Vec::new()
     };
+    let operations = verified_operations(root, &key)?;
     let hmac_key_id = hex(&Sha256::digest(key));
-    let next_hmac_key_id = next_hmac_key_id_for_checkpoint(root, &key, &modules, &tombstones)?;
-    let inventory_hash =
-        checkpoint_inventory_hash(&hmac_key_id, &next_hmac_key_id, &modules, &tombstones)?;
+    let next_hmac_key_id =
+        next_hmac_key_id_for_checkpoint(root, &key, &modules, &tombstones, &operations)?;
+    let inventory_hash = checkpoint_inventory_hash(
+        &hmac_key_id,
+        &next_hmac_key_id,
+        &modules,
+        &tombstones,
+        &operations,
+    )?;
     Ok(CheckpointPayload {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
         created_at_unix_seconds: now(),
@@ -759,7 +1087,104 @@ fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
         inventory_hash,
         modules,
         tombstones,
+        operations,
     })
+}
+
+fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
+    let directory = root.join(OPERATIONS_DIR);
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&directory).context("recover audit operations")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let authenticated: AuthenticatedRecord<AuditOperationRecord> = read_json(&entry.path())?;
+        verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+        let mut operation = authenticated.record;
+        validate_operation_record(&operation)?;
+        if operation.state != AuditOperationState::Applying {
+            continue;
+        }
+        let mut changed = false;
+        for target in &operation.targets {
+            if operation.completed_targets.contains(target) {
+                continue;
+            }
+            let completed = match operation.action.as_str() {
+                "rescan" => {
+                    operation_rescan_event_exists(root, target, &operation.operation_id, key)?
+                }
+                "prune" => {
+                    operation_trash_path(root, &operation.operation_id, target).exists()
+                        && operation_tombstone_path(root, target, &operation.operation_id).exists()
+                }
+                _ => false,
+            };
+            if completed {
+                operation.completed_targets.push(target.clone());
+                changed = true;
+            }
+        }
+        operation.completed_targets.sort();
+        if operation.completed_targets == operation.targets {
+            operation.state = AuditOperationState::Applied;
+            changed = true;
+        }
+        if changed {
+            operation.updated_at_unix_seconds = now();
+            write_record(&entry.path(), operation, key)?;
+        }
+    }
+    Ok(())
+}
+
+fn operation_rescan_event_exists(
+    root: &Path,
+    module_id: &str,
+    operation_id: &str,
+    key: &[u8; 32],
+) -> Result<bool> {
+    if !module_path(root, module_id).exists() {
+        return Ok(false);
+    }
+    Ok(verify_chain(root, module_id, key, true)?
+        .events
+        .iter()
+        .any(|entry| match &entry.event.kind {
+            AuditEventKind::InstalledRescan {
+                operation_id: recorded,
+                ..
+            }
+            | AuditEventKind::InstalledRescanFailed {
+                operation_id: recorded,
+                ..
+            } => recorded == operation_id,
+            _ => false,
+        }))
+}
+
+#[allow(dead_code)]
+pub fn active_manager_audit_operation_targets(
+    root: &Path,
+    action: &str,
+) -> Result<Option<Vec<String>>> {
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    recover_operation_progress(root, &key)?;
+    let active = read_operation_records(root, &key)?
+        .into_iter()
+        .filter(|operation| {
+            operation.state == AuditOperationState::Applying && operation.action == action
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        active.len() <= 1,
+        "multiple active audit operations require recovery"
+    );
+    Ok(active.into_iter().next().map(|operation| operation.targets))
 }
 
 fn next_hmac_key_id_for_checkpoint(
@@ -767,6 +1192,7 @@ fn next_hmac_key_id_for_checkpoint(
     key: &[u8; 32],
     modules: &[CheckpointModuleHead],
     tombstones: &[CheckpointTombstone],
+    operations: &[CheckpointOperation],
 ) -> Result<String> {
     let current_key_id = hmac_key_id(key);
     let registry = read_manager_auth_registry(root, key)?;
@@ -774,9 +1200,14 @@ fn next_hmac_key_id_for_checkpoint(
         Some(registry) => load_verified_manager_seal(root, &registry)?,
         None => None,
     };
-    let has_unsealed_state = seal.map_or(!modules.is_empty() || !tombstones.is_empty(), |seal| {
-        seal.payload.modules != modules || seal.payload.tombstones != tombstones
-    });
+    let has_unsealed_state = seal.map_or(
+        !modules.is_empty() || !tombstones.is_empty() || !operations.is_empty(),
+        |seal| {
+            seal.payload.modules != modules
+                || seal.payload.tombstones != tombstones
+                || seal.payload.operations != operations
+        },
+    );
     if has_unsealed_state {
         pending_hmac_key(root, key, true)?.next_key_id()
     } else {
@@ -789,6 +1220,7 @@ fn checkpoint_inventory_hash(
     next_hmac_key_id: &str,
     modules: &[CheckpointModuleHead],
     tombstones: &[CheckpointTombstone],
+    operations: &[CheckpointOperation],
 ) -> Result<String> {
     #[derive(Serialize)]
     struct Inventory<'a> {
@@ -797,6 +1229,7 @@ fn checkpoint_inventory_hash(
         next_hmac_key_id: &'a str,
         modules: &'a [CheckpointModuleHead],
         tombstones: &'a [CheckpointTombstone],
+        operations: &'a [CheckpointOperation],
     }
 
     let bytes = serde_json::to_vec(&Inventory {
@@ -805,6 +1238,7 @@ fn checkpoint_inventory_hash(
         next_hmac_key_id,
         modules,
         tombstones,
+        operations,
     })?;
     Ok(hex(&Sha256::digest(bytes)))
 }
@@ -825,6 +1259,9 @@ pub fn manager_audit_seal_status(root: &Path) -> Result<ManagerAuditSealStatus> 
         Some(registry) => load_verified_manager_seal(root, registry)?,
         None => None,
     };
+    if let Some(seal) = &seal {
+        finalize_sealed_operation_trash(root, &seal.payload)?;
+    }
     Ok(match seal {
         Some(seal) => ManagerAuditSealStatus {
             configured: true,
@@ -865,13 +1302,15 @@ pub fn commit_manager_audit_seal(
             && payload.hmac_key_id == current.hmac_key_id
             && payload.next_hmac_key_id == current.next_hmac_key_id
             && payload.modules == current.modules
-            && payload.tombstones == current.tombstones,
+            && payload.tombstones == current.tombstones
+            && payload.operations == current.operations,
         "Manager audit seal does not describe the current verified inventory"
     );
 
     if let Some(previous) = load_verified_manager_seal(root, &registry)? {
         if previous.seal_hash == seal_hash {
             complete_hmac_rotation(root, &key, &previous.payload, &previous.seal_hash)?;
+            finalize_sealed_operation_trash(root, &previous.payload)?;
             return Ok(ManagerAuditSealStatus {
                 configured: true,
                 generation: Some(previous.envelope.generation),
@@ -884,7 +1323,11 @@ pub fn commit_manager_audit_seal(
             envelope.generation == previous.envelope.generation.saturating_add(1),
             "Manager audit seal generation is not the next expected value"
         );
-        ensure_checkpoint_extends(&previous.payload, &payload)?;
+        ensure_checkpoint_extends(&previous.payload, &payload, &registry)?;
+    } else {
+        for operation in &payload.operations {
+            verify_checkpoint_operation_authorization(operation, &registry)?;
+        }
     }
 
     atomic_write_json(
@@ -895,6 +1338,7 @@ pub fn commit_manager_audit_seal(
         },
     )?;
     complete_hmac_rotation(root, &key, &payload, &seal_hash)?;
+    finalize_sealed_operation_trash(root, &payload)?;
     Ok(ManagerAuditSealStatus {
         configured: true,
         generation: Some(envelope.generation),
@@ -902,6 +1346,22 @@ pub fn commit_manager_audit_seal(
         inventory_hash: Some(payload.inventory_hash),
         key_id: Some(envelope.key_id),
     })
+}
+
+fn finalize_sealed_operation_trash(root: &Path, payload: &CheckpointPayload) -> Result<()> {
+    for operation in &payload.operations {
+        if operation.action != "prune" || operation.state == AuditOperationState::Applying {
+            continue;
+        }
+        let trash = root.join(OPERATION_TRASH_DIR).join(&operation.operation_id);
+        if trash.exists() {
+            std::fs::remove_dir_all(&trash).with_context(|| {
+                format!("finalize sealed audit cleanup {}", operation.operation_id)
+            })?;
+            sync_dir(trash.parent().context("operation trash has no parent")?)?;
+        }
+    }
+    Ok(())
 }
 
 fn load_verified_manager_seal(
@@ -994,12 +1454,16 @@ fn verify_manager_checkpoint_envelope(
     validate_sha256_hex(&payload.hmac_key_id, "HMAC key id")?;
     validate_sha256_hex(&payload.next_hmac_key_id, "next HMAC key id")?;
     validate_sha256_hex(&payload.inventory_hash, "inventory hash")?;
+    for operation in &payload.operations {
+        validate_checkpoint_operation(operation)?;
+    }
     ensure!(
         checkpoint_inventory_hash(
             &payload.hmac_key_id,
             &payload.next_hmac_key_id,
             &payload.modules,
             &payload.tombstones,
+            &payload.operations,
         )? == payload.inventory_hash,
         "Manager audit seal inventory hash mismatch"
     );
@@ -1026,10 +1490,52 @@ fn verify_manager_checkpoint_envelope(
     Ok(payload)
 }
 
+fn verify_checkpoint_operation_authorization(
+    operation: &CheckpointOperation,
+    registry: &ManagerAuditAuthRegistry,
+) -> Result<()> {
+    let token_bytes = decode_hex(&operation.authorization_hex)?;
+    ensure!(
+        hex(&Sha256::digest(&token_bytes)) == operation.operation_id,
+        "audit operation authorization hash mismatch"
+    );
+    let token: SignedAuditAuthorization = serde_json::from_slice(&token_bytes)
+        .context("parse checkpoint audit operation authorization")?;
+    ensure!(
+        token.schema_version == MANAGER_AUTH_SCHEMA_VERSION
+            && token.action == operation.action
+            && token.inventory_hash == operation.base_inventory_hash
+            && token.arguments_hash == operation.arguments_hash
+            && token.key_id == registry.key_id,
+        "checkpoint audit operation authorization mismatch"
+    );
+    validate_sha256_hex(&token.challenge_id, "challenge id")?;
+    let public_key = decode_hex(&registry.public_key_hex)?;
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(&public_key).context("invalid registered Manager key")?;
+    let signature = Signature::from_der(&decode_hex(&token.signature_der_hex)?)
+        .context("invalid checkpoint operation signature")?;
+    verifying_key
+        .verify(
+            audit_authorization_message(
+                &token.action,
+                &token.inventory_hash,
+                &token.arguments_hash,
+                &token.key_id,
+                &token.challenge_id,
+                token.created_at_unix_seconds,
+            )
+            .as_bytes(),
+            &signature,
+        )
+        .context("checkpoint audit operation authorization rejected")
+}
+
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 fn ensure_checkpoint_extends(
     previous: &CheckpointPayload,
     current: &CheckpointPayload,
+    registry: &ManagerAuditAuthRegistry,
 ) -> Result<()> {
     let same_hmac_key = previous.hmac_key_id == current.hmac_key_id;
     let authorized_hmac_rotation = previous.next_hmac_key_id == current.hmac_key_id;
@@ -1041,7 +1547,8 @@ fn ensure_checkpoint_extends(
         !same_hmac_key
             || previous.next_hmac_key_id == current.next_hmac_key_id
             || previous.modules != current.modules
-            || previous.tombstones != current.tombstones,
+            || previous.tombstones != current.tombstones
+            || previous.operations != current.operations,
         "pending HMAC key changed without completing its sealed rotation"
     );
     for old_tombstone in &previous.tombstones {
@@ -1084,6 +1591,136 @@ fn ensure_checkpoint_extends(
             old_module.module_id
         );
     }
+    for new_module in &current.modules {
+        if previous
+            .modules
+            .iter()
+            .any(|module| module.module_id == new_module.module_id)
+        {
+            continue;
+        }
+        ensure!(
+            !current.tombstones.iter().any(|tombstone| {
+                tombstone.module_id == new_module.module_id
+                    && new_module
+                        .event_hashes
+                        .starts_with(&tombstone.previous_event_hashes)
+            }),
+            "compacted audit history was replayed as an active module: {}",
+            new_module.module_id
+        );
+    }
+    for old_operation in &previous.operations {
+        let current_operation = current
+            .operations
+            .iter()
+            .find(|operation| operation.operation_id == old_operation.operation_id)
+            .with_context(|| {
+                format!(
+                    "Manager audit operation disappeared: {}",
+                    old_operation.operation_id
+                )
+            })?;
+        ensure_operation_extends(old_operation, current_operation)?;
+    }
+    for operation in &current.operations {
+        validate_checkpoint_operation(operation)?;
+        if !previous
+            .operations
+            .iter()
+            .any(|previous| previous.operation_id == operation.operation_id)
+        {
+            verify_checkpoint_operation_authorization(operation, registry)?;
+            ensure!(
+                operation.base_inventory_hash == previous.inventory_hash,
+                "new audit operation is not bound to the previous sealed inventory"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_operation(operation: &CheckpointOperation) -> Result<()> {
+    validate_sha256_hex(&operation.operation_id, "operation id")?;
+    validate_sha256_hex(
+        &operation.base_inventory_hash,
+        "operation base inventory hash",
+    )?;
+    validate_sha256_hex(&operation.arguments_hash, "operation arguments hash")?;
+    ensure!(
+        !operation.authorization_hex.is_empty()
+            && operation.authorization_hex.len() <= 64 * 1024
+            && operation
+                .authorization_hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "invalid checkpoint audit operation authorization"
+    );
+    ensure!(
+        matches!(operation.action.as_str(), "rescan" | "prune"),
+        "unsupported checkpoint audit operation"
+    );
+    ensure!(
+        operation.targets.windows(2).all(|pair| pair[0] < pair[1])
+            && operation
+                .completed_targets
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && operation
+                .completed_targets
+                .iter()
+                .all(|target| operation.targets.contains(target)),
+        "non-canonical checkpoint audit operation"
+    );
+    ensure!(
+        operation.state != AuditOperationState::Applied
+            || operation.completed_targets == operation.targets,
+        "applied checkpoint audit operation is incomplete"
+    );
+    ensure!(
+        (operation.state == AuditOperationState::Interrupted) == operation.error.is_some(),
+        "checkpoint audit operation interruption state is inconsistent"
+    );
+    ensure!(
+        operation
+            .error
+            .as_ref()
+            .is_none_or(|error| !error.is_empty() && error.len() <= 4096),
+        "invalid checkpoint audit operation error"
+    );
+    Ok(())
+}
+
+fn ensure_operation_extends(
+    previous: &CheckpointOperation,
+    current: &CheckpointOperation,
+) -> Result<()> {
+    ensure!(
+        previous.operation_id == current.operation_id
+            && previous.action == current.action
+            && previous.base_inventory_hash == current.base_inventory_hash
+            && previous.arguments_hash == current.arguments_hash
+            && previous.authorization_hex == current.authorization_hex
+            && previous.targets == current.targets,
+        "audit operation identity changed"
+    );
+    ensure!(
+        current
+            .completed_targets
+            .starts_with(&previous.completed_targets),
+        "audit operation progress was rolled back: {}",
+        previous.operation_id
+    );
+    ensure!(
+        previous.state == AuditOperationState::Applying || current.state == previous.state,
+        "terminal audit operation changed state: {}",
+        previous.operation_id
+    );
+    ensure!(
+        previous.state == AuditOperationState::Applying || current.error == previous.error,
+        "terminal audit operation error changed: {}",
+        previous.operation_id
+    );
     Ok(())
 }
 
@@ -1158,26 +1795,46 @@ pub fn manager_audit_auth_challenge(
 ) -> Result<ManagerAuditAuthChallenge> {
     validate_authorization_field(action, "action")?;
     validate_sha256_hex(arguments_hash, "arguments hash")?;
-    let status = manager_audit_auth_status(root)?;
-    let key_id = status
-        .key_id
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?
         .context("Manager audit authorization key is not configured")?;
-    Ok(ManagerAuditAuthChallenge {
+    let checkpoint = checkpoint_payload_unlocked(root)?;
+    clear_authorization_challenges(root)?;
+    let challenge_id = hex(&random_hmac_key()?);
+    let challenge = AuditAuthorizationChallenge {
         schema_version: MANAGER_AUTH_SCHEMA_VERSION,
         action: action.to_owned(),
-        inventory_hash: status.inventory_hash,
+        inventory_hash: checkpoint.inventory_hash,
         arguments_hash: arguments_hash.to_owned(),
-        key_id,
+        key_id: registry.key_id,
+        challenge_id,
+        created_at_unix_seconds: now(),
+    };
+    write_record(
+        &challenge_path(root, &challenge.challenge_id),
+        challenge.clone(),
+        &key,
+    )?;
+    Ok(ManagerAuditAuthChallenge {
+        schema_version: challenge.schema_version,
+        action: challenge.action,
+        inventory_hash: challenge.inventory_hash,
+        arguments_hash: challenge.arguments_hash,
+        key_id: challenge.key_id,
+        challenge_id: challenge.challenge_id,
+        created_at_unix_seconds: challenge.created_at_unix_seconds,
     })
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-pub fn verify_manager_audit_authorization(
+pub fn begin_manager_audit_operation(
     root: &Path,
     encoded_authorization: &str,
     expected_action: &str,
     expected_arguments_hash: &str,
-) -> Result<()> {
+    expected_targets: &[String],
+) -> Result<AuthorizedAuditOperation> {
     let token_bytes = decode_hex(encoded_authorization)?;
     let token: SignedAuditAuthorization =
         serde_json::from_slice(&token_bytes).context("parse Manager audit authorization")?;
@@ -1195,20 +1852,65 @@ pub fn verify_manager_audit_authorization(
     );
     validate_sha256_hex(&token.inventory_hash, "inventory hash")?;
     validate_sha256_hex(&token.arguments_hash, "arguments hash")?;
+    validate_sha256_hex(&token.challenge_id, "challenge id")?;
+    validate_sha256_hex(&token.key_id, "Manager key id")?;
     ensure!(
-        token.nonce_hex.len() == 64 && token.nonce_hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
-        "invalid audit authorization nonce"
+        expected_targets.windows(2).all(|pair| pair[0] < pair[1]),
+        "audit operation targets are not canonical"
     );
-
-    let checkpoint = checkpoint_payload(root)?;
-    ensure!(
-        token.inventory_hash == checkpoint.inventory_hash,
-        "audit inventory changed after authorization"
-    );
+    let operation_id = hex(&Sha256::digest(&token_bytes));
     let _lock = AuditLock::acquire(root, false)?;
     let hmac_key = load_key(root, false)?;
     let registry = read_manager_auth_registry(root, &hmac_key)?
         .context("Manager audit authorization key is not configured")?;
+    ensure!(
+        token.key_id == registry.key_id,
+        "Manager authorization key mismatch"
+    );
+
+    if let Some(operation) = read_operation(root, &operation_id, &hmac_key)? {
+        ensure_operation_matches(
+            &operation,
+            &operation_id,
+            expected_action,
+            expected_arguments_hash,
+            expected_targets,
+        )?;
+        ensure!(
+            operation.state != AuditOperationState::Interrupted,
+            "audit operation was interrupted: {}",
+            operation.error.as_deref().unwrap_or("unknown failure")
+        );
+        remove_challenge_if_present(root, &token.challenge_id)?;
+        return Ok(authorized_operation(&operation));
+    }
+
+    let challenge: AuthenticatedRecord<AuditAuthorizationChallenge> =
+        read_json(&challenge_path(root, &token.challenge_id))
+            .context("audit authorization challenge is unavailable or already consumed")?;
+    verify_record(&challenge.record, &challenge.hmac_sha256, &hmac_key)?;
+    let challenge_age = now()
+        .checked_sub(challenge.record.created_at_unix_seconds)
+        .context("audit authorization challenge is from the future")?;
+    ensure!(
+        challenge_age <= AUTH_CHALLENGE_TTL_SECONDS,
+        "audit authorization challenge expired"
+    );
+    ensure!(
+        challenge.record.schema_version == MANAGER_AUTH_SCHEMA_VERSION
+            && challenge.record.action == token.action
+            && challenge.record.inventory_hash == token.inventory_hash
+            && challenge.record.arguments_hash == token.arguments_hash
+            && challenge.record.key_id == token.key_id
+            && challenge.record.challenge_id == token.challenge_id
+            && challenge.record.created_at_unix_seconds == token.created_at_unix_seconds,
+        "audit authorization does not match its ksud challenge"
+    );
+    let checkpoint = checkpoint_payload_unlocked(root)?;
+    ensure!(
+        token.inventory_hash == checkpoint.inventory_hash,
+        "audit inventory changed after authorization"
+    );
     let public_key = decode_hex(&registry.public_key_hex)?;
     let verifying_key =
         VerifyingKey::from_sec1_bytes(&public_key).context("invalid registered Manager key")?;
@@ -1218,11 +1920,147 @@ pub fn verify_manager_audit_authorization(
         &token.action,
         &token.inventory_hash,
         &token.arguments_hash,
-        &token.nonce_hex,
+        &token.key_id,
+        &token.challenge_id,
+        token.created_at_unix_seconds,
     );
     verifying_key
         .verify(message.as_bytes(), &signature)
-        .context("Manager audit authorization signature rejected")
+        .context("Manager audit authorization signature rejected")?;
+
+    if let Some(operation) = find_resumable_operation(
+        root,
+        &hmac_key,
+        expected_action,
+        expected_arguments_hash,
+        expected_targets,
+    )? {
+        remove_challenge_if_present(root, &token.challenge_id)?;
+        return Ok(authorized_operation(&operation));
+    }
+    ensure!(
+        !read_operation_records(root, &hmac_key)?
+            .iter()
+            .any(|operation| operation.state == AuditOperationState::Applying),
+        "another audit mutation is still active"
+    );
+
+    let operation = AuditOperationRecord {
+        schema_version: SCHEMA_VERSION,
+        operation_id,
+        action: expected_action.to_owned(),
+        base_inventory_hash: token.inventory_hash,
+        arguments_hash: expected_arguments_hash.to_owned(),
+        authorization_hex: encoded_authorization.to_owned(),
+        targets: expected_targets.to_vec(),
+        completed_targets: Vec::new(),
+        state: AuditOperationState::Applying,
+        error: None,
+        started_at_unix_seconds: now(),
+        updated_at_unix_seconds: now(),
+    };
+    validate_operation_record(&operation)?;
+    write_record(
+        &operation_path(root, &operation.operation_id),
+        operation.clone(),
+        &hmac_key,
+    )?;
+    remove_challenge_if_present(root, &token.challenge_id)?;
+    Ok(authorized_operation(&operation))
+}
+
+fn ensure_operation_matches(
+    operation: &AuditOperationRecord,
+    operation_id: &str,
+    action: &str,
+    arguments_hash: &str,
+    targets: &[String],
+) -> Result<()> {
+    ensure!(
+        operation.operation_id == operation_id
+            && hex(&Sha256::digest(decode_hex(&operation.authorization_hex)?)) == operation_id
+            && operation.action == action
+            && operation.arguments_hash == arguments_hash
+            && operation.targets == targets,
+        "replayed authorization does not match its original audit operation"
+    );
+    Ok(())
+}
+
+fn authorized_operation(operation: &AuditOperationRecord) -> AuthorizedAuditOperation {
+    AuthorizedAuditOperation {
+        operation_id: operation.operation_id.clone(),
+        completed_targets: operation.completed_targets.clone(),
+        applied: operation.state == AuditOperationState::Applied,
+    }
+}
+
+fn find_resumable_operation(
+    root: &Path,
+    key: &[u8; 32],
+    action: &str,
+    arguments_hash: &str,
+    targets: &[String],
+) -> Result<Option<AuditOperationRecord>> {
+    let directory = root.join(OPERATIONS_DIR);
+    if !directory.exists() {
+        return Ok(None);
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let authenticated: AuthenticatedRecord<AuditOperationRecord> = read_json(&entry.path())?;
+        verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+        validate_operation_record(&authenticated.record)?;
+        if authenticated.record.state == AuditOperationState::Applying
+            && authenticated.record.action == action
+            && authenticated.record.arguments_hash == arguments_hash
+            && authenticated.record.targets == targets
+        {
+            return Ok(Some(authenticated.record));
+        }
+    }
+    Ok(None)
+}
+
+fn read_operation(
+    root: &Path,
+    operation_id: &str,
+    key: &[u8; 32],
+) -> Result<Option<AuditOperationRecord>> {
+    let path = operation_path(root, operation_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let authenticated: AuthenticatedRecord<AuditOperationRecord> = read_json(&path)?;
+    verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+    validate_operation_record(&authenticated.record)?;
+    Ok(Some(authenticated.record))
+}
+
+fn remove_challenge_if_present(root: &Path, challenge_id: &str) -> Result<()> {
+    let path = challenge_path(root, challenge_id);
+    if path.exists() {
+        std::fs::remove_file(&path).context("consume audit authorization challenge")?;
+        sync_dir(path.parent().context("challenge has no parent")?)?;
+    }
+    Ok(())
+}
+
+fn clear_authorization_challenges(root: &Path) -> Result<()> {
+    let directory = root.join(CHALLENGES_DIR);
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&directory).context("read audit authorization challenges")? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::remove_file(entry.path()).context("invalidate old audit challenge")?;
+        }
+    }
+    sync_dir(&directory)
 }
 
 fn read_manager_auth_registry(
@@ -1279,10 +2117,12 @@ fn audit_authorization_message(
     action: &str,
     inventory_hash: &str,
     arguments_hash: &str,
-    nonce_hex: &str,
+    key_id: &str,
+    challenge_id: &str,
+    created_at_unix_seconds: u64,
 ) -> String {
     format!(
-        "kernelsu-audit-authorization-v1\n{action}\n{inventory_hash}\n{arguments_hash}\n{nonce_hex}\n"
+        "kernelsu-audit-authorization-v2\n{action}\n{inventory_hash}\n{arguments_hash}\n{key_id}\n{challenge_id}\n{created_at_unix_seconds}\n"
     )
 }
 
@@ -1404,6 +2244,28 @@ fn manager_auth_path(root: &Path) -> PathBuf {
 
 fn manager_seal_path(root: &Path) -> PathBuf {
     root.join(MANAGER_SEAL_FILE)
+}
+
+fn challenge_path(root: &Path, challenge_id: &str) -> PathBuf {
+    root.join(CHALLENGES_DIR)
+        .join(format!("{challenge_id}.json"))
+}
+
+fn operation_path(root: &Path, operation_id: &str) -> PathBuf {
+    root.join(OPERATIONS_DIR)
+        .join(format!("{operation_id}.json"))
+}
+
+fn operation_trash_path(root: &Path, operation_id: &str, module_id: &str) -> PathBuf {
+    root.join(OPERATION_TRASH_DIR)
+        .join(operation_id)
+        .join(module_dir_name(module_id))
+}
+
+fn operation_tombstone_path(root: &Path, module_id: &str, operation_id: &str) -> PathBuf {
+    root.join("tombstones")
+        .join(module_dir_name(module_id))
+        .join(format!("operation-{operation_id}.json"))
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
@@ -1993,6 +2855,16 @@ fn reauthenticate_audit_metadata(root: &Path, previous: &[u8; 32], next: &[u8; 3
         &root.join("tombstones"),
         previous,
         next,
+    )?;
+    rewrite_authenticated_directory::<AuditOperationRecord>(
+        &root.join(OPERATIONS_DIR),
+        previous,
+        next,
+    )?;
+    rewrite_authenticated_directory::<AuditAuthorizationChallenge>(
+        &root.join(CHALLENGES_DIR),
+        previous,
+        next,
     )
 }
 
@@ -2108,13 +2980,6 @@ fn event_path(root: &Path, module_id: &str, sequence: u64) -> PathBuf {
 fn risk_path(root: &Path, module_id: &str) -> PathBuf {
     root.join("risk")
         .join(format!("{}.json", module_dir_name(module_id)))
-}
-
-#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-fn new_tombstone_path(root: &Path, module_id: &str, previous_head_hash: &str) -> PathBuf {
-    root.join("tombstones")
-        .join(module_dir_name(module_id))
-        .join(format!("{}-{previous_head_hash}.json", now()))
 }
 
 fn head_path(root: &Path, module_id: &str) -> PathBuf {
@@ -2234,12 +3099,13 @@ mod tests {
         arguments_hash: &str,
     ) -> String {
         let challenge = manager_audit_auth_challenge(root, action, arguments_hash).unwrap();
-        let nonce_hex = "42".repeat(32);
         let message = audit_authorization_message(
             action,
             &challenge.inventory_hash,
             arguments_hash,
-            &nonce_hex,
+            &challenge.key_id,
+            &challenge.challenge_id,
+            challenge.created_at_unix_seconds,
         );
         let signature: Signature = signing_key.sign(message.as_bytes());
         let token = SignedAuditAuthorization {
@@ -2247,10 +3113,30 @@ mod tests {
             action: action.to_owned(),
             inventory_hash: challenge.inventory_hash,
             arguments_hash: arguments_hash.to_owned(),
-            nonce_hex,
+            key_id: challenge.key_id,
+            challenge_id: challenge.challenge_id,
+            created_at_unix_seconds: challenge.created_at_unix_seconds,
             signature_der_hex: hex(signature.to_der().as_bytes()),
         };
         hex(&serde_json::to_vec(&token).unwrap())
+    }
+
+    fn begin_test_operation(
+        root: &Path,
+        action: &str,
+        targets: &[&str],
+    ) -> AuthorizedAuditOperation {
+        let manager = signing_key(29);
+        register_manager_audit_auth_key(root, &public_key_hex(&manager), false).unwrap();
+        let targets = targets
+            .iter()
+            .map(|target| (*target).to_owned())
+            .collect::<Vec<_>>();
+        let arguments_hash = hex(&Sha256::digest(
+            serde_json::to_vec(&(action, &targets)).unwrap(),
+        ));
+        let token = authorization_token(root, &manager, action, &arguments_hash);
+        begin_manager_audit_operation(root, &token, action, &arguments_hash, &targets).unwrap()
     }
 
     fn checkpoint_envelope(root: &Path, signing_key: &SigningKey, generation: u64) -> String {
@@ -2422,7 +3308,15 @@ mod tests {
         record(&audit_root, "module.beta", "ab");
         record(&audit_root, "module.alpha", "cd");
 
-        prune_stale_histories(&audit_root, &installed_root, &pending_root, None).unwrap();
+        let operation = begin_test_operation(&audit_root, "prune", &["module.beta"]);
+        prune_stale_histories(
+            &audit_root,
+            &installed_root,
+            &pending_root,
+            &operation.operation_id,
+        )
+        .unwrap();
+        finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
 
         let payload = checkpoint_payload(&audit_root).unwrap();
         assert_eq!(payload.modules.len(), 1);
@@ -2466,21 +3360,141 @@ mod tests {
 
         let arguments_hash = "ab".repeat(32);
         let token = authorization_token(temp.path(), &key, "rescan", &arguments_hash);
-        verify_manager_audit_authorization(temp.path(), &token, "rescan", &arguments_hash).unwrap();
+        let targets = vec!["test.module".to_owned()];
+        let operation =
+            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
+                .unwrap();
         assert!(
-            verify_manager_audit_authorization(temp.path(), &token, "prune", &arguments_hash,)
+            begin_manager_audit_operation(temp.path(), &token, "prune", &arguments_hash, &targets,)
                 .is_err()
         );
         assert!(
-            verify_manager_audit_authorization(temp.path(), &token, "rescan", &"cd".repeat(32),)
-                .is_err()
+            begin_manager_audit_operation(
+                temp.path(),
+                &token,
+                "rescan",
+                &"cd".repeat(32),
+                &targets,
+            )
+            .is_err()
         );
 
+        let replay =
+            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
+                .unwrap();
+        assert_eq!(replay.operation_id, operation.operation_id);
+
+        let stale_token = authorization_token(temp.path(), &key, "rescan", &arguments_hash);
         record(temp.path(), "test.module", "cd");
-        let error =
-            verify_manager_audit_authorization(temp.path(), &token, "rescan", &arguments_hash)
-                .unwrap_err();
+        let error = begin_manager_audit_operation(
+            temp.path(),
+            &stale_token,
+            "rescan",
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("inventory changed"));
+    }
+
+    #[test]
+    fn consumed_authorization_cannot_be_replayed_after_operation_loss() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        let targets = vec!["test.module".to_owned()];
+        let arguments_hash = "ab".repeat(32);
+        let token = authorization_token(temp.path(), &manager, "rescan", &arguments_hash);
+        let operation =
+            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
+                .unwrap();
+        std::fs::remove_file(operation_path(temp.path(), &operation.operation_id)).unwrap();
+
+        let error =
+            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
+                .unwrap_err();
+        assert!(error.to_string().contains("already consumed"));
+    }
+
+    #[test]
+    fn newer_challenge_invalidates_an_unconsumed_authorization() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        let targets = vec!["test.module".to_owned()];
+        let arguments_hash = "ab".repeat(32);
+        let stale = authorization_token(temp.path(), &manager, "rescan", &arguments_hash);
+        let current = authorization_token(temp.path(), &manager, "rescan", &arguments_hash);
+
+        assert!(
+            begin_manager_audit_operation(
+                temp.path(),
+                &stale,
+                "rescan",
+                &arguments_hash,
+                &targets,
+            )
+            .is_err()
+        );
+        begin_manager_audit_operation(temp.path(), &current, "rescan", &arguments_hash, &targets)
+            .unwrap();
+    }
+
+    #[test]
+    fn rescan_operation_recovers_event_written_before_progress() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let operation = begin_test_operation(temp.path(), "rescan", &["test.module"]);
+        append_event(
+            temp.path(),
+            "test.module",
+            AuditEventKind::InstalledRescan {
+                operation_id: operation.operation_id.clone(),
+                report: report("test.module", "cd"),
+            },
+        )
+        .unwrap();
+
+        let payload = checkpoint_payload(temp.path()).unwrap();
+        let recovered = payload
+            .operations
+            .iter()
+            .find(|candidate| candidate.operation_id == operation.operation_id)
+            .unwrap();
+        assert_eq!(recovered.state, AuditOperationState::Applied);
+        assert_eq!(recovered.completed_targets, vec!["test.module"]);
+        assert_eq!(
+            read_module_history(temp.path(), "test.module", false)
+                .unwrap()
+                .events
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn interrupted_install_is_closed_once_without_rerunning_scripts() {
+        let temp = TempDir::new().unwrap();
+        begin_install(temp.path(), report("test.module", "ab")).unwrap();
+
+        assert_eq!(
+            recover_interrupted_installs(temp.path()).unwrap(),
+            vec!["test.module"]
+        );
+        assert!(
+            recover_interrupted_installs(temp.path())
+                .unwrap()
+                .is_empty()
+        );
+        let history = read_module_history(temp.path(), "test.module", false).unwrap();
+        assert_eq!(history.events.len(), 2);
+        let AuditEventKind::InstallResult { outcome, error, .. } = &history.events[1].kind else {
+            panic!("expected interrupted install result");
+        };
+        assert_eq!(*outcome, InstallOutcome::InstallationFailed);
+        assert!(error.as_deref().unwrap().contains("interrupted"));
     }
 
     #[test]
@@ -2535,6 +3549,35 @@ mod tests {
         assert_eq!(second_status.generation, Some(2));
 
         assert!(commit_manager_audit_seal(temp.path(), &first).is_err());
+    }
+
+    #[test]
+    fn sealed_operation_receipt_cannot_disappear() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        let targets = vec!["test.module".to_owned()];
+        let arguments_hash = "ab".repeat(32);
+        let token = authorization_token(temp.path(), &manager, "rescan", &arguments_hash);
+        let operation =
+            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
+                .unwrap();
+        record_installed_rescan(
+            temp.path(),
+            &operation.operation_id,
+            "test.module",
+            Ok(report("test.module", "cd")),
+        )
+        .unwrap();
+        finish_manager_audit_operation(temp.path(), &operation.operation_id).unwrap();
+        let first = checkpoint_envelope(temp.path(), &manager, 1);
+        commit_manager_audit_seal(temp.path(), &first).unwrap();
+
+        std::fs::remove_file(operation_path(temp.path(), &operation.operation_id)).unwrap();
+        let replay = checkpoint_envelope(temp.path(), &manager, 2);
+        let error = commit_manager_audit_seal(temp.path(), &replay).unwrap_err();
+        assert!(error.to_string().contains("operation disappeared"));
     }
 
     #[test]
@@ -2605,23 +3648,26 @@ mod tests {
         );
 
         let arguments_hash = "ef".repeat(32);
+        let targets = vec!["test.module".to_owned()];
         let stale_token = authorization_token(temp.path(), &first, "rescan", &arguments_hash);
         assert!(
-            verify_manager_audit_authorization(
+            begin_manager_audit_operation(
                 temp.path(),
                 &stale_token,
                 "rescan",
                 &arguments_hash,
+                &targets,
             )
             .is_err()
         );
         let replacement_token =
             authorization_token(temp.path(), &replacement, "rescan", &arguments_hash);
-        verify_manager_audit_authorization(
+        begin_manager_audit_operation(
             temp.path(),
             &replacement_token,
             "rescan",
             &arguments_hash,
+            &targets,
         )
         .unwrap();
     }
@@ -2653,17 +3699,26 @@ mod tests {
     #[test]
     fn installed_rescans_are_appended_to_the_authenticated_history() {
         let temp = TempDir::new().unwrap();
-        let status =
-            record_installed_rescan(temp.path(), "test.module", Ok(report("test.module", "ab")))
-                .unwrap();
-        assert_eq!(status.event_count, 1);
-
+        let first = begin_test_operation(temp.path(), "rescan", &["test.module"]);
         let status = record_installed_rescan(
             temp.path(),
+            &first.operation_id,
+            "test.module",
+            Ok(report("test.module", "ab")),
+        )
+        .unwrap();
+        assert_eq!(status.event_count, 1);
+        finish_manager_audit_operation(temp.path(), &first.operation_id).unwrap();
+
+        let second = begin_test_operation(temp.path(), "rescan", &["test.module"]);
+        let status = record_installed_rescan(
+            temp.path(),
+            &second.operation_id,
             "test.module",
             Err("unable to read service.sh".to_owned()),
         )
         .unwrap();
+        finish_manager_audit_operation(temp.path(), &second.operation_id).unwrap();
         assert_eq!(status.event_count, 2);
         let history = read_module_history(temp.path(), "test.module", false).unwrap();
         assert!(matches!(
@@ -2735,13 +3790,15 @@ mod tests {
         assert_eq!(stale[0].module_id, "stale.module");
         assert_eq!(stale[0].event_count, 2);
 
+        let operation = begin_test_operation(&audit_root, "prune", &["stale.module"]);
         let pruned = prune_stale_histories(
             &audit_root,
             &installed_root,
             &pending_root,
-            Some("stale.module"),
+            &operation.operation_id,
         )
         .unwrap();
+        finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0].removed_event_count, 2);
         assert!(!module_path(&audit_root, "stale.module").exists());
@@ -2760,10 +3817,67 @@ mod tests {
         verify_record(&tombstone.record, &tombstone.hmac_sha256, &key).unwrap();
         assert_eq!(tombstone.record.module_id, "stale.module");
         assert_eq!(tombstone.record.previous_event_count, 2);
-        assert_eq!(tombstone.record.reason, "user_cleanup");
+        assert_eq!(
+            tombstone.record.reason,
+            format!("user_cleanup:{}", operation.operation_id)
+        );
 
         std::fs::write(&tombstone_path, b"corrupt").unwrap();
         assert!(list_histories(&audit_root, false).is_err());
+    }
+
+    #[test]
+    fn prune_operation_recovers_quarantine_written_before_progress() {
+        let temp = TempDir::new().unwrap();
+        let audit_root = temp.path().join("audit");
+        let installed_root = temp.path().join("modules");
+        let pending_root = temp.path().join("modules_update");
+        std::fs::create_dir(&installed_root).unwrap();
+        record(&audit_root, "stale.module", "ab");
+        let operation = begin_test_operation(&audit_root, "prune", &["stale.module"]);
+        prune_stale_histories(
+            &audit_root,
+            &installed_root,
+            &pending_root,
+            &operation.operation_id,
+        )
+        .unwrap();
+
+        let key = load_key(&audit_root, false).unwrap();
+        let mut interrupted = read_operation(&audit_root, &operation.operation_id, &key)
+            .unwrap()
+            .unwrap();
+        interrupted.completed_targets.clear();
+        interrupted.state = AuditOperationState::Applying;
+        interrupted.updated_at_unix_seconds = interrupted.started_at_unix_seconds;
+        write_record(
+            &operation_path(&audit_root, &operation.operation_id),
+            interrupted,
+            &key,
+        )
+        .unwrap();
+
+        let payload = checkpoint_payload(&audit_root).unwrap();
+        let recovered = payload
+            .operations
+            .iter()
+            .find(|candidate| candidate.operation_id == operation.operation_id)
+            .unwrap();
+        assert_eq!(recovered.state, AuditOperationState::Applied);
+        assert_eq!(recovered.completed_targets, vec!["stale.module"]);
+        let trash = audit_root
+            .join(OPERATION_TRASH_DIR)
+            .join(&operation.operation_id);
+        assert!(trash.exists());
+        let manager = signing_key(29);
+        let envelope = checkpoint_envelope(&audit_root, &manager, 1);
+        commit_manager_audit_seal(&audit_root, &envelope).unwrap();
+        assert!(!trash.exists());
+
+        std::fs::create_dir_all(&trash).unwrap();
+        std::fs::write(trash.join("leftover"), b"test").unwrap();
+        manager_audit_seal_status(&audit_root).unwrap();
+        assert!(!trash.exists());
     }
 
     #[test]
@@ -2782,35 +3896,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let operation = begin_test_operation(&audit_root, "prune", &["active.module"]);
         let error = prune_stale_histories(
             &audit_root,
             &installed_root,
             &pending_root,
-            Some("active.module"),
+            &operation.operation_id,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("installed module"));
+        assert!(
+            error.to_string().contains("installed"),
+            "unexpected error: {error:#}"
+        );
         assert!(module_path(&audit_root, "active.module").exists());
 
+        let pending_audit_root = temp.path().join("pending-audit");
         let pending_module = pending_root.join("pending.module");
         std::fs::create_dir_all(&pending_module).unwrap();
         std::fs::write(pending_module.join("module.prop"), b"id=pending.module\n").unwrap();
-        record(&audit_root, "pending.module", "cd");
+        record(&pending_audit_root, "pending.module", "cd");
 
         assert!(
-            list_stale_histories(&audit_root, &installed_root, &pending_root)
+            list_stale_histories(&pending_audit_root, &installed_root, &pending_root)
                 .unwrap()
                 .is_empty()
         );
+        let operation = begin_test_operation(&pending_audit_root, "prune", &["pending.module"]);
         let error = prune_stale_histories(
-            &audit_root,
+            &pending_audit_root,
             &installed_root,
             &pending_root,
-            Some("pending.module"),
+            &operation.operation_id,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("installed module"));
-        assert!(module_path(&audit_root, "pending.module").exists());
+        assert!(error.to_string().contains("installed"));
+        assert!(module_path(&pending_audit_root, "pending.module").exists());
     }
 
     #[test]
@@ -2823,11 +3943,12 @@ mod tests {
         record(&audit_root, "risky.module", "ab");
         std::fs::write(event_path(&audit_root, "risky.module", 1), b"corrupt").unwrap();
 
+        let operation = begin_test_operation(&audit_root, "prune", &["risky.module"]);
         let pruned = prune_stale_histories(
             &audit_root,
             &installed_root,
             &pending_root,
-            Some("risky.module"),
+            &operation.operation_id,
         )
         .unwrap();
         assert!(pruned[0].retained_integrity_incident);

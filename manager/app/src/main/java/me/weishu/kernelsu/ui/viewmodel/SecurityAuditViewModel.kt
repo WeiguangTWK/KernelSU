@@ -62,12 +62,21 @@ class SecurityAuditViewModel : ViewModel() {
             runCatching {
                 val checkpointResult = runCatching { getModuleAuditCheckpoint() }
                 val rawHistoryResult = runCatching { getModuleAuditHistories() }
+                val sealedEnvelopeHash = runCatching {
+                    JSONObject(getModuleAuditSealStatus())
+                        .optString("seal_hash")
+                        .takeIf(String::isNotBlank)
+                }.getOrNull()
                 val historyResult = rawHistoryResult.mapCatching(::parseAuditHistories)
                 checkpointResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
                 historyResult.exceptionOrNull()?.let { if (it is CancellationException) throw it }
                 var checkpoint = checkpointResult.fold(
                     onSuccess = { payload ->
-                        checkpointStore.reconcile(payload, rawHistoryResult.getOrNull())
+                        checkpointStore.reconcile(
+                            payload,
+                            rawHistoryResult.getOrNull(),
+                            sealedEnvelopeHash,
+                        )
                     },
                     onFailure = { error ->
                         checkpointStore.checkpointUnavailable(
@@ -216,7 +225,10 @@ class SecurityAuditViewModel : ViewModel() {
         val sealedHash = status.optString("seal_hash").takeIf(String::isNotBlank)
         val currentHash = checkpointStore.currentSealHash()
         val previousHash = checkpointStore.acceptablePreviousSealHash()
-        if (!requiresAuditSealCommit(configured, sealedHash, currentHash, previousHash)) return true
+        if (!requiresAuditSealCommit(configured, sealedHash, currentHash, previousHash)) {
+            checkpointStore.markSealSynchronized(currentHash)
+            return true
+        }
 
         val committed = JSONObject(
             commitModuleAuditSeal(checkpointStore.currentSealEnvelopeHex())
@@ -227,6 +239,7 @@ class SecurityAuditViewModel : ViewModel() {
         check(committed.optString("seal_hash") == currentHash) {
             "ksud persisted an unexpected Manager audit seal"
         }
+        checkpointStore.markSealSynchronized(currentHash)
         return true
     }
 

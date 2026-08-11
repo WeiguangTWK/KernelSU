@@ -1009,42 +1009,30 @@ struct InstalledAuditScanResult {
 }
 
 pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
-    let arguments_hash = audit_rescan_arguments_hash()?;
-    module_audit_log::verify_manager_audit_authorization(
+    let targets = audit_rescan_targets()?;
+    let arguments_hash = audit_operation_arguments_hash("rescan", &targets)?;
+    let operation = module_audit_log::begin_manager_audit_operation(
         Path::new(defs::MODULE_AUDIT_DIR),
         authorization,
         "rescan",
         &arguments_hash,
+        &targets,
     )?;
     let modules_root = Path::new(defs::MODULE_DIR);
-    let mut entries = match std::fs::read_dir(modules_root) {
-        Ok(entries) => entries.flatten().collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error).context("read installed module directory"),
-    };
-    entries.sort_by_key(std::fs::DirEntry::file_name);
     let mut results = Vec::new();
-    for entry in entries {
-        if !entry.file_type()?.is_dir() || !entry.path().join("module.prop").is_file() {
-            continue;
-        }
-        let Some(module_id) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if let Err(error) = validate_module_id(&module_id) {
-            results.push(InstalledAuditScanResult {
-                module_id,
-                success: false,
-                finding_count: 0,
-                error: Some(format!("{error:#}")),
-            });
+    for module_id in &targets {
+        if operation
+            .completed_targets
+            .iter()
+            .any(|completed| completed == module_id)
+        {
             continue;
         }
         if !json {
             println!("- Auditing installed module {module_id}");
         }
         let scan = ksu_module_audit::scan_directory_path(
-            entry.path(),
+            modules_root.join(module_id),
             &ksu_module_audit::AuditConfig::default(),
         );
         let (finding_count, record) = match scan {
@@ -1060,19 +1048,24 @@ pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
         let record_error = record.as_ref().err().cloned();
         let persisted = module_audit_log::record_installed_rescan(
             Path::new(defs::MODULE_AUDIT_DIR),
-            &module_id,
+            &operation.operation_id,
+            module_id,
             record,
         );
         let error = persisted.err().map_or(record_error, |error| {
             Some(format!("failed to persist rescan: {error:#}"))
         });
         results.push(InstalledAuditScanResult {
-            module_id,
+            module_id: module_id.clone(),
             success: error.is_none(),
             finding_count,
             error,
         });
     }
+    module_audit_log::finish_manager_audit_operation(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        &operation.operation_id,
+    )?;
     if json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else {
@@ -1116,19 +1109,26 @@ pub fn prune_module_audit_histories(
             }
         }
     } else {
-        let arguments_hash = audit_prune_arguments_hash(module_id)?;
-        module_audit_log::verify_manager_audit_authorization(
+        let targets = audit_prune_targets(module_id)?;
+        let arguments_hash = audit_operation_arguments_hash("prune", &targets)?;
+        let operation = module_audit_log::begin_manager_audit_operation(
             audit_root,
             authorization.context("Manager authorization is required for audit cleanup")?,
             "prune",
             &arguments_hash,
+            &targets,
         )?;
-        let pruned = module_audit_log::prune_stale_histories(
-            audit_root,
-            installed_root,
-            pending_root,
-            module_id,
-        )?;
+        let pruned = if operation.applied {
+            Vec::new()
+        } else {
+            module_audit_log::prune_stale_histories(
+                audit_root,
+                installed_root,
+                pending_root,
+                &operation.operation_id,
+            )?
+        };
+        module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)?;
         if json {
             println!("{}", serde_json::to_string_pretty(&pruned)?);
         } else {
@@ -1139,11 +1139,36 @@ pub fn prune_module_audit_histories(
 }
 
 pub fn audit_rescan_arguments_hash() -> Result<String> {
-    audit_operation_arguments_hash("rescan", &installed_module_ids()?)
+    audit_operation_arguments_hash("rescan", &audit_rescan_targets()?)
+}
+
+fn audit_rescan_targets() -> Result<Vec<String>> {
+    if let Some(targets) = module_audit_log::active_manager_audit_operation_targets(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        "rescan",
+    )? {
+        return Ok(targets);
+    }
+    installed_module_ids()
 }
 
 pub fn audit_prune_arguments_hash(module_id: Option<&str>) -> Result<String> {
+    audit_operation_arguments_hash("prune", &audit_prune_targets(module_id)?)
+}
+
+fn audit_prune_targets(module_id: Option<&str>) -> Result<Vec<String>> {
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    if let Some(targets) =
+        module_audit_log::active_manager_audit_operation_targets(audit_root, "prune")?
+    {
+        if let Some(module_id) = module_id {
+            ensure!(
+                targets.iter().any(|target| target == module_id),
+                "requested module does not match the active cleanup operation"
+            );
+        }
+        return Ok(targets);
+    }
     let installed_root = Path::new(defs::MODULE_DIR);
     let pending_root = Path::new(defs::MODULE_UPDATE_DIR);
     let mut targets =
@@ -1158,7 +1183,7 @@ pub fn audit_prune_arguments_hash(module_id: Option<&str>) -> Result<String> {
         );
         targets.retain(|candidate| candidate == module_id);
     }
-    audit_operation_arguments_hash("prune", &targets)
+    Ok(targets)
 }
 
 fn installed_module_ids() -> Result<Vec<String>> {

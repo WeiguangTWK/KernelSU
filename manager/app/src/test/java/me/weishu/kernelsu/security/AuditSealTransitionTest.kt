@@ -69,4 +69,29 @@ class AuditSealTransitionTest {
             )
         }
     }
+
+    @Test
+    fun persistedTransitionSelectsTheSealThatKsudActuallyAcknowledged() {
+        assertTrue(
+            selectAuditTransitionBaseHash(
+                sealedHash = "current",
+                currentHash = "current",
+                previousHash = "previous",
+            ) == "current"
+        )
+        assertTrue(
+            selectAuditTransitionBaseHash(
+                sealedHash = "previous",
+                currentHash = "current",
+                previousHash = "previous",
+            ) == "previous"
+        )
+        assertFailsWith<IllegalStateException> {
+            selectAuditTransitionBaseHash(
+                sealedHash = "replayed",
+                currentHash = "current",
+                previousHash = "previous",
+            )
+        }
+    }
 }
