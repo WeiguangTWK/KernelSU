@@ -134,6 +134,16 @@ struct PersistentQuarantineRecord {
     updated_at_unix_seconds: u64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistentContainmentResultRecord {
+    schema_version: u32,
+    module_id: String,
+    uncertain_ownership: bool,
+    quarantined_paths: Vec<String>,
+    failures: Vec<String>,
+    updated_at_unix_seconds: u64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContainmentState {
@@ -188,6 +198,10 @@ pub struct ModuleAuditStatus {
     pub quarantined_persistent_scripts: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persistent_script_ownership: Option<PersistentScriptOwnership>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quarantined_persistent_script_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persistent_script_failures: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -388,6 +402,12 @@ pub struct PersistentScriptContainmentPlan {
     pub module_id: String,
     pub paths: Vec<String>,
     pub infer_unattributed: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersistentScriptQuarantineOutcome {
+    pub completed_paths: Vec<String>,
+    pub failures: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -753,6 +773,14 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         .map_or_else(|| GENESIS_HASH.to_owned(), |entry| entry.event_hash.clone());
     let (quarantined_persistent_scripts, persistent_script_ownership) =
         read_persistent_quarantine_summary(root, module_id, &key)?;
+    let persistent_result = read_persistent_containment_result(root, module_id, &key)?;
+    let quarantined_persistent_scripts =
+        quarantined_persistent_scripts.max(persistent_result.quarantined_paths.len());
+    let persistent_script_ownership = if persistent_result.uncertain_ownership {
+        Some(PersistentScriptOwnership::Uncertain)
+    } else {
+        persistent_script_ownership
+    };
     Ok(ModuleAuditStatus {
         module_id: module_id.to_owned(),
         verification: chain.state,
@@ -769,6 +797,8 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         containment_state: read_containment_state(root, module_id, &key)?,
         quarantined_persistent_scripts,
         persistent_script_ownership,
+        quarantined_persistent_script_paths: persistent_result.quarantined_paths,
+        persistent_script_failures: persistent_result.failures,
     })
 }
 
@@ -1013,6 +1043,14 @@ fn compromised_sealed_history(
         .with_context(|| format!("audit history failed without sealed damage: {source:#}"))?;
     let (quarantined_persistent_scripts, persistent_script_ownership) =
         read_persistent_quarantine_summary(root, module_id, &key)?;
+    let persistent_result = read_persistent_containment_result(root, module_id, &key)?;
+    let quarantined_persistent_scripts =
+        quarantined_persistent_scripts.max(persistent_result.quarantined_paths.len());
+    let persistent_script_ownership = if persistent_result.uncertain_ownership {
+        Some(PersistentScriptOwnership::Uncertain)
+    } else {
+        persistent_script_ownership
+    };
     Ok(ModuleAuditHistory {
         status: ModuleAuditStatus {
             module_id: module_id.to_owned(),
@@ -1026,6 +1064,8 @@ fn compromised_sealed_history(
             containment_state: read_containment_state(root, module_id, &key)?,
             quarantined_persistent_scripts,
             persistent_script_ownership,
+            quarantined_persistent_script_paths: persistent_result.quarantined_paths,
+            persistent_script_failures: persistent_result.failures,
         },
         events: Vec::new(),
         integrity_error: Some(format!(
@@ -2051,21 +2091,20 @@ fn diagnose_sealed_module(
     root: &Path,
     module: &CheckpointModuleHead,
 ) -> Result<Option<SealedIntegrityFailure>> {
+    Ok(verified_sealed_prefix(root, module)?.1)
+}
+
+fn verified_sealed_prefix(
+    root: &Path,
+    module: &CheckpointModuleHead,
+) -> Result<(Vec<AuthenticatedEvent>, Option<SealedIntegrityFailure>)> {
     let events_dir = module_path(root, &module.module_id).join("events");
-    if events_dir.is_dir() {
+    let unexpected = if events_dir.is_dir() {
         let (_, unexpected) = audit_event_paths(&events_dir)?;
-        if let Some(path) = unexpected.first() {
-            return Ok(Some(SealedIntegrityFailure {
-                module_id: module.module_id.clone(),
-                corrupted_from_sequence: u64::try_from(module.event_hashes.len())?
-                    .saturating_add(1),
-                reason: format!(
-                    "audit event directory contains unexpected entry {}",
-                    path.display()
-                ),
-            }));
-        }
-    }
+        unexpected
+    } else {
+        Vec::new()
+    };
     let mut valid = Vec::new();
     for (index, sealed_hash) in module.event_hashes.iter().enumerate() {
         let sequence = u64::try_from(index)?.saturating_add(1);
@@ -2085,15 +2124,28 @@ fn diagnose_sealed_module(
         match result {
             Ok(event) => valid.push(event),
             Err(error) => {
-                return Ok(Some(SealedIntegrityFailure {
-                    module_id: module.module_id.clone(),
-                    corrupted_from_sequence: sequence,
-                    reason: format!("{error:#}"),
-                }));
+                return Ok((
+                    valid,
+                    Some(SealedIntegrityFailure {
+                        module_id: module.module_id.clone(),
+                        corrupted_from_sequence: sequence,
+                        reason: format!("{error:#}"),
+                    }),
+                ));
             }
         }
     }
-    Ok(None)
+    let failure = unexpected.first().map(|path| SealedIntegrityFailure {
+        module_id: module.module_id.clone(),
+        corrupted_from_sequence: u64::try_from(module.event_hashes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1),
+        reason: format!(
+            "audit event directory contains unexpected entry {}",
+            path.display()
+        ),
+    });
+    Ok((valid, failure))
 }
 
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -2133,24 +2185,10 @@ pub fn persistent_script_containment_plans(
         .context("Manager audit seal is not configured")?;
     let mut plans = Vec::new();
     for module in &seal.payload.modules {
-        let Some(failure) = diagnose_sealed_module(root, module)? else {
+        let (trusted, failure) = verified_sealed_prefix(root, module)?;
+        let Some(_failure) = failure else {
             continue;
         };
-        let mut trusted = Vec::new();
-        for (index, sealed_hash) in module.event_hashes.iter().enumerate() {
-            let sequence = u64::try_from(index)?.saturating_add(1);
-            if sequence >= failure.corrupted_from_sequence {
-                break;
-            }
-            trusted.push(verify_event_file(
-                &event_path(root, &module.module_id, sequence),
-                &module.module_id,
-                sequence,
-                &trusted,
-                &[0_u8; 32],
-                Some(sealed_hash),
-            )?);
-        }
         plans.push(PersistentScriptContainmentPlan {
             module_id: module.module_id.clone(),
             paths: persistent_paths_from_events(&trusted),
@@ -2171,20 +2209,9 @@ pub fn trusted_persistent_script_paths(root: &Path) -> Result<Vec<String>> {
         .context("Manager audit seal is not configured")?;
     let mut paths = std::collections::BTreeSet::new();
     for module in &seal.payload.modules {
-        if diagnose_sealed_module(root, module)?.is_some() {
+        let (events, failure) = verified_sealed_prefix(root, module)?;
+        if failure.is_some() {
             continue;
-        }
-        let mut events = Vec::new();
-        for (index, sealed_hash) in module.event_hashes.iter().enumerate() {
-            let sequence = u64::try_from(index)?.saturating_add(1);
-            events.push(verify_event_file(
-                &event_path(root, &module.module_id, sequence),
-                &module.module_id,
-                sequence,
-                &events,
-                &[0_u8; 32],
-                Some(sealed_hash),
-            )?);
         }
         paths.extend(persistent_paths_from_events(&events));
     }
@@ -2196,6 +2223,71 @@ fn persistent_quarantine_record_path(root: &Path, module_id: &str) -> PathBuf {
     root.join(CONTAINMENT_DIR)
         .join(module_dir_name(module_id))
         .join("persistent.json")
+}
+
+fn persistent_containment_result_path(root: &Path, module_id: &str) -> PathBuf {
+    root.join(CONTAINMENT_DIR)
+        .join(module_dir_name(module_id))
+        .join("persistent-result.json")
+}
+
+fn read_persistent_containment_result(
+    root: &Path,
+    module_id: &str,
+    key: &[u8; 32],
+) -> Result<PersistentContainmentResultRecord> {
+    let path = persistent_containment_result_path(root, module_id);
+    if !path.exists() {
+        return Ok(PersistentContainmentResultRecord::default());
+    }
+    let authenticated: AuthenticatedRecord<PersistentContainmentResultRecord> = read_json(&path)?;
+    verify_record(&authenticated.record, &authenticated.hmac_sha256, key)?;
+    ensure!(
+        authenticated.record.module_id == module_id,
+        "persistent containment result module id mismatch"
+    );
+    Ok(authenticated.record)
+}
+
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn record_persistent_containment_result(
+    root: &Path,
+    module_id: &str,
+    uncertain_ownership: bool,
+    quarantined_paths: &[String],
+    failures: &[String],
+) -> Result<()> {
+    validate_module_id(module_id)?;
+    let _lock = AuditLock::acquire(root, true)?;
+    let key = load_key(root, false)?;
+    let path = persistent_containment_result_path(root, module_id);
+    if path.exists() {
+        let authenticated: AuthenticatedRecord<PersistentContainmentResultRecord> =
+            read_json(&path)?;
+        verify_record(&authenticated.record, &authenticated.hmac_sha256, &key)?;
+        ensure!(
+            authenticated.record.module_id == module_id,
+            "persistent containment result module id mismatch"
+        );
+    }
+    let mut quarantined_paths = quarantined_paths.to_vec();
+    quarantined_paths.sort();
+    quarantined_paths.dedup();
+    let mut failures = failures.to_vec();
+    failures.sort();
+    failures.dedup();
+    write_record(
+        &path,
+        PersistentContainmentResultRecord {
+            schema_version: SCHEMA_VERSION,
+            module_id: module_id.to_owned(),
+            uncertain_ownership,
+            quarantined_paths,
+            failures,
+            updated_at_unix_seconds: now(),
+        },
+        &key,
+    )
 }
 
 fn read_persistent_quarantine_summary(
@@ -2254,7 +2346,9 @@ pub fn set_containment_state(root: &Path, module_id: &str, state: ContainmentSta
     let _lock = AuditLock::acquire(root, true)?;
     let key = load_key(root, false)?;
     let state = match (read_containment_state(root, module_id, &key)?, state) {
-        (Some(ContainmentState::Contained), _) => ContainmentState::Contained,
+        (Some(ContainmentState::Contained), ContainmentState::PendingReboot) => {
+            ContainmentState::Contained
+        }
         (Some(ContainmentState::PersistentScriptsIncomplete), ContainmentState::PendingReboot) => {
             ContainmentState::PersistentScriptsIncomplete
         }
@@ -2307,11 +2401,20 @@ pub fn quarantine_persistent_scripts(
     module_id: &str,
     paths: &[String],
     uncertain_ownership: bool,
-) -> Result<Vec<String>> {
+) -> Result<PersistentScriptQuarantineOutcome> {
     validate_module_id(module_id)?;
+    quarantine_persistent_scripts_inner(root, module_id, paths, uncertain_ownership)
+}
+
+fn quarantine_persistent_scripts_inner(
+    root: &Path,
+    record_id: &str,
+    paths: &[String],
+    uncertain_ownership: bool,
+) -> Result<PersistentScriptQuarantineOutcome> {
     let _lock = AuditLock::acquire(root, true)?;
     let key = load_key(root, false)?;
-    let record_path = persistent_quarantine_record_path(root, module_id);
+    let record_path = persistent_quarantine_record_path(root, record_id);
     let mut record = if record_path.exists() {
         let authenticated: AuthenticatedRecord<PersistentQuarantineRecord> =
             read_json(&record_path)?;
@@ -2320,7 +2423,7 @@ pub fn quarantine_persistent_scripts(
     } else {
         PersistentQuarantineRecord {
             schema_version: SCHEMA_VERSION,
-            module_id: module_id.to_owned(),
+            module_id: record_id.to_owned(),
             uncertain_ownership,
             planned_paths: Vec::new(),
             completed_paths: Vec::new(),
@@ -2328,21 +2431,20 @@ pub fn quarantine_persistent_scripts(
         }
     };
     ensure!(
-        record.module_id == module_id,
+        record.module_id == record_id,
         "containment module id mismatch"
     );
     record.uncertain_ownership |= uncertain_ownership;
+    let mut failures = Vec::new();
     for path in paths {
         let source = Path::new(path);
-        let _ = persistent_quarantine_destination(root, module_id, source)?;
+        if let Err(error) = persistent_quarantine_destination(root, record_id, source) {
+            failures.push(format!("reject persistent startup path {path}: {error:#}"));
+            continue;
+        }
         if !source.exists() {
             continue;
         }
-        let metadata = std::fs::symlink_metadata(source)?;
-        ensure!(
-            metadata.file_type().is_file(),
-            "refuse to quarantine non-regular startup file {path}"
-        );
         if !record.planned_paths.contains(path) {
             record.planned_paths.push(path.clone());
         }
@@ -2356,36 +2458,62 @@ pub fn quarantine_persistent_scripts(
             continue;
         }
         let source = Path::new(&path);
-        let destination = persistent_quarantine_destination(root, module_id, source)?;
-        if source.exists() {
-            let metadata = std::fs::symlink_metadata(source)?;
-            ensure!(
-                metadata.file_type().is_file(),
-                "refuse to quarantine non-regular startup file {path}"
-            );
-            ensure_dir(
-                destination
-                    .parent()
-                    .context("quarantine destination has no parent")?,
-            )?;
-            ensure!(
-                !destination.exists(),
-                "persistent quarantine destination already exists"
-            );
-            std::fs::rename(source, &destination)
-                .with_context(|| format!("quarantine persistent startup script {path}"))?;
-        } else {
-            ensure!(
-                destination.is_file(),
-                "planned persistent script disappeared: {path}"
-            );
+        let destination = persistent_quarantine_destination(root, record_id, source)?;
+        let moved = (|| -> Result<()> {
+            if source.exists() {
+                let metadata = std::fs::symlink_metadata(source)?;
+                ensure!(
+                    metadata.file_type().is_file(),
+                    "refuse to quarantine non-regular startup file {path}"
+                );
+                ensure_dir(
+                    destination
+                        .parent()
+                        .context("quarantine destination has no parent")?,
+                )?;
+                ensure!(
+                    !destination.exists(),
+                    "persistent quarantine destination already exists"
+                );
+                std::fs::rename(source, &destination)
+                    .with_context(|| format!("quarantine persistent startup script {path}"))?;
+            } else {
+                ensure!(
+                    destination.is_file(),
+                    "planned persistent script disappeared: {path}"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = moved {
+            failures.push(format!("{path}: {error:#}"));
+            continue;
         }
         record.completed_paths.push(path);
         record.completed_paths.sort();
         record.updated_at_unix_seconds = now();
         write_record(&record_path, record.clone(), &key)?;
     }
-    Ok(record.completed_paths)
+    Ok(PersistentScriptQuarantineOutcome {
+        completed_paths: record.completed_paths,
+        failures,
+    })
+}
+
+/// Quarantines startup scripts whose owner cannot be established from any
+/// intact Manager-sealed history. The reserved incident bucket deliberately is
+/// not the identity of an installed module.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn quarantine_unattributed_persistent_scripts(
+    root: &Path,
+    paths: &[String],
+) -> Result<PersistentScriptQuarantineOutcome> {
+    quarantine_persistent_scripts_inner(
+        root,
+        "@global/unattributed-persistent-scripts",
+        paths,
+        true,
+    )
 }
 
 fn verify_manager_checkpoint_envelope(
@@ -4122,6 +4250,14 @@ fn rewrite_containment_records(root: &Path, previous: &[u8; 32], next: &[u8; 32]
         if persistent.is_file() {
             rewrite_authenticated_file::<PersistentQuarantineRecord>(&persistent, previous, next)?;
         }
+        let persistent_result = directory.join("persistent-result.json");
+        if persistent_result.is_file() {
+            rewrite_authenticated_file::<PersistentContainmentResultRecord>(
+                &persistent_result,
+                previous,
+                next,
+            )?;
+        }
         let state = directory.join("state.json");
         if state.is_file() {
             rewrite_authenticated_file::<ModuleContainmentRecord>(&state, previous, next)?;
@@ -4501,6 +4637,12 @@ mod tests {
         commit_manager_audit_seal(temp.path(), &checkpoint_envelope(temp.path(), &manager, 1))
             .unwrap();
         std::fs::write(event_path(temp.path(), "persistent.module", 2), b"damaged").unwrap();
+        std::fs::create_dir(
+            module_path(temp.path(), "persistent.module")
+                .join("events")
+                .join("unexpected-entry"),
+        )
+        .unwrap();
 
         let plans = persistent_script_containment_plans(temp.path()).unwrap();
         assert_eq!(plans.len(), 1);
@@ -4508,6 +4650,42 @@ mod tests {
         assert_eq!(plans[0].paths, ["/data/adb/service.d/persistent-module.sh"]);
         assert!(!plans[0].infer_unattributed);
         assert!(module_requires_containment(temp.path(), "persistent.module").unwrap());
+    }
+
+    #[test]
+    fn persistent_containment_result_is_authenticated_and_visible() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "contained.module", "ab");
+        record_persistent_containment_result(
+            temp.path(),
+            "contained.module",
+            true,
+            &["/data/adb/service.d/unknown.sh".to_owned()],
+            &["startup entry changed while being isolated".to_owned()],
+        )
+        .unwrap();
+
+        let status = verify_module(temp.path(), "contained.module", false).unwrap();
+        assert_eq!(status.quarantined_persistent_scripts, 1);
+        assert_eq!(
+            status.persistent_script_ownership,
+            Some(PersistentScriptOwnership::Uncertain)
+        );
+        assert_eq!(
+            status.quarantined_persistent_script_paths,
+            ["/data/adb/service.d/unknown.sh"]
+        );
+        assert_eq!(
+            status.persistent_script_failures,
+            ["startup entry changed while being isolated"]
+        );
+
+        let path = persistent_containment_result_path(temp.path(), "contained.module");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["record"]["failures"] = serde_json::json!([]);
+        std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        assert!(verify_module(temp.path(), "contained.module", false).is_err());
     }
 
     #[test]
@@ -4527,7 +4705,7 @@ mod tests {
     }
 
     #[test]
-    fn containment_state_is_authenticated_and_never_downgraded() {
+    fn containment_state_preserves_progress_but_reports_new_failures() {
         let temp = TempDir::new().unwrap();
         record(temp.path(), "contained.module", "ab");
         set_containment_state(
@@ -4557,7 +4735,12 @@ mod tests {
         )
         .unwrap();
         let status = verify_module(temp.path(), "contained.module", false).unwrap();
-        assert_eq!(status.containment_state, Some(ContainmentState::Contained));
+        assert_eq!(
+            status.containment_state,
+            Some(ContainmentState::PersistentScriptsIncomplete)
+        );
+        set_containment_state(temp.path(), "contained.module", ContainmentState::Contained)
+            .unwrap();
 
         let path = module_containment_record_path(temp.path(), "contained.module");
         let mut record: AuthenticatedRecord<ModuleContainmentRecord> = read_json(&path).unwrap();

@@ -22,6 +22,8 @@ data class AuditStatus(
     val containmentState: String? = null,
     val quarantinedPersistentScripts: Int = 0,
     val persistentScriptOwnership: String? = null,
+    val quarantinedPersistentScriptPaths: List<String> = emptyList(),
+    val persistentScriptFailures: List<String> = emptyList(),
 )
 
 enum class SecureRemovalPhase {
@@ -243,6 +245,12 @@ fun parseAuditHistories(raw: String): List<AuditHistory> = JSONArray(raw).mapObj
             containmentState = status.optString("containment_state").takeIf(String::isNotBlank),
             quarantinedPersistentScripts = status.optInt("quarantined_persistent_scripts"),
             persistentScriptOwnership = status.optString("persistent_script_ownership").takeIf(String::isNotBlank),
+            quarantinedPersistentScriptPaths = status.optJSONArray("quarantined_persistent_script_paths")
+                ?.mapStrings()
+                .orEmpty(),
+            persistentScriptFailures = status.optJSONArray("persistent_script_failures")
+                ?.mapStrings()
+                .orEmpty(),
         ),
         events = history.optJSONArray("events")?.mapObjects(::parseAuditEvent).orEmpty(),
         integrityError = history.optString("integrity_error").takeIf(String::isNotBlank),

@@ -654,6 +654,33 @@ private fun AuditIntegrityMiuix(history: AuditHistory) {
                     color = colorScheme.error,
                 )
             }
+            if (history.status.quarantinedPersistentScriptPaths.isNotEmpty()) {
+                Text(
+                    stringResource(R.string.security_audit_persistent_paths),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+                history.status.quarantinedPersistentScriptPaths.forEach { path ->
+                    Text(
+                        path,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = colorScheme.primary,
+                    )
+                }
+            }
+            if (history.status.persistentScriptFailures.isNotEmpty()) {
+                Text(
+                    stringResource(R.string.security_audit_persistent_failures),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = colorScheme.error,
+                )
+                history.status.persistentScriptFailures.forEach { failure ->
+                    Text(failure, fontSize = 12.sp, color = colorScheme.error)
+                }
+            }
             history.packageFingerprint()?.let { Text(stringResource(R.string.security_audit_package_hash, it), fontSize = 12.sp) }
         }
     }

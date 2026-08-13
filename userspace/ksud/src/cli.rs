@@ -404,6 +404,9 @@ enum Module {
         authorization: String,
     },
 
+    /// Query response prerequisites without reading the audit store
+    AuditResponseStatus,
+
     /// Undo module uninstall mark <id>
     UndoUninstall {
         /// module id
@@ -906,7 +909,8 @@ pub fn run() -> Result<()> {
                         }
                         AuditAuth::Recover { public_key } => {
                             anyhow::ensure!(
-                                ksucalls::check_kernel_safemode(),
+                                ksucalls::try_check_kernel_safemode()
+                                    .context("query KernelSU safe mode for Manager key recovery")?,
                                 "Manager audit authorization recovery requires KernelSU safe mode"
                             );
                             let status = crate::module_audit_log::register_manager_audit_auth_key(
@@ -1026,6 +1030,16 @@ pub fn run() -> Result<()> {
                     } else {
                         println!("- Rebuilt Manager-sealed audit history for {id}");
                     }
+                    Ok(())
+                }
+                Module::AuditResponseStatus => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "kernel_safe_mode": ksucalls::try_check_kernel_safemode()
+                                .context("query KernelSU safe mode for audit response")?,
+                        })
+                    );
                     Ok(())
                 }
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),

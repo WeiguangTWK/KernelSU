@@ -1,7 +1,7 @@
 use crate::{defs, ksucalls, metamodule, module, module_audit_log};
 use anyhow::{Context, Result, ensure};
 use log::{info, warn};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const PERSISTENT_SCRIPT_DIRS: &[&str] = &[
@@ -135,20 +135,22 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<Vec<String>> {
         module::regenerate_preinit_rc()?;
     }
 
-    let persistent_result = quarantine_persistent_scripts(audit_root);
-    if let Err(error) = persistent_result {
-        warn!("persistent startup script containment is incomplete: {error:#}");
-        if boot_enforcement {
-            for id in &ids {
-                module_audit_log::set_containment_state(
-                    audit_root,
-                    id,
-                    module_audit_log::ContainmentState::PersistentScriptsIncomplete,
-                )?;
-            }
-        }
-    } else if boot_enforcement || ksucalls::try_check_kernel_safemode().unwrap_or(false) {
-        for id in &ids {
+    let persistent_results = quarantine_persistent_scripts(audit_root, &ids);
+    let may_complete = boot_enforcement || ksucalls::try_check_kernel_safemode().unwrap_or(false);
+    for id in &ids {
+        let result = persistent_results.get(id);
+        let failures = result.map_or(&[][..], |result| result.failures.as_slice());
+        if !failures.is_empty() {
+            warn!(
+                "persistent startup script containment for {id} is incomplete: {}",
+                failures.join("; ")
+            );
+            module_audit_log::set_containment_state(
+                audit_root,
+                id,
+                module_audit_log::ContainmentState::PersistentScriptsIncomplete,
+            )?;
+        } else if may_complete {
             module_audit_log::set_containment_state(
                 audit_root,
                 id,
@@ -160,40 +162,113 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<Vec<String>> {
     Ok(ids.into_iter().collect())
 }
 
-fn quarantine_persistent_scripts(audit_root: &Path) -> Result<()> {
+#[derive(Default)]
+struct PersistentContainmentResult {
+    uncertain_ownership: bool,
+    quarantined_paths: Vec<String>,
+    failures: Vec<String>,
+}
+
+fn quarantine_persistent_scripts(
+    audit_root: &Path,
+    affected_ids: &BTreeSet<String>,
+) -> BTreeMap<String, PersistentContainmentResult> {
     // Use only Manager-sealed evidence. Exact ownership is preferred. If a
     // damaged module has no surviving event, preserve paths attributed by every
     // other intact history and quarantine the remainder as uncertain ownership.
-    let mut plans = module_audit_log::persistent_script_containment_plans(audit_root)?;
+    let mut results = BTreeMap::new();
+    let mut plans = match module_audit_log::persistent_script_containment_plans(audit_root) {
+        Ok(plans) => plans,
+        Err(error) => {
+            let reason = format!("build trusted persistent-script plan: {error:#}");
+            for id in affected_ids {
+                results
+                    .entry(id.clone())
+                    .or_insert_with(PersistentContainmentResult::default)
+                    .failures
+                    .push(reason.clone());
+            }
+            persist_containment_results(audit_root, &mut results);
+            return results;
+        }
+    };
     plans.sort_by(|left, right| left.module_id.cmp(&right.module_id));
     for plan in plans.iter().filter(|plan| !plan.paths.is_empty()) {
-        module_audit_log::quarantine_persistent_scripts(
+        let result = results.entry(plan.module_id.clone()).or_default();
+        match module_audit_log::quarantine_persistent_scripts(
             audit_root,
             &plan.module_id,
             &plan.paths,
             false,
-        )?;
-    }
-    if let Some(owner) = plans.iter().find(|plan| plan.infer_unattributed) {
-        let trusted = module_audit_log::trusted_persistent_script_paths(audit_root)?
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        let unknown = collect_unattributed_persistent_scripts(PERSISTENT_SCRIPT_DIRS, &trusted)?;
-        if !unknown.is_empty() {
-            warn!(
-                "audit history for {} has no trusted persistent-script inventory; quarantining {} unattributed startup scripts",
-                owner.module_id,
-                unknown.len()
-            );
-            module_audit_log::quarantine_persistent_scripts(
-                audit_root,
-                &owner.module_id,
-                &unknown,
-                true,
-            )?;
+        ) {
+            Ok(outcome) => {
+                result.quarantined_paths = outcome.completed_paths;
+                result.failures.extend(outcome.failures);
+            }
+            Err(error) => result
+                .failures
+                .push(format!("quarantine attributed startup scripts: {error:#}")),
         }
     }
-    Ok(())
+    let inference_ids = plans
+        .iter()
+        .filter(|plan| plan.infer_unattributed)
+        .map(|plan| plan.module_id.clone())
+        .collect::<Vec<_>>();
+    if !inference_ids.is_empty() {
+        let inference = (|| -> Result<module_audit_log::PersistentScriptQuarantineOutcome> {
+            let trusted = module_audit_log::trusted_persistent_script_paths(audit_root)?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let unknown =
+                collect_unattributed_persistent_scripts(PERSISTENT_SCRIPT_DIRS, &trusted)?;
+            if unknown.is_empty() {
+                return Ok(module_audit_log::PersistentScriptQuarantineOutcome::default());
+            }
+            warn!(
+                "{} damaged audit histories have no trusted persistent-script inventory; quarantining {} globally unattributed startup scripts",
+                inference_ids.len(),
+                unknown.len()
+            );
+            module_audit_log::quarantine_unattributed_persistent_scripts(audit_root, &unknown)
+        })();
+        for id in inference_ids {
+            let result = results.entry(id).or_default();
+            result.uncertain_ownership = true;
+            match &inference {
+                Ok(outcome) => {
+                    result
+                        .quarantined_paths
+                        .clone_from(&outcome.completed_paths);
+                    result.failures.extend(outcome.failures.clone());
+                }
+                Err(error) => result.failures.push(format!(
+                    "quarantine unattributed startup scripts: {error:#}"
+                )),
+            }
+        }
+    }
+    persist_containment_results(audit_root, &mut results);
+    results
+}
+
+fn persist_containment_results(
+    audit_root: &Path,
+    results: &mut BTreeMap<String, PersistentContainmentResult>,
+) {
+    for (id, result) in results.iter_mut() {
+        if let Err(error) = module_audit_log::record_persistent_containment_result(
+            audit_root,
+            id,
+            result.uncertain_ownership,
+            &result.quarantined_paths,
+            &result.failures,
+        ) {
+            result.failures.push(format!(
+                "authenticate persistent containment result: {error:#}"
+            ));
+        }
+    }
 }
 
 fn collect_unattributed_persistent_scripts(
@@ -208,9 +283,6 @@ fn collect_unattributed_persistent_scripts(
         }
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
             let path = entry.path().to_string_lossy().into_owned();
             if !trusted.contains(&path) {
                 unknown.push(path);

@@ -628,6 +628,35 @@ private fun AuditIntegrityMaterial(history: AuditHistory) {
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+            if (history.status.quarantinedPersistentScriptPaths.isNotEmpty()) {
+                Text(
+                    stringResource(R.string.security_audit_persistent_paths),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                history.status.quarantinedPersistentScriptPaths.forEach { path ->
+                    Text(
+                        path,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+            if (history.status.persistentScriptFailures.isNotEmpty()) {
+                Text(
+                    stringResource(R.string.security_audit_persistent_failures),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                history.status.persistentScriptFailures.forEach { failure ->
+                    Text(
+                        failure,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
             history.packageFingerprint()?.let {
                 Text(stringResource(R.string.security_audit_package_hash, it), style = MaterialTheme.typography.bodySmall)
             }
