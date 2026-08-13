@@ -138,6 +138,7 @@ struct PersistentQuarantineRecord {
 #[serde(rename_all = "snake_case")]
 pub enum ContainmentState {
     PendingReboot,
+    PersistentScriptsIncomplete,
     Contained,
 }
 
@@ -2253,10 +2254,11 @@ pub fn set_containment_state(root: &Path, module_id: &str, state: ContainmentSta
     let _lock = AuditLock::acquire(root, true)?;
     let key = load_key(root, false)?;
     let state = match (read_containment_state(root, module_id, &key)?, state) {
-        (Some(ContainmentState::Contained), ContainmentState::PendingReboot) => {
-            ContainmentState::Contained
+        (Some(ContainmentState::Contained), _) => ContainmentState::Contained,
+        (Some(ContainmentState::PersistentScriptsIncomplete), ContainmentState::PendingReboot) => {
+            ContainmentState::PersistentScriptsIncomplete
         }
-        (_, state) => state,
+        (_, requested) => requested,
     };
     write_record(
         &module_containment_record_path(root, module_id),
@@ -4528,12 +4530,30 @@ mod tests {
     fn containment_state_is_authenticated_and_never_downgraded() {
         let temp = TempDir::new().unwrap();
         record(temp.path(), "contained.module", "ab");
+        set_containment_state(
+            temp.path(),
+            "contained.module",
+            ContainmentState::PersistentScriptsIncomplete,
+        )
+        .unwrap();
+        set_containment_state(
+            temp.path(),
+            "contained.module",
+            ContainmentState::PendingReboot,
+        )
+        .unwrap();
+        let status = verify_module(temp.path(), "contained.module", false).unwrap();
+        assert_eq!(
+            status.containment_state,
+            Some(ContainmentState::PersistentScriptsIncomplete)
+        );
+
         set_containment_state(temp.path(), "contained.module", ContainmentState::Contained)
             .unwrap();
         set_containment_state(
             temp.path(),
             "contained.module",
-            ContainmentState::PendingReboot,
+            ContainmentState::PersistentScriptsIncomplete,
         )
         .unwrap();
         let status = verify_module(temp.path(), "contained.module", false).unwrap();

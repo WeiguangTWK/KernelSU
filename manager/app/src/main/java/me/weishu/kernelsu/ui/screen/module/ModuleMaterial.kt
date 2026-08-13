@@ -875,6 +875,8 @@ private fun ModuleItem(
                     text = stringResource(
                         when (containmentState) {
                             "pending_reboot" -> R.string.security_audit_containment_pending
+                            "persistent_scripts_incomplete" ->
+                                R.string.security_audit_containment_incomplete
                             "contained" -> R.string.security_audit_module_contained
                             else -> R.string.security_audit_integrity_compromised
                         }

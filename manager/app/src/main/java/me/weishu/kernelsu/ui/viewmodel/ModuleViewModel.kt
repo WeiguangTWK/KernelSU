@@ -21,7 +21,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.data.model.Module
 import me.weishu.kernelsu.data.model.ModuleUpdateInfo
@@ -39,6 +38,7 @@ import me.weishu.kernelsu.ui.util.PinyinUtil
 import me.weishu.kernelsu.ui.util.hasMagisk
 import me.weishu.kernelsu.ui.util.getModuleAuditStatuses
 import me.weishu.kernelsu.ui.util.getModuleAuditRecoveryStatus
+import me.weishu.kernelsu.ui.util.getModuleAuditResponseStatus
 import me.weishu.kernelsu.ui.util.module.fetchModuleDetail
 import me.weishu.kernelsu.ui.util.module.fetchReleaseDescriptionHtml
 import okhttp3.Request
@@ -126,7 +126,11 @@ class ModuleViewModel(
     fun refreshEnvironmentState() {
         viewModelScope.launch {
             val magiskInstalled = withContext(Dispatchers.IO) { hasMagisk() }
-            val isSafeMode = Natives.isSafeMode
+            val isSafeMode = withContext(Dispatchers.IO) {
+                runCatching {
+                    JSONObject(getModuleAuditResponseStatus()).getBoolean("kernel_safe_mode")
+                }.getOrDefault(false)
+            }
             _uiState.update {
                 it.copy(
                     magiskInstalled = magiskInstalled,

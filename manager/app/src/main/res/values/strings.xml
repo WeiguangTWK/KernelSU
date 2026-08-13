@@ -100,6 +100,7 @@
     <string name="security_audit_secure_remove_reboot">Disable and reboot</string>
     <string name="security_audit_module_contained">Module contained · Open Security &amp; Audit Center</string>
     <string name="security_audit_containment_pending">Containment pending reboot</string>
+    <string name="security_audit_containment_incomplete">Module disabled · Persistent startup script isolation incomplete</string>
     <string name="security_audit_containment_active">Module isolated</string>
     <string name="security_audit_integrity_compromised">Audit integrity compromised · Open Security &amp; Audit Center</string>
     <string name="security_audit_persistent_quarantined">Quarantined persistent scripts: %1$d</string>

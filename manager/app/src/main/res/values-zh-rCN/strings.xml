@@ -82,6 +82,7 @@
     <string name="security_audit_secure_remove_reboot">禁用并重启</string>
     <string name="security_audit_module_contained">模块已隔离 · 前往安全与审计中心</string>
     <string name="security_audit_containment_pending">重启后完成隔离</string>
+    <string name="security_audit_containment_incomplete">模块已禁用 · 持久化启动脚本隔离未完成</string>
     <string name="security_audit_containment_active">模块已隔离</string>
     <string name="security_audit_integrity_compromised">完整性异常 · 前往安全与审计中心</string>
     <string name="security_audit_persistent_quarantined">已隔离持久化脚本：%1$d</string>

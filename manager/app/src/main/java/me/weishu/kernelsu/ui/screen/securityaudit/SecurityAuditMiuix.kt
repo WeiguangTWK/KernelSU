@@ -625,8 +625,12 @@ private fun AuditIntegrityMiuix(history: AuditHistory) {
             history.status.containmentState?.let { state ->
                 Text(
                     stringResource(
-                        if (state == "contained") R.string.security_audit_containment_active
-                        else R.string.security_audit_containment_pending
+                        when (state) {
+                            "contained" -> R.string.security_audit_containment_active
+                            "persistent_scripts_incomplete" ->
+                                R.string.security_audit_containment_incomplete
+                            else -> R.string.security_audit_containment_pending
+                        }
                     ),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,

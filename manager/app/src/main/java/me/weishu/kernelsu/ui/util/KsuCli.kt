@@ -367,6 +367,13 @@ suspend fun securelyRemoveModule(moduleId: String, authorization: String): Strin
         )
     }
 
+suspend fun getModuleAuditResponseStatus(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-response-status",
+        "Unable to read module audit response prerequisites",
+    )
+}
+
 private fun runModuleAuditCommand(command: String, fallbackError: String): String {
     val stdout = ArrayList<String>()
     val stderr = ArrayList<String>()

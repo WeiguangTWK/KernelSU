@@ -13,7 +13,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
-import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.AuditCheckpointTrust
@@ -30,6 +29,7 @@ import me.weishu.kernelsu.ui.util.commitModuleAuditSeal
 import me.weishu.kernelsu.ui.util.containModuleForSecureRemoval
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
 import me.weishu.kernelsu.ui.util.getModuleAuditRecoveryStatus
+import me.weishu.kernelsu.ui.util.getModuleAuditResponseStatus
 import me.weishu.kernelsu.ui.util.getModuleAuditCheckpoint
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationChallenge
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationStatus
@@ -175,6 +175,9 @@ class SecurityAuditViewModel : ViewModel() {
         }
         refreshJob = viewModelScope.launch(Dispatchers.IO) {
             checkpointStore.readDashboardCache()?.let(::applyCachedDashboard)
+            val recoverySafeMode = runCatching {
+                JSONObject(getModuleAuditResponseStatus()).getBoolean("kernel_safe_mode")
+            }.getOrDefault(false)
             runCatching {
                 val stream = loadDashboardStream(generation)
                 val completion = stream.completion
@@ -218,7 +221,9 @@ class SecurityAuditViewModel : ViewModel() {
                     checkpoint.trust == AuditCheckpointTrust.Initialized ||
                     checkpoint.trust == AuditCheckpointTrust.Verified
                 ) {
-                    runCatching { ensureAuditAuthorization(authorizationStatus) }
+                    runCatching {
+                        ensureAuditAuthorization(authorizationStatus, recoverySafeMode)
+                    }
                 } else {
                     Result.success(false)
                 }
@@ -270,7 +275,7 @@ class SecurityAuditViewModel : ViewModel() {
                         ?.detail,
                     recoverableModuleIds = result.checkpoint.recoverableModules,
                     sealedRecoveryModuleIds = result.sealedRecoveryModuleIds,
-                    recoverySafeMode = Natives.isSafeMode,
+                    recoverySafeMode = recoverySafeMode,
                     auditInitialized = result.initialized,
                     keyProtection = result.checkpoint.protection,
                     auditAuthorizationReady = result.authorizationReady,
@@ -296,6 +301,7 @@ class SecurityAuditViewModel : ViewModel() {
                         sealedRecoveryModuleIds = sealedRecoveryModuleIds,
                         checkpointCompromised = it.checkpointCompromised ||
                             sealedRecoveryModuleIds.isNotEmpty(),
+                        recoverySafeMode = recoverySafeMode,
                         errorMessage = error.message ?: error::class.java.simpleName,
                     )
                 }
@@ -332,7 +338,10 @@ class SecurityAuditViewModel : ViewModel() {
         }
     }
 
-    private suspend fun ensureAuditAuthorization(prefetchedStatus: JSONObject? = null): Boolean {
+    private suspend fun ensureAuditAuthorization(
+        prefetchedStatus: JSONObject? = null,
+        kernelSafeMode: Boolean = _uiState.value.recoverySafeMode,
+    ): Boolean {
         val publicKey = checkpointStore.authorizationPublicKeyHex()
         val ownKeyId = checkpointStore.authorizationKeyId()
         val statusResult = prefetchedStatus?.let { Result.success(it) } ?: runCatching {
@@ -353,7 +362,7 @@ class SecurityAuditViewModel : ViewModel() {
         }
         if (configured && registeredKeyId == ownKeyId) return true
 
-        if (Natives.isSafeMode) {
+        if (kernelSafeMode) {
             val recovered = JSONObject(
                 registerModuleAuditAuthorizationKey(publicKey, recover = true)
             )
@@ -413,7 +422,7 @@ class SecurityAuditViewModel : ViewModel() {
             ) {
                 return
             }
-            if (!Natives.isSafeMode) {
+            if (!state.recoverySafeMode) {
                 _uiState.update {
                     it.copy(errorMessage = ksuApp.getString(R.string.security_audit_recovery_safe_mode))
                 }

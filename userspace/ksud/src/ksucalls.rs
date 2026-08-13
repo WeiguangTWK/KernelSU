@@ -48,11 +48,33 @@ fn init_driver_fd() -> Option<RawFd> {
     }
 }
 
+fn driver_fd() -> std::io::Result<RawFd> {
+    if let Some(fd) = DRIVER_FD.get() {
+        return Ok(*fd);
+    }
+    let fd = init_driver_fd().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "KernelSU driver file descriptor is unavailable",
+        )
+    })?;
+    match DRIVER_FD.set(fd) {
+        Ok(()) => Ok(fd),
+        Err(extra_fd) => {
+            // Another thread initialized the shared descriptor first.
+            unsafe { libc::close(extra_fd) };
+            Ok(*DRIVER_FD
+                .get()
+                .expect("KernelSU driver fd initialized concurrently"))
+        }
+    }
+}
+
 // ioctl wrapper using libc
 fn ksuctl<T>(request: u32, arg: *mut T) -> std::io::Result<i32> {
     use std::io;
 
-    let fd = *DRIVER_FD.get_or_init(|| init_driver_fd().unwrap_or(-1));
+    let fd = driver_fd()?;
     unsafe {
         let ret = libc::ioctl(fd as libc::c_int, request as i32, arg);
         if ret < 0 {
@@ -138,10 +160,14 @@ pub fn report_module_mounted() {
     report_event(ksu_uapi::EVENT_MODULE_MOUNTED);
 }
 
-pub fn check_kernel_safemode() -> bool {
+pub fn try_check_kernel_safemode() -> std::io::Result<bool> {
     let mut cmd = ksu_uapi::ksu_check_safemode_cmd { in_safe_mode: 0 };
-    let _ = ksuctl(ksu_uapi::KSU_IOCTL_CHECK_SAFEMODE, &raw mut cmd);
-    cmd.in_safe_mode != 0
+    ksuctl(ksu_uapi::KSU_IOCTL_CHECK_SAFEMODE, &raw mut cmd)?;
+    Ok(cmd.in_safe_mode != 0)
+}
+
+pub fn check_kernel_safemode() -> bool {
+    try_check_kernel_safemode().unwrap_or(false)
 }
 
 pub fn set_sepolicy(payload: *const u8, payload_len: u64) -> std::io::Result<i32> {

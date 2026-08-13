@@ -138,7 +138,16 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<Vec<String>> {
     let persistent_result = quarantine_persistent_scripts(audit_root);
     if let Err(error) = persistent_result {
         warn!("persistent startup script containment is incomplete: {error:#}");
-    } else if boot_enforcement {
+        if boot_enforcement {
+            for id in &ids {
+                module_audit_log::set_containment_state(
+                    audit_root,
+                    id,
+                    module_audit_log::ContainmentState::PersistentScriptsIncomplete,
+                )?;
+            }
+        }
+    } else if boot_enforcement || ksucalls::try_check_kernel_safemode().unwrap_or(false) {
         for id in &ids {
             module_audit_log::set_containment_state(
                 audit_root,
@@ -239,7 +248,8 @@ fn secure_remove_targets(module_id: &str) -> Result<Vec<String>> {
 pub fn secure_remove(module_id: &str, authorization: &str) -> Result<()> {
     module::validate_module_id(module_id)?;
     ensure!(
-        ksucalls::check_kernel_safemode(),
+        ksucalls::try_check_kernel_safemode()
+            .context("query KernelSU safe mode for secure removal")?,
         "Secure module removal requires KernelSU safe mode"
     );
     let targets = secure_remove_targets(module_id)?;
@@ -290,7 +300,8 @@ pub fn recover_manager_sealed_audit(
 ) -> Result<module_audit_log::ModuleAuditStatus> {
     module::validate_module_id(module_id)?;
     ensure!(
-        ksucalls::check_kernel_safemode(),
+        ksucalls::try_check_kernel_safemode()
+            .context("query KernelSU safe mode for Manager-sealed audit recovery")?,
         "Manager-sealed audit recovery requires KernelSU safe mode"
     );
     module_audit_log::recover_manager_sealed_module(
