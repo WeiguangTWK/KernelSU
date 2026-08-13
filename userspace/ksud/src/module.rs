@@ -437,6 +437,26 @@ fn collect_rc_files<P: AsRef<Path>>(
     Ok(())
 }
 
+fn append_auditd_init_rc(out: &mut dyn Write) -> Result<()> {
+    writeln!(out, "# === KernelSU auditd service ===")?;
+    writeln!(out, "service ksud-auditd {} auditd", defs::DAEMON_PATH)?;
+    writeln!(out, "    class main")?;
+    writeln!(out, "    user root")?;
+    writeln!(out, "    group root")?;
+    writeln!(out, "    seclabel u:r:ksu:s0")?;
+    writeln!(out, "    disabled")?;
+    writeln!(out, "    restart_period 5")?;
+    writeln!(
+        out,
+        "    onrestart exec u:r:ksu:s0 root -- {} auditd-restart-notify",
+        defs::DAEMON_PATH
+    )?;
+    writeln!(out, "on post-fs-data")?;
+    writeln!(out, "    start ksud-auditd")?;
+    writeln!(out)?;
+    Ok(())
+}
+
 /// Rebuild PREINITDIR/modules.rc by concatenating *.rc from every enabled
 /// module. The kernel-side read hook splices this file into init.rc on the
 /// next boot.
@@ -487,6 +507,7 @@ pub fn regenerate_preinit_rc() -> Result<()> {
                 collect_rc_files(path.join(defs::MODULE_INIT_RC_DIR), Some(&id), &mut tmp)?;
             }
         }
+        append_auditd_init_rc(&mut tmp)?;
         tmp.sync_all()?;
     }
 

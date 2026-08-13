@@ -3,7 +3,7 @@ use log::{info, warn};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -18,6 +18,7 @@ use crate::{defs, module_response, utils};
 
 const AUDITD_LOCK_MODE: u32 = 0o600;
 const AUDITD_RESTART_DELAY: Duration = Duration::from_secs(3);
+const AUDITD_LOCK_WAIT: Duration = Duration::from_secs(1);
 const EVENT_BUF_SIZE: usize = 64 * 1024;
 const DEBOUNCE_DELAY: Duration = Duration::from_millis(150);
 const PERIODIC_VERIFY_INTERVAL: Duration = Duration::from_secs(30);
@@ -339,9 +340,12 @@ fn run_auditd_session(last_contained: &mut BTreeSet<String>) -> Result<()> {
 }
 
 pub fn run_auditd() -> Result<()> {
-    let Some(_lock_guard) = AuditdLockGuard::acquire()? else {
-        info!("auditd lock is held, skipping start");
-        return Ok(());
+    let _lock_guard = loop {
+        if let Some(guard) = AuditdLockGuard::acquire()? {
+            break guard;
+        }
+        info!("auditd lock is held; waiting for it to become available");
+        thread::sleep(AUDITD_LOCK_WAIT);
     };
 
     let mut last_contained = BTreeSet::new();
@@ -377,4 +381,27 @@ pub fn spawn_auditd() -> Result<()> {
 
 pub fn ensure_auditd_running() -> Result<()> {
     spawn_auditd()
+}
+
+pub fn record_restart_notify() {
+    log::error!("auditd restarted by init");
+    if let Err(error) = append_restart_marker() {
+        warn!("failed to persist auditd restart marker: {error:#}");
+    }
+}
+
+fn append_restart_marker() -> Result<()> {
+    utils::ensure_dir_exists(defs::WORKING_DIR)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(AUDITD_LOCK_MODE)
+        .open(defs::AUDITD_RESTART_LOG_PATH)
+        .with_context(|| format!("failed to open {}", defs::AUDITD_RESTART_LOG_PATH))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_secs();
+    writeln!(file, "{timestamp}")?;
+    Ok(())
 }

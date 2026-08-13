@@ -44,6 +44,10 @@ enum Commands {
     #[command(hide = true)]
     Auditd,
 
+    /// Record an auditd restart security event.
+    #[command(hide = true)]
+    AuditdRestartNotify,
+
     /// Trigger `boot-complete` event
     BootCompleted,
 
@@ -1190,6 +1194,10 @@ pub fn run() -> Result<()> {
         }
         Commands::Sulogd => sulog::run_sulogd(),
         Commands::Auditd => auditd::run_auditd(),
+        Commands::AuditdRestartNotify => {
+            auditd::record_restart_notify();
+            Ok(())
+        }
         Commands::Profile { command } => match command {
             Profile::GetSepolicy { package } => crate::profile::get_sepolicy(package),
             Profile::SetSepolicy { package, policy } => {

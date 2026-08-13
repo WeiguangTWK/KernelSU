@@ -49,9 +49,6 @@ pub fn on_post_data_fs() -> Result<()> {
     if let Err(e) = crate::module_response::enforce_containment(true) {
         warn!("enforce module audit containment failed: {e:#}");
     }
-    if let Err(e) = crate::auditd::ensure_auditd_running() {
-        warn!("ensure auditd running failed: {e:#}");
-    }
 
     let safe_mode = crate::utils::is_safe_mode();
 
@@ -153,10 +150,6 @@ pub fn run_stage(stage: &str, block: bool) {
     if crate::utils::is_safe_mode() {
         warn!("safe mode, skip {stage} scripts");
         return;
-    }
-
-    if let Err(e) = crate::auditd::ensure_auditd_running() {
-        warn!("ensure auditd running before {stage} failed: {e:#}");
     }
 
     if let Err(e) = crate::module_response::enforce_containment(true) {
