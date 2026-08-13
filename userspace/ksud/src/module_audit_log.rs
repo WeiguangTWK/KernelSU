@@ -2072,8 +2072,17 @@ fn sealed_integrity_status_unlocked(root: &Path, key: &[u8; 32]) -> Result<Seale
             && recovery.seal_hash == seal.seal_hash
         {
             verify_sealed_recovery_record(&recovery, &seal, &registry, root, key)?;
-            verify_chain(root, &module.module_id, key, true)?;
-            continue;
+            match verify_chain(root, &module.module_id, key, true) {
+                Ok(_) => continue,
+                Err(error) => {
+                    if let Some(failure) = diagnose_sealed_module(root, module)? {
+                        failures.push(failure);
+                        continue;
+                    }
+                    return Err(error)
+                        .context("recovered audit chain failed without sealed damage");
+                }
+            }
         }
         if let Some(failure) = diagnose_sealed_module(root, module)? {
             failures.push(failure);
@@ -3095,6 +3104,13 @@ pub fn recover_manager_sealed_module(
     } else {
         write_record(&recovery_path, recovery, &key)?;
     }
+    let events_dir = module_path(root, module_id).join("events");
+    if events_dir.is_dir() {
+        let (_, unexpected) = audit_event_paths(&events_dir)?;
+        if !unexpected.is_empty() {
+            let _quarantine = quarantine_unexpected_entries(root, module_id, &unexpected)?;
+        }
+    }
     let module_status = verify_module_unlocked(root, module_id, true)?;
     let mut operation_record = read_operation(root, &operation.operation_id, &key)?
         .context("sealed recovery operation disappeared")?;
@@ -4029,6 +4045,23 @@ fn quarantine_suffix(root: &Path, module_id: &str, paths: &[PathBuf]) -> Result<
     if head.exists() {
         std::fs::rename(&head, directory.join("head.json"))
             .context("quarantine invalid audit head")?;
+    }
+    sync_dir(directory.parent().context("quarantine has no parent")?)?;
+    Ok(directory)
+}
+
+fn quarantine_unexpected_entries(
+    root: &Path,
+    module_id: &str,
+    paths: &[PathBuf],
+) -> Result<PathBuf> {
+    let directory = module_path(root, module_id)
+        .join("quarantine")
+        .join(format!("{}-{}", now(), std::process::id()));
+    ensure_dir(&directory)?;
+    for path in paths {
+        let name = path.file_name().context("audit event has no filename")?;
+        std::fs::rename(path, directory.join(name)).context("quarantine unexpected audit event")?;
     }
     sync_dir(directory.parent().context("quarantine has no parent")?)?;
     Ok(directory)
