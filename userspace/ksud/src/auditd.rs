@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -50,6 +50,10 @@ struct AuditdLockGuard {
     _lock_file: File,
 }
 
+pub struct AuditCoordinatorGuard {
+    _lock_file: File,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct InotifyEvent {
@@ -76,6 +80,42 @@ impl AuditdLockGuard {
             .open(defs::AUDITD_LOCK_PATH)
             .with_context(|| format!("failed to open {}", defs::AUDITD_LOCK_PATH))?;
 
+        if try_lock_file(&file)? {
+            Ok(Some(Self { _lock_file: file }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl AuditCoordinatorGuard {
+    pub fn acquire_blocking() -> Result<Self> {
+        utils::ensure_dir_exists(defs::WORKING_DIR)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(AUDITD_LOCK_MODE)
+            .open(defs::AUDIT_COORD_LOCK_PATH)
+            .with_context(|| format!("failed to open {}", defs::AUDIT_COORD_LOCK_PATH))?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        ensure!(
+            result == 0,
+            "lock audit coordinator: {}",
+            io::Error::last_os_error()
+        );
+        Ok(Self { _lock_file: file })
+    }
+
+    fn try_acquire() -> Result<Option<Self>> {
+        utils::ensure_dir_exists(defs::WORKING_DIR)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(AUDITD_LOCK_MODE)
+            .open(defs::AUDIT_COORD_LOCK_PATH)
+            .with_context(|| format!("failed to open {}", defs::AUDIT_COORD_LOCK_PATH))?;
         if try_lock_file(&file)? {
             Ok(Some(Self { _lock_file: file }))
         } else {
@@ -268,6 +308,18 @@ fn event_name(name_bytes: &[u8]) -> String {
 }
 
 fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recorded: &mut bool) {
+    let _coordinator = match AuditCoordinatorGuard::try_acquire() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            info!("audit dashboard snapshot in progress; deferring auditd verification");
+            return;
+        }
+        Err(error) => {
+            warn!("cannot acquire audit coordinator lock: {error:#}");
+            return;
+        }
+    };
+
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
     if !audit_root.exists() {
         if !last_contained.is_empty() {

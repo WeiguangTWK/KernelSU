@@ -41,7 +41,6 @@ import me.weishu.kernelsu.ui.util.recoverManagerSealedAudit
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
 import me.weishu.kernelsu.ui.util.securelyRemoveModule as runSecureModuleRemoval
 import me.weishu.kernelsu.ui.util.streamModuleAuditDashboard
-import me.weishu.kernelsu.ui.util.waitForModuleAuditDashboardChange
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicLong
@@ -50,7 +49,6 @@ class SecurityAuditViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(SecurityAuditUiState())
     val uiState: StateFlow<SecurityAuditUiState> = _uiState.asStateFlow()
     private var refreshJob: Job? = null
-    private var watchJob: Job? = null
     private val refreshGeneration = AtomicLong()
     private val checkpointStore by lazy { ModuleAuditCheckpointStore(ksuApp) }
 
@@ -155,7 +153,6 @@ class SecurityAuditViewModel : ViewModel() {
 
     fun refresh() {
         refreshJob?.cancel()
-        watchJob?.cancel()
         val generation = refreshGeneration.incrementAndGet()
         while (true) {
             val state = _uiState.value
@@ -283,7 +280,6 @@ class SecurityAuditViewModel : ViewModel() {
                         it.message ?: it::class.java.simpleName
                     },
                 )
-                startDashboardWatch(result.storeRevision)
             }.onFailure { error ->
                 if (error is CancellationException) throw error
                 if (refreshGeneration.get() != generation) return@onFailure
@@ -319,24 +315,6 @@ class SecurityAuditViewModel : ViewModel() {
         val storeRevision: String,
         val error: Throwable?,
     )
-
-    private fun startDashboardWatch(initialRevision: String) {
-        watchJob?.cancel()
-        watchJob = viewModelScope.launch(Dispatchers.IO) {
-            while (isActive) {
-                val changed = runCatching {
-                    waitForModuleAuditDashboardChange(initialRevision)
-                }.getOrElse {
-                    delay(1_000)
-                    false
-                }
-                if (changed) {
-                    viewModelScope.launch { refresh() }
-                    return@launch
-                }
-            }
-        }
-    }
 
     private suspend fun ensureAuditAuthorization(
         prefetchedStatus: JSONObject? = null,

@@ -2383,7 +2383,8 @@ pub fn set_containment_state(root: &Path, module_id: &str, state: ContainmentSta
     validate_module_id(module_id)?;
     let _lock = AuditLock::acquire(root, true)?;
     let key = load_key(root, false)?;
-    let state = match (read_containment_state(root, module_id, &key)?, state) {
+    let existing = read_containment_state(root, module_id, &key)?;
+    let state = match (existing, state) {
         (Some(ContainmentState::Contained), ContainmentState::PendingReboot) => {
             ContainmentState::Contained
         }
@@ -2392,6 +2393,9 @@ pub fn set_containment_state(root: &Path, module_id: &str, state: ContainmentSta
         }
         (_, requested) => requested,
     };
+    if existing == Some(state) {
+        return Ok(());
+    }
     write_record(
         &module_containment_record_path(root, module_id),
         ModuleContainmentRecord {

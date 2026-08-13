@@ -165,30 +165,6 @@ suspend fun streamModuleAuditDashboard(onLine: (String) -> Unit): Unit =
         }
     }
 
-suspend fun waitForModuleAuditDashboardChange(baseline: String): Boolean =
-    withContext(Dispatchers.IO) {
-        check(baseline.length == 64 && baseline.all { it.isLowerHexDigit() }) {
-            "Invalid module audit dashboard revision"
-        }
-        val stdout = ArrayList<String>()
-        val stderr = ArrayList<String>()
-        val result = withNewRootShell {
-            newJob()
-                .add(
-                    "${getKsuDaemonPath()} module audit-watch " +
-                        "--baseline $baseline --timeout-seconds 30"
-                )
-                .to(stdout, stderr)
-                .exec()
-        }
-        check(result.isSuccess) {
-            stderr.joinToString("\n").ifBlank { "Unable to watch module audit state" }
-        }
-        stdout.any { line ->
-            runCatching { JSONObject(line).optString("type") == "changed" }.getOrDefault(false)
-        }
-    }
-
 suspend fun getModuleAuditStatuses(): String = withContext(Dispatchers.IO) {
     runModuleAuditCommand(
         "audit-status --json",

@@ -711,6 +711,7 @@ fn emit_audit_dashboard_line(value: &serde_json::Value) -> Result<()> {
 
 fn stream_audit_dashboard() -> Result<()> {
     let root = std::path::Path::new(defs::MODULE_AUDIT_DIR);
+    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
     if crate::module_audit_log::dashboard_store_uninitialized(root)? {
         emit_audit_dashboard_line(&serde_json::json!({
             "type": "start",
@@ -763,6 +764,11 @@ fn stream_audit_dashboard() -> Result<()> {
         "completed": module_ids.len(),
         "total_modules": module_ids.len(),
     }))?;
+    // Query and finalize the Manager seal before snapshotting the checkpoint
+    // revision. manager_audit_seal_status may remove sealed operation trash,
+    // so keeping it after the revision read makes the dashboard nondeterministic
+    // while recovering an unsealed store.
+    let seal_status = crate::module_audit_log::manager_audit_seal_status(root)?;
     let checkpoint = crate::module_audit_log::checkpoint_payload(root)?;
     let checkpoint_revision = crate::module_audit_log::dashboard_store_revision(root)?;
     let checkpoint_heads = checkpoint
@@ -793,7 +799,6 @@ fn stream_audit_dashboard() -> Result<()> {
         std::path::Path::new(defs::MODULE_DIR),
         std::path::Path::new(defs::MODULE_UPDATE_DIR),
     );
-    let seal_status = crate::module_audit_log::manager_audit_seal_status(root)?;
     let authorization_status = crate::module_audit_log::manager_audit_auth_status_for_inventory(
         root,
         &checkpoint.inventory_hash,
