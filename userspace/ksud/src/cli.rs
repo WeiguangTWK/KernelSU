@@ -10,8 +10,8 @@ use crate::boot_patch::{BootPatchArgs, BootRestoreArgs};
 use crate::lkm_image::BootPatchV2Args;
 use crate::module::regenerate_preinit_rc;
 use crate::{
-    apk_sign, assets, debug, defs, init_event, ksu_uapi, ksucalls, module, module_config, sulog,
-    utils,
+    apk_sign, assets, auditd, debug, defs, init_event, ksu_uapi, ksucalls, module, module_config,
+    sulog, utils,
 };
 
 /// KernelSU userspace cli
@@ -39,6 +39,10 @@ enum Commands {
     /// Run sulog reader daemon. Not for user. Use `ksud debug sulogd` to launch daemon.
     #[command(hide = true)]
     Sulogd,
+
+    /// Run module audit watcher daemon. Not for user. Use `ksud debug auditd` to launch daemon.
+    #[command(hide = true)]
+    Auditd,
 
     /// Trigger `boot-complete` event
     BootCompleted,
@@ -225,6 +229,9 @@ enum Debug {
 
     /// Launch sulogd daemon manually
     Sulogd,
+
+    /// Launch auditd daemon manually
+    Auditd,
 
     /// Get kernel info
     Info,
@@ -1182,6 +1189,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Commands::Sulogd => sulog::run_sulogd(),
+        Commands::Auditd => auditd::run_auditd(),
         Commands::Profile { command } => match command {
             Profile::GetSepolicy { package } => crate::profile::get_sepolicy(package),
             Profile::SetSepolicy { package, policy } => {
@@ -1235,6 +1243,7 @@ pub fn run() -> Result<()> {
                 MarkCommand::Refresh => debug::mark_refresh(),
             },
             Debug::Sulogd => sulog::ensure_sulogd_running(),
+            Debug::Auditd => auditd::ensure_auditd_running(),
             Debug::Info => {
                 let info = ksucalls::get_info();
                 println!("version: {}", info.version);

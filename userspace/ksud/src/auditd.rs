@@ -1,0 +1,380 @@
+use anyhow::{Context, Result, bail};
+use log::{info, warn};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::mem::size_of;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
+
+use crate::{defs, module_response, utils};
+
+const AUDITD_LOCK_MODE: u32 = 0o600;
+const AUDITD_RESTART_DELAY: Duration = Duration::from_secs(3);
+const EVENT_BUF_SIZE: usize = 64 * 1024;
+const DEBOUNCE_DELAY: Duration = Duration::from_millis(150);
+const PERIODIC_VERIFY_INTERVAL: Duration = Duration::from_secs(30);
+
+const IN_ATTRIB: u32 = 0x0000_0004;
+const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+const IN_MOVED_FROM: u32 = 0x0000_0040;
+const IN_MOVED_TO: u32 = 0x0000_0080;
+const IN_CREATE: u32 = 0x0000_0100;
+const IN_DELETE: u32 = 0x0000_0200;
+const IN_DELETE_SELF: u32 = 0x0000_0400;
+const IN_MOVE_SELF: u32 = 0x0000_0800;
+const IN_UNMOUNT: u32 = 0x0000_2000;
+const IN_Q_OVERFLOW: u32 = 0x0000_4000;
+const IN_IGNORED: u32 = 0x0000_8000;
+const IN_ISDIR: u32 = 0x4000_0000;
+
+const WATCH_MASK: u32 = IN_ATTRIB
+    | IN_CLOSE_WRITE
+    | IN_MOVED_FROM
+    | IN_MOVED_TO
+    | IN_CREATE
+    | IN_DELETE
+    | IN_DELETE_SELF
+    | IN_MOVE_SELF
+    | IN_UNMOUNT;
+
+struct AuditdLockGuard {
+    _lock_file: File,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct InotifyEvent {
+    wd: i32,
+    mask: u32,
+    cookie: u32,
+    len: u32,
+}
+
+struct InotifyWatcher {
+    fd: RawFd,
+    watches: BTreeMap<PathBuf, i32>,
+    needs_refresh: bool,
+}
+
+impl AuditdLockGuard {
+    fn acquire() -> Result<Option<Self>> {
+        utils::ensure_dir_exists(defs::WORKING_DIR)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(AUDITD_LOCK_MODE)
+            .open(defs::AUDITD_LOCK_PATH)
+            .with_context(|| format!("failed to open {}", defs::AUDITD_LOCK_PATH))?;
+
+        if try_lock_file(&file)? {
+            Ok(Some(Self { _lock_file: file }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl InotifyWatcher {
+    fn new() -> Result<Self> {
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            bail!("inotify_init1 failed: {}", io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            watches: BTreeMap::new(),
+            needs_refresh: false,
+        })
+    }
+
+    fn refresh(&mut self) {
+        self.clear_watches();
+        self.add_dir(Path::new(defs::ADB_DIR));
+        self.add_tree(Path::new(defs::MODULE_AUDIT_DIR));
+        self.add_tree(Path::new(defs::MODULE_DIR));
+        self.add_tree(Path::new(defs::MODULE_UPDATE_DIR));
+        self.needs_refresh = false;
+    }
+
+    fn clear_watches(&mut self) {
+        for watch in self.watches.values() {
+            let watch = u32::try_from(*watch).unwrap_or(u32::MAX);
+            unsafe {
+                libc::inotify_rm_watch(self.fd, watch);
+            }
+        }
+        self.watches.clear();
+    }
+
+    fn add_dir(&mut self, path: &Path) {
+        if !path.is_dir() || self.watches.contains_key(path) {
+            return;
+        }
+
+        let Some(path_bytes) = CString::new(path.as_os_str().as_bytes()).ok() else {
+            warn!("cannot encode inotify watch path: {}", path.display());
+            return;
+        };
+        let watch = unsafe { libc::inotify_add_watch(self.fd, path_bytes.as_ptr(), WATCH_MASK) };
+        if watch < 0 {
+            warn!(
+                "failed to add inotify watch for {}: {}",
+                path.display(),
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        self.watches.insert(path.to_path_buf(), watch);
+    }
+
+    fn add_tree(&mut self, root: &Path) {
+        if !root.is_dir() {
+            return;
+        }
+
+        self.add_dir(root);
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                    pending.push(entry.path());
+                }
+            }
+        }
+    }
+
+    fn drain_events(&mut self) -> Result<bool> {
+        let mut observed = false;
+        let mut buffer = vec![0_u8; EVENT_BUF_SIZE];
+
+        loop {
+            let read = unsafe {
+                libc::read(
+                    self.fd,
+                    buffer.as_mut_ptr().cast::<libc::c_void>(),
+                    buffer.len(),
+                )
+            };
+            if read < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(observed);
+                }
+                return Err(error).context("read inotify events");
+            }
+            if read == 0 {
+                return Ok(observed);
+            }
+
+            observed = true;
+            let read_len = usize::try_from(read).context("inotify read length overflow")?;
+            self.process_bytes(&buffer[..read_len]);
+        }
+    }
+
+    fn process_bytes(&mut self, bytes: &[u8]) {
+        let event_size = size_of::<InotifyEvent>();
+        let mut offset = 0_usize;
+
+        while offset.saturating_add(event_size) <= bytes.len() {
+            let event = unsafe {
+                std::ptr::read_unaligned(bytes[offset..].as_ptr().cast::<InotifyEvent>())
+            };
+            let name_len = usize::try_from(event.len).unwrap_or(usize::MAX);
+            let Some(total_len) = event_size.checked_add(name_len) else {
+                break;
+            };
+            if offset.saturating_add(total_len) > bytes.len() {
+                break;
+            }
+
+            let name_start = offset.saturating_add(event_size);
+            let name_bytes = &bytes[name_start..name_start.saturating_add(name_len)];
+            self.handle_event(event, name_bytes);
+            offset = offset.saturating_add(total_len);
+        }
+    }
+
+    fn handle_event(&mut self, event: InotifyEvent, name_bytes: &[u8]) {
+        if event.mask & IN_IGNORED != 0 {
+            self.watches.retain(|_, watch| *watch != event.wd);
+        }
+
+        if event.mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT | IN_Q_OVERFLOW) != 0 {
+            self.needs_refresh = true;
+        }
+
+        if event.mask & (IN_CREATE | IN_MOVED_TO) != 0
+            && event.mask & IN_ISDIR != 0
+            && let Some(parent) = self.path_for_watch(event.wd)
+        {
+            let name = event_name(name_bytes);
+            self.add_dir(&parent.join(name));
+        }
+    }
+
+    fn path_for_watch(&self, watch_descriptor: i32) -> Option<PathBuf> {
+        self.watches
+            .iter()
+            .find_map(|(path, watch)| (*watch == watch_descriptor).then(|| path.clone()))
+    }
+}
+
+fn try_lock_file(file: &File) -> Result<bool> {
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    if let Some(code) = error.raw_os_error()
+        && (code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+    {
+        return Ok(false);
+    }
+
+    Err(error.into())
+}
+
+fn event_name(name_bytes: &[u8]) -> String {
+    let length = name_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name_bytes.len());
+    String::from_utf8_lossy(&name_bytes[..length]).into_owned()
+}
+
+fn verify_and_respond(last_contained: &mut BTreeSet<String>) {
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    if !audit_root.exists() {
+        if !last_contained.is_empty() {
+            warn!(
+                "module audit root is missing; applying in-memory containment for {} modules",
+                last_contained.len()
+            );
+            match module_response::enforce_memory_containment(last_contained) {
+                Ok(contained) => info!(
+                    "enforced in-memory containment for {} modules",
+                    contained.len()
+                ),
+                Err(error) => {
+                    warn!("failed to enforce in-memory containment: {error:#}");
+                }
+            }
+        }
+        return;
+    }
+
+    match module_response::enforce_containment(false) {
+        Ok(contained) => {
+            let next: BTreeSet<String> = contained.into_iter().collect();
+            if next != *last_contained {
+                info!("audit containment set changed: {} modules", next.len());
+            }
+            *last_contained = next;
+        }
+        Err(error) => {
+            warn!("audit verification and containment failed: {error:#}");
+        }
+    }
+}
+
+fn run_auditd_session(last_contained: &mut BTreeSet<String>) -> Result<()> {
+    let mut watcher = InotifyWatcher::new()?;
+    watcher.refresh();
+
+    loop {
+        if watcher.needs_refresh {
+            watcher.refresh();
+        }
+
+        verify_and_respond(last_contained);
+
+        let timeout_ms = i32::try_from(PERIODIC_VERIFY_INTERVAL.as_millis()).unwrap_or(i32::MAX);
+        let mut poll_fd = libc::pollfd {
+            fd: watcher.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&raw mut poll_fd, 1, timeout_ms) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error).context("poll audit watches");
+        }
+        if ready == 0 {
+            continue;
+        }
+
+        if poll_fd.revents & libc::POLLIN != 0 {
+            let observed = watcher.drain_events()?;
+            if watcher.needs_refresh {
+                watcher.refresh();
+            }
+            if observed {
+                thread::sleep(DEBOUNCE_DELAY);
+            }
+        } else if poll_fd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            watcher.needs_refresh = true;
+            thread::sleep(DEBOUNCE_DELAY);
+        }
+    }
+}
+
+pub fn run_auditd() -> Result<()> {
+    let Some(_lock_guard) = AuditdLockGuard::acquire()? else {
+        info!("auditd lock is held, skipping start");
+        return Ok(());
+    };
+
+    let mut last_contained = BTreeSet::new();
+    loop {
+        if let Err(error) = run_auditd_session(&mut last_contained) {
+            warn!(
+                "auditd session failed: {error:#}; restarting in {}s",
+                AUDITD_RESTART_DELAY.as_secs()
+            );
+        }
+        thread::sleep(AUDITD_RESTART_DELAY);
+    }
+}
+
+pub fn spawn_auditd() -> Result<()> {
+    if utils::create_daemon(true)? {
+        let mut command = Command::new("/proc/self/exe");
+        command
+            .arg("auditd")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .current_dir("/");
+
+        let error = command.exec();
+        log::error!("failed to exec auditd: {error:#}");
+        unsafe {
+            libc::_exit(1);
+        }
+    }
+    Ok(())
+}
+
+pub fn ensure_auditd_running() -> Result<()> {
+    spawn_auditd()
+}

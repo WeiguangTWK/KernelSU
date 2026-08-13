@@ -162,6 +162,45 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<Vec<String>> {
     Ok(ids.into_iter().collect())
 }
 
+/// Apply the last known containment set when the authenticated audit root is
+/// unavailable. This is only a best-effort runtime stopgap; the persisted audit
+/// store and Manager seal remain the authority once they are visible again.
+pub fn enforce_memory_containment(ids: &BTreeSet<String>) -> Result<Vec<String>> {
+    let mut changed = false;
+    for id in ids {
+        if let Err(error) = module::validate_module_id(id) {
+            warn!("skip invalid in-memory containment module id '{id}': {error:#}");
+            continue;
+        }
+
+        for root in [defs::MODULE_DIR, defs::MODULE_UPDATE_DIR] {
+            let module_path = Path::new(root).join(id);
+            if !module_path.is_dir() {
+                continue;
+            }
+
+            let disable = module_path.join(defs::DISABLE_FILE_NAME);
+            if !disable.exists() {
+                crate::utils::ensure_file_exists(&disable)?;
+                changed = true;
+            }
+
+            let remove = module_path.join(defs::REMOVE_FILE_NAME);
+            if remove.exists() {
+                std::fs::remove_file(&remove)
+                    .with_context(|| format!("cancel unsafe uninstall for module '{id}'"))?;
+                changed = true;
+            }
+        }
+    }
+
+    if changed {
+        module::regenerate_preinit_rc()?;
+    }
+
+    Ok(ids.iter().cloned().collect())
+}
+
 #[derive(Default)]
 struct PersistentContainmentResult {
     uncertain_ownership: bool,

@@ -12,6 +12,8 @@
 
 mod apk_sign;
 mod assets;
+#[cfg(target_os = "android")]
+mod auditd;
 mod boot_patch;
 #[cfg(target_os = "android")]
 mod cli;
