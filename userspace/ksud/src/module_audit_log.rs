@@ -387,6 +387,8 @@ pub struct SealedIntegrityFailure {
     pub module_id: String,
     pub corrupted_from_sequence: u64,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unexpected_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -419,6 +421,8 @@ struct SealedRecoveryRecord {
     base_inventory_hash: String,
     corrupted_from_sequence: u64,
     reason: String,
+    #[serde(default)]
+    unexpected_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1987,7 +1991,7 @@ fn verified_sealed_event_hashes(
         verify_sealed_recovery_record(&recovery, &seal, registry, root, key)?;
         let retained = usize::try_from(recovery.corrupted_from_sequence.saturating_sub(1))?;
         ensure!(
-            retained < hashes.len(),
+            retained <= hashes.len(),
             "sealed recovery boundary is outside the seal"
         );
         hashes.truncate(retained);
@@ -2045,6 +2049,7 @@ fn verify_sealed_recovery_record(
             module_id: recovery.module_id.clone(),
             corrupted_from_sequence: recovery.corrupted_from_sequence,
             reason: recovery.reason.clone(),
+            unexpected_paths: recovery.unexpected_paths.clone(),
         },
     )?;
     ensure!(
@@ -2114,6 +2119,10 @@ fn verified_sealed_prefix(
     } else {
         Vec::new()
     };
+    let unexpected_paths = unexpected
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     let mut valid = Vec::new();
     for (index, sealed_hash) in module.event_hashes.iter().enumerate() {
         let sequence = u64::try_from(index)?.saturating_add(1);
@@ -2139,20 +2148,32 @@ fn verified_sealed_prefix(
                         module_id: module.module_id.clone(),
                         corrupted_from_sequence: sequence,
                         reason: format!("{error:#}"),
+                        unexpected_paths: unexpected_paths.clone(),
                     }),
                 ));
             }
         }
     }
-    let failure = unexpected.first().map(|path| SealedIntegrityFailure {
-        module_id: module.module_id.clone(),
-        corrupted_from_sequence: u64::try_from(module.event_hashes.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(1),
-        reason: format!(
-            "audit event directory contains unexpected entry {}",
-            path.display()
-        ),
+    let failure = (!unexpected_paths.is_empty()).then(|| {
+        let reason = if unexpected_paths.len() == 1 {
+            format!(
+                "audit event directory contains unexpected entry {}",
+                unexpected_paths[0]
+            )
+        } else {
+            format!(
+                "audit event directory contains unexpected entries: {}",
+                unexpected_paths.join(", ")
+            )
+        };
+        SealedIntegrityFailure {
+            module_id: module.module_id.clone(),
+            corrupted_from_sequence: u64::try_from(module.event_hashes.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+            reason,
+            unexpected_paths,
+        }
     });
     Ok((valid, failure))
 }
@@ -3027,6 +3048,8 @@ fn sealed_recovery_arguments_hash(
         inventory_hash,
         &failure.module_id,
         failure.corrupted_from_sequence,
+        &failure.reason,
+        &failure.unexpected_paths,
     ))?;
     Ok(hex(&Sha256::digest(bytes)))
 }
@@ -3094,24 +3117,83 @@ pub fn recover_manager_sealed_module(
         seal_hash: status.seal_hash,
         base_inventory_hash: status.inventory_hash,
         corrupted_from_sequence: failure.corrupted_from_sequence,
-        reason: failure.reason,
+        reason: failure.reason.clone(),
+        unexpected_paths: failure.unexpected_paths.clone(),
     };
     let recovery_path = sealed_recovery_path(root, module_id);
     if recovery_path.exists() {
         let existing = read_sealed_recovery(root, module_id, &key)?
             .context("sealed recovery record disappeared")?;
-        ensure!(existing == recovery, "sealed recovery record changed");
+        if existing != recovery {
+            let previous_operation = read_operation(root, &existing.operation_id, &key)?
+                .context("sealed recovery operation is unavailable")?;
+            ensure!(
+                previous_operation.state == AuditOperationState::Applied,
+                "previous sealed recovery is still active; cannot start a new recovery"
+            );
+            write_record(&recovery_path, recovery.clone(), &key)?;
+        }
     } else {
         write_record(&recovery_path, recovery, &key)?;
     }
     let events_dir = module_path(root, module_id).join("events");
-    if events_dir.is_dir() {
-        let (_, unexpected) = audit_event_paths(&events_dir)?;
-        if !unexpected.is_empty() {
-            let _quarantine = quarantine_unexpected_entries(root, module_id, &unexpected)?;
-        }
+    let unexpected_entries = if events_dir.is_dir() {
+        audit_event_paths(&events_dir)?.1
+    } else {
+        Vec::new()
+    };
+    let current_unexpected_paths = unexpected_entries
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    ensure!(
+        current_unexpected_paths == failure.unexpected_paths,
+        "audit event directory changed after recovery authorization"
+    );
+    let unexpected_quarantine = if unexpected_entries.is_empty() {
+        None
+    } else {
+        Some(quarantine_unexpected_entries(
+            root,
+            module_id,
+            &unexpected_entries,
+        )?)
+    };
+
+    let registry = read_manager_auth_registry(root, &key)?
+        .context("Manager audit authorization key is not configured")?;
+    let seal = load_verified_manager_seal(root, &registry)?
+        .context("Manager audit seal is not configured")?;
+    let sealed_module = seal
+        .payload
+        .modules
+        .iter()
+        .find(|module| module.module_id == module_id)
+        .context("failed audit module is not present in the Manager seal")?;
+    let unexpected_only = failure.corrupted_from_sequence
+        == u64::try_from(sealed_module.event_hashes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+    if unexpected_only {
+        let quarantine =
+            unexpected_quarantine.context("unexpected audit entries were not quarantined")?;
+        let mut chain = verify_chain(root, module_id, &key, false)?;
+        append_incident(
+            root,
+            module_id,
+            &key,
+            &mut chain.events,
+            failure.corrupted_from_sequence,
+            failure.reason.clone(),
+            &quarantine,
+        )?;
+        write_risk(root, module_id, &key, "audit history integrity failure")?;
     }
-    let module_status = verify_module_unlocked(root, module_id, true)?;
+    let module_status = if unexpected_only {
+        verify_module_unlocked(root, module_id, false)?
+    } else {
+        verify_module_unlocked(root, module_id, true)?
+    };
     let mut operation_record = read_operation(root, &operation.operation_id, &key)?
         .context("sealed recovery operation disappeared")?;
     operation_record.completed_targets = targets;
@@ -5314,7 +5396,8 @@ mod tests {
                 seal_hash: status.seal_hash,
                 base_inventory_hash: status.inventory_hash,
                 corrupted_from_sequence: failure.corrupted_from_sequence,
-                reason: failure.reason,
+                reason: failure.reason.clone(),
+                unexpected_paths: failure.unexpected_paths.clone(),
             },
             &key,
         )

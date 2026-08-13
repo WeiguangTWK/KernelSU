@@ -125,7 +125,7 @@ internal fun isAuthenticatedAuditChainRebuild(
         .zip(currentHashes)
         .takeWhile { (oldHash, newHash) -> oldHash == newHash }
         .size
-    if (prefixLength >= previousHashes.size) return false
+    if (prefixLength > previousHashes.size) return false
     if (currentHashes.size != prefixLength + 1) return false
     val expectedSequence = prefixLength.toLong() + 1L
     if (corruptedFromSequence != 0L && corruptedFromSequence != expectedSequence) return false
@@ -512,6 +512,27 @@ class ModuleAuditCheckpointStore(context: Context) {
                 newModule.sequence > oldModule.sequence &&
                 newModule.eventHashes.hashAt(oldModule.sequence) == oldModule.headHash
             ) {
+                val recoveryEvidence = evidence[oldModule.moduleId]
+                if (
+                    recoveryEvidence != null &&
+                    newModule.highRisk &&
+                    newModule.eventHashes.size == oldModule.eventHashes.size + 1 &&
+                    isAuthenticatedAuditChainRebuild(
+                        previousHashes = oldModule.eventHashes,
+                        currentHashes = newModule.eventHashes,
+                        currentHighRisk = newModule.highRisk,
+                        hmacVerified = recoveryEvidence.hmacVerified,
+                        eventCount = recoveryEvidence.eventCount,
+                        lastSequence = recoveryEvidence.lastSequence,
+                        lastPreviousHash = recoveryEvidence.previousHash,
+                        lastKind = recoveryEvidence.lastKind,
+                        corruptedFromSequence = recoveryEvidence.corruptedFromSequence,
+                        reason = recoveryEvidence.reason,
+                        quarantine = recoveryEvidence.quarantine,
+                    )
+                ) {
+                    recoverableModules += oldModule.moduleId
+                }
                 continue
             }
             if (isRecoverableRollback(oldModule, newModule, evidence[oldModule.moduleId])) {
