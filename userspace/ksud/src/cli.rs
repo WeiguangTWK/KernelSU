@@ -48,6 +48,12 @@ enum Commands {
     #[command(hide = true)]
     AuditdRestartNotify,
 
+    /// Manage the KernelSU global security event audit store
+    GlobalAudit {
+        #[command(subcommand)]
+        command: GlobalAuditCommand,
+    },
+
     /// Trigger `boot-complete` event
     BootCompleted,
 
@@ -496,6 +502,46 @@ enum AuditSeal {
         /// file containing the UTF-8 checkpoint envelope encoded as hexadecimal
         #[arg(long)]
         file: std::path::PathBuf,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum GlobalAuditCommand {
+    /// Show the authenticated global audit status
+    Status,
+    /// Show the authenticated global audit history
+    History,
+    /// Show the canonical global audit checkpoint payload
+    Checkpoint,
+    /// Diagnose sealed global audit integrity failures
+    RecoveryStatus,
+    /// Manage the Manager authorization key for global audit mutations
+    Auth {
+        #[command(subcommand)]
+        command: GlobalAuditAuth,
+    },
+    /// Manage the Manager-sealed global audit checkpoint
+    Seal {
+        #[command(subcommand)]
+        command: AuditSeal,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum GlobalAuditAuth {
+    /// Show the registered Manager key and current global audit inventory
+    Status,
+    /// Trust the first Manager key for global audit mutations
+    Register {
+        /// uncompressed P-256 public key encoded as hexadecimal
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Replace a missing or mismatched Manager key in kernel safe mode
+    Recover {
+        /// uncompressed P-256 public key encoded as hexadecimal
+        #[arg(long)]
+        public_key: String,
     },
 }
 
@@ -1198,6 +1244,95 @@ pub fn run() -> Result<()> {
             auditd::record_restart_notify();
             Ok(())
         }
+        Commands::GlobalAudit { command } => match command {
+            GlobalAuditCommand::Status => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::global_audit::status()?)?
+                );
+                Ok(())
+            }
+            GlobalAuditCommand::History => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::global_audit::history()?)?
+                );
+                Ok(())
+            }
+            GlobalAuditCommand::Checkpoint => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::global_audit::checkpoint()?)?
+                );
+                Ok(())
+            }
+            GlobalAuditCommand::RecoveryStatus => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::global_audit::recovery_status()?)?
+                );
+                Ok(())
+            }
+            GlobalAuditCommand::Auth { command } => match command {
+                GlobalAuditAuth::Status => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::auth_status()?)?
+                    );
+                    Ok(())
+                }
+                GlobalAuditAuth::Register { public_key } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::register_auth_key(
+                            &public_key,
+                            false
+                        )?)?
+                    );
+                    Ok(())
+                }
+                GlobalAuditAuth::Recover { public_key } => {
+                    anyhow::ensure!(
+                        ksucalls::try_check_kernel_safemode()
+                            .context("query KernelSU safe mode for global audit key recovery")?,
+                        "Global audit authorization recovery requires KernelSU safe mode"
+                    );
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::register_auth_key(
+                            &public_key,
+                            true
+                        )?)?
+                    );
+                    Ok(())
+                }
+            },
+            GlobalAuditCommand::Seal { command } => match command {
+                AuditSeal::Status => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::seal_status()?)?
+                    );
+                    Ok(())
+                }
+                AuditSeal::Commit { file } => {
+                    let metadata = std::fs::metadata(&file)?;
+                    anyhow::ensure!(metadata.is_file(), "global audit seal input is not a file");
+                    anyhow::ensure!(
+                        metadata.len() <= 16 * 1024 * 1024,
+                        "global audit seal input is too large"
+                    );
+                    let envelope = std::fs::read_to_string(file)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::commit_seal(
+                            envelope.trim()
+                        )?)?
+                    );
+                    Ok(())
+                }
+            },
+        },
         Commands::Profile { command } => match command {
             Profile::GetSepolicy { package } => crate::profile::get_sepolicy(package),
             Profile::SetSepolicy { package, policy } => {

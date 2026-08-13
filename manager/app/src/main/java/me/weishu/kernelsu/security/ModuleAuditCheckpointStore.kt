@@ -140,13 +140,44 @@ internal fun isAuthenticatedAuditChainRebuild(
 private const val AUDIT_GENESIS_HASH =
     "0000000000000000000000000000000000000000000000000000000000000000"
 
-class ModuleAuditCheckpointStore(context: Context) {
-    private val checkpointFile = AtomicFile(File(context.noBackupFilesDir, CHECKPOINT_FILE_NAME))
+enum class AuditStoreDomain(
+    val keyAlias: String,
+    val checkpointFileName: String,
+    val previousCheckpointFileName: String,
+    val softwareKeyFileName: String,
+    val dashboardCacheFileName: String,
+    val authorizationPrefix: String,
+) {
+    ModuleAudit(
+        keyAlias = "kernelsu.module_audit.checkpoint.v1",
+        checkpointFileName = "module_audit_checkpoint.json",
+        previousCheckpointFileName = "module_audit_checkpoint_previous.json",
+        softwareKeyFileName = "module_audit_emergency_key.json",
+        dashboardCacheFileName = "module_audit_dashboard_cache.json",
+        authorizationPrefix = "kernelsu-audit-authorization-v2",
+    ),
+    GlobalAudit(
+        keyAlias = "kernelsu.global_audit.checkpoint.v1",
+        checkpointFileName = "global_audit_checkpoint.json",
+        previousCheckpointFileName = "global_audit_checkpoint_previous.json",
+        softwareKeyFileName = "global_audit_emergency_key.json",
+        dashboardCacheFileName = "global_audit_dashboard_cache.json",
+        authorizationPrefix = "kernelsu-global-audit-authorization-v1",
+    ),
+}
+
+class ModuleAuditCheckpointStore(
+    context: Context,
+    private val domain: AuditStoreDomain = AuditStoreDomain.ModuleAudit,
+) {
+    private val checkpointFile =
+        AtomicFile(File(context.noBackupFilesDir, domain.checkpointFileName))
     private val previousCheckpointFile =
-        AtomicFile(File(context.noBackupFilesDir, PREVIOUS_CHECKPOINT_FILE_NAME))
-    private val softwareKeyFile = AtomicFile(File(context.noBackupFilesDir, SOFTWARE_KEY_FILE_NAME))
+        AtomicFile(File(context.noBackupFilesDir, domain.previousCheckpointFileName))
+    private val softwareKeyFile =
+        AtomicFile(File(context.noBackupFilesDir, domain.softwareKeyFileName))
     private val dashboardCacheFile =
-        AtomicFile(File(context.noBackupFilesDir, DASHBOARD_CACHE_FILE_NAME))
+        AtomicFile(File(context.noBackupFilesDir, domain.dashboardCacheFileName))
     @Volatile
     private var trustedInventoryHash: String? = null
     @Volatile
@@ -174,7 +205,7 @@ class ModuleAuditCheckpointStore(context: Context) {
             }
             val envelopeText = readEnvelope()
             val hasAndroidKey = runCatching {
-                loadKeyStore().containsAlias(KEY_ALIAS)
+                loadKeyStore().containsAlias(domain.keyAlias)
             }.getOrDefault(false)
             val hasSoftwareKey = softwareKeyFile.baseFile.isFile
 
@@ -282,14 +313,14 @@ class ModuleAuditCheckpointStore(context: Context) {
                 "Manager checkpoint signature is invalid"
             }
         } else if (
-            runCatching { loadKeyStore().containsAlias(KEY_ALIAS) }.getOrDefault(false) ||
+            runCatching { loadKeyStore().containsAlias(domain.keyAlias) }.getOrDefault(false) ||
             softwareKeyFile.baseFile.isFile
         ) {
             activeProtection = loadCurrentSigningKey().protection
         }
         if (
             hasEnvelope ||
-            runCatching { loadKeyStore().containsAlias(KEY_ALIAS) }.getOrDefault(false) ||
+            runCatching { loadKeyStore().containsAlias(domain.keyAlias) }.getOrDefault(false) ||
             softwareKeyFile.baseFile.isFile
         ) {
             compromised("Audit mutations unavailable after checkpoint: $detail")
@@ -314,7 +345,7 @@ class ModuleAuditCheckpointStore(context: Context) {
         val envelopeText = readEnvelope() ?: error("Manager checkpoint data is missing")
         val envelope = parseEnvelope(envelopeText)
         val hasAndroidKey = runCatching {
-            loadKeyStore().containsAlias(KEY_ALIAS)
+            loadKeyStore().containsAlias(domain.keyAlias)
         }.getOrDefault(false)
         check(!(envelope.backend == AuditKeyBackend.SoftwareFile && hasAndroidKey)) {
             "Manager checkpoint key backend changed while its Keystore key remains"
@@ -612,7 +643,7 @@ class ModuleAuditCheckpointStore(context: Context) {
         check(challengeId.isSha256Hex())
         check(createdAtUnixSeconds >= 0L)
         val message = buildString {
-            append("kernelsu-audit-authorization-v2\n")
+            append(domain.authorizationPrefix).append('\n')
             append(action).append('\n')
             append(inventoryHash).append('\n')
             append(argumentsHash).append('\n')
@@ -796,7 +827,7 @@ class ModuleAuditCheckpointStore(context: Context) {
         check(challengeId.isSha256Hex()) { "Invalid ksud audit challenge id" }
         check(createdAtUnixSeconds >= 0L) { "Invalid ksud audit challenge timestamp" }
         val message = buildString {
-            append("kernelsu-audit-authorization-v2\n")
+            append(domain.authorizationPrefix).append('\n')
             append(action).append('\n')
             append(inventoryHash).append('\n')
             append(argumentsHash).append('\n')
@@ -942,7 +973,7 @@ class ModuleAuditCheckpointStore(context: Context) {
     }.getOrElse { androidError ->
         runCatching {
             val keyStore = loadKeyStore()
-            if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)
+            if (keyStore.containsAlias(domain.keyAlias)) keyStore.deleteEntry(domain.keyAlias)
         }
         runCatching {
             generateSoftwareSigningKey()
@@ -959,7 +990,7 @@ class ModuleAuditCheckpointStore(context: Context) {
         KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, ANDROID_KEY_STORE).run {
             initialize(
                 KeyGenParameterSpec.Builder(
-                    KEY_ALIAS,
+                    domain.keyAlias,
                     KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY,
                 )
                     .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
@@ -987,9 +1018,9 @@ class ModuleAuditCheckpointStore(context: Context) {
 
     private fun loadAndroidSigningKey(): AuditSigningKey {
         val keyStore = loadKeyStore()
-        val privateKey = keyStore.getKey(KEY_ALIAS, null) as? PrivateKey
+        val privateKey = keyStore.getKey(domain.keyAlias, null) as? PrivateKey
             ?: error("Manager Keystore key is missing")
-        val publicKey = keyStore.getCertificate(KEY_ALIAS)?.publicKey
+        val publicKey = keyStore.getCertificate(domain.keyAlias)?.publicKey
             ?: error("Manager Keystore certificate is missing")
         val protection = runCatching {
             KeyFactory.getInstance(privateKey.algorithm, ANDROID_KEY_STORE)
@@ -1044,7 +1075,7 @@ class ModuleAuditCheckpointStore(context: Context) {
         when (backend) {
             AuditKeyBackend.AndroidKeyStore -> runCatching {
                 val keyStore = loadKeyStore()
-                if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)
+                if (keyStore.containsAlias(domain.keyAlias)) keyStore.deleteEntry(domain.keyAlias)
             }
             AuditKeyBackend.SoftwareFile -> softwareKeyFile.delete()
         }
@@ -1369,12 +1400,7 @@ class ModuleAuditCheckpointStore(context: Context) {
 
     private companion object {
         const val ANDROID_KEY_STORE = "AndroidKeyStore"
-        const val KEY_ALIAS = "kernelsu.module_audit.checkpoint.v1"
         const val SIGNATURE_ALGORITHM = "SHA256withECDSA"
-        const val CHECKPOINT_FILE_NAME = "module_audit_checkpoint.json"
-        const val PREVIOUS_CHECKPOINT_FILE_NAME = "module_audit_checkpoint_previous.json"
-        const val SOFTWARE_KEY_FILE_NAME = "module_audit_emergency_key.json"
-        const val DASHBOARD_CACHE_FILE_NAME = "module_audit_dashboard_cache.json"
         const val ENVELOPE_SCHEMA_VERSION = 2
         const val SOFTWARE_KEY_SCHEMA_VERSION = 1
         const val CHECKPOINT_SCHEMA_VERSION = 6

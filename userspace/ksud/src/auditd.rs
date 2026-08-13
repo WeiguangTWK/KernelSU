@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use crate::{defs, module_response, utils};
+use crate::{defs, global_audit, module_audit_log::AuditEventKind, module_response, utils};
 
 const AUDITD_LOCK_MODE: u32 = 0o600;
 const AUDITD_RESTART_DELAY: Duration = Duration::from_secs(3);
@@ -213,7 +213,14 @@ impl InotifyWatcher {
             self.watches.retain(|_, watch| *watch != event.wd);
         }
 
-        if event.mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT | IN_Q_OVERFLOW) != 0 {
+        if event.mask & IN_Q_OVERFLOW != 0 {
+            self.needs_refresh = true;
+            if let Err(error) = global_audit::record_event(AuditEventKind::WatchOverflow) {
+                warn!("failed to record audit watch overflow event: {error:#}");
+            }
+        }
+
+        if event.mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT) != 0 {
             self.needs_refresh = true;
         }
 
@@ -260,10 +267,16 @@ fn event_name(name_bytes: &[u8]) -> String {
     String::from_utf8_lossy(&name_bytes[..length]).into_owned()
 }
 
-fn verify_and_respond(last_contained: &mut BTreeSet<String>) {
+fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recorded: &mut bool) {
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
     if !audit_root.exists() {
         if !last_contained.is_empty() {
+            if !*store_missing_recorded {
+                if let Err(error) = global_audit::record_event(AuditEventKind::AuditStoreMissing) {
+                    warn!("failed to record audit store missing event: {error:#}");
+                }
+                *store_missing_recorded = true;
+            }
             warn!(
                 "module audit root is missing; applying in-memory containment for {} modules",
                 last_contained.len()
@@ -280,12 +293,18 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>) {
         }
         return;
     }
+    *store_missing_recorded = false;
 
     match module_response::enforce_containment(false) {
         Ok(contained) => {
             let next: BTreeSet<String> = contained.into_iter().collect();
             if next != *last_contained {
                 info!("audit containment set changed: {} modules", next.len());
+                if let Err(error) = global_audit::record_event(AuditEventKind::ContainmentApplied {
+                    module_ids: next.iter().cloned().collect(),
+                }) {
+                    warn!("failed to record audit containment event: {error:#}");
+                }
             }
             *last_contained = next;
         }
@@ -295,7 +314,10 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>) {
     }
 }
 
-fn run_auditd_session(last_contained: &mut BTreeSet<String>) -> Result<()> {
+fn run_auditd_session(
+    last_contained: &mut BTreeSet<String>,
+    store_missing_recorded: &mut bool,
+) -> Result<()> {
     let mut watcher = InotifyWatcher::new()?;
     watcher.refresh();
 
@@ -304,7 +326,7 @@ fn run_auditd_session(last_contained: &mut BTreeSet<String>) -> Result<()> {
             watcher.refresh();
         }
 
-        verify_and_respond(last_contained);
+        verify_and_respond(last_contained, store_missing_recorded);
 
         let timeout_ms = i32::try_from(PERIODIC_VERIFY_INTERVAL.as_millis()).unwrap_or(i32::MAX);
         let mut poll_fd = libc::pollfd {
@@ -349,8 +371,9 @@ pub fn run_auditd() -> Result<()> {
     };
 
     let mut last_contained = BTreeSet::new();
+    let mut store_missing_recorded = false;
     loop {
-        if let Err(error) = run_auditd_session(&mut last_contained) {
+        if let Err(error) = run_auditd_session(&mut last_contained, &mut store_missing_recorded) {
             warn!(
                 "auditd session failed: {error:#}; restarting in {}s",
                 AUDITD_RESTART_DELAY.as_secs()
@@ -385,6 +408,11 @@ pub fn ensure_auditd_running() -> Result<()> {
 
 pub fn record_restart_notify() {
     log::error!("auditd restarted by init");
+    if let Err(error) = global_audit::record_event(AuditEventKind::AuditdRestart {
+        reason: "init restarted auditd".to_owned(),
+    }) {
+        warn!("failed to record auditd restart event: {error:#}");
+    }
     if let Err(error) = append_restart_marker() {
         warn!("failed to persist auditd restart marker: {error:#}");
     }

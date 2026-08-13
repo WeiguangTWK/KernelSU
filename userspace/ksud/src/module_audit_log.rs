@@ -63,6 +63,14 @@ pub enum AuditEventKind {
         operation_id: String,
         removed_paths: Vec<String>,
     },
+    AuditdRestart {
+        reason: String,
+    },
+    ContainmentApplied {
+        module_ids: Vec<String>,
+    },
+    AuditStoreMissing,
+    WatchOverflow,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3703,6 +3711,12 @@ fn append_event(root: &Path, module_id: &str, kind: AuditEventKind) -> Result<()
         kind,
     };
     write_event(root, module_id, &key, event)
+}
+
+pub fn append_global_event(root: &Path, module_id: &str, kind: AuditEventKind) -> Result<()> {
+    validate_module_id(module_id)?;
+    let _lock = AuditLock::acquire(root, true)?;
+    append_event(root, module_id, kind)
 }
 
 fn verify_chain(
