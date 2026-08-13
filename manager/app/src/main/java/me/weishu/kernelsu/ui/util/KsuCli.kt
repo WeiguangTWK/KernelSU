@@ -146,6 +146,68 @@ suspend fun getModuleAuditHistories(): String = withContext(Dispatchers.IO) {
     stdout.joinToString("\n").ifBlank { "[]" }
 }
 
+suspend fun getGlobalAuditHistory(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} global-audit history")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read global audit history" }
+    }
+    stdout.joinToString("\n").ifBlank { "{}" }
+}
+
+suspend fun getGlobalAuditStatus(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} global-audit status")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read global audit status" }
+    }
+    stdout.joinToString("\n").also { check(it.isNotBlank()) }
+}
+
+suspend fun getGlobalAuditRevision(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} global-audit store-revision")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read global audit revision" }
+    }
+    stdout.firstOrNull()?.trim().also { check(!it.isNullOrBlank()) } ?: ""
+}
+
+suspend fun waitForGlobalAuditChange(baseline: String): Boolean = withContext(Dispatchers.IO) {
+    check(baseline.length == 64 && baseline.all { it.isLowerHexDigit() }) {
+        "Invalid global audit dashboard revision"
+    }
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = withNewRootShell {
+        newJob()
+            .add(
+                "${getKsuDaemonPath()} global-audit watch " +
+                    "--baseline $baseline --timeout-seconds 30"
+            )
+            .to(stdout, stderr)
+            .exec()
+    }
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to watch global audit state" }
+    }
+    stdout.any { line ->
+        runCatching { JSONObject(line).optString("type") == "changed" }.getOrDefault(false)
+    }
+}
+
 suspend fun streamModuleAuditDashboard(onLine: (String) -> Unit): Unit =
     withContext(Dispatchers.IO) {
         val stderr = ArrayList<String>()

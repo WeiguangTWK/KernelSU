@@ -32,6 +32,10 @@ pub fn checkpoint() -> Result<CheckpointPayload> {
     crate::module_audit_log::checkpoint_payload(root())
 }
 
+pub fn store_revision() -> Result<String> {
+    crate::module_audit_log::dashboard_store_revision(root())
+}
+
 pub fn recovery_status() -> Result<SealedIntegrityStatus> {
     crate::module_audit_log::sealed_integrity_status(root())
 }

@@ -513,8 +513,19 @@ enum GlobalAuditCommand {
     History,
     /// Show the canonical global audit checkpoint payload
     Checkpoint,
+    /// Show the content-derived global audit store revision
+    StoreRevision,
     /// Diagnose sealed global audit integrity failures
     RecoveryStatus,
+    /// Wait for a change to the global audit store revision
+    Watch {
+        /// Baseline store revision
+        #[arg(long)]
+        baseline: String,
+        /// Maximum wait in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
     /// Manage the Manager authorization key for global audit mutations
     Auth {
         #[command(subcommand)]
@@ -819,12 +830,27 @@ fn stream_audit_dashboard() -> Result<()> {
 }
 
 fn watch_audit_dashboard(baseline: &str, timeout_seconds: u64) -> Result<()> {
+    watch_audit_root(
+        std::path::Path::new(defs::MODULE_AUDIT_DIR),
+        baseline,
+        timeout_seconds,
+    )
+}
+
+fn watch_global_audit_dashboard(baseline: &str, timeout_seconds: u64) -> Result<()> {
+    watch_audit_root(
+        std::path::Path::new(defs::GLOBAL_AUDIT_DIR),
+        baseline,
+        timeout_seconds,
+    )
+}
+
+fn watch_audit_root(root: &std::path::Path, baseline: &str, timeout_seconds: u64) -> Result<()> {
     anyhow::ensure!(
         baseline.len() == 64 && baseline.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "invalid audit dashboard revision"
     );
     anyhow::ensure!(timeout_seconds <= 60, "audit watch timeout is too large");
-    let root = std::path::Path::new(defs::MODULE_AUDIT_DIR);
     let started = std::time::Instant::now();
     loop {
         let revision = crate::module_audit_log::dashboard_store_revision(root)?;
@@ -1271,6 +1297,10 @@ pub fn run() -> Result<()> {
                 );
                 Ok(())
             }
+            GlobalAuditCommand::StoreRevision => {
+                println!("{}", crate::global_audit::store_revision()?);
+                Ok(())
+            }
             GlobalAuditCommand::RecoveryStatus => {
                 println!(
                     "{}",
@@ -1278,6 +1308,10 @@ pub fn run() -> Result<()> {
                 );
                 Ok(())
             }
+            GlobalAuditCommand::Watch {
+                baseline,
+                timeout_seconds,
+            } => watch_global_audit_dashboard(&baseline, timeout_seconds),
             GlobalAuditCommand::Auth { command } => match command {
                 GlobalAuditAuth::Status => {
                     println!(

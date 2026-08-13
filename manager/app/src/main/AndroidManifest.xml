@@ -61,6 +61,15 @@
                     android:host="webui"
                     android:scheme="ksu" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data
+                    android:host="audit"
+                    android:scheme="ksu" />
+            </intent-filter>
         </activity>
 
         <activity
@@ -93,6 +102,14 @@
             android:name=".ui.util.DownloadService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name=".ui.AuditEventReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="me.weishu.kernelsu.action.AUDIT_SECURITY_EVENT" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name=".magica.BootCompletedReceiver"

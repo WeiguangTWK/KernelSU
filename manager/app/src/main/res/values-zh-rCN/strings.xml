@@ -386,4 +386,8 @@
     <string name="nav_rail_collapse">收起导航栏</string>
     <string name="settings_navigation_badge">导航栏角标</string>
     <string name="settings_navigation_badge_summary">在导航栏显示已授权应用和已启用模块数量</string>
+    <string name="security_audit_global_restart">auditd 已被重启</string>
+    <string name="security_audit_global_containment">检测到模块被隔离，请打开安全中心处理</string>
+    <string name="security_audit_global_store_missing">模块审计根目录丢失</string>
+    <string name="security_audit_global_watch_overflow">审计事件队列溢出，可能遗漏了部分变更</string>
 </resources>

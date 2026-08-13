@@ -258,6 +258,7 @@ impl InotifyWatcher {
             if let Err(error) = global_audit::record_event(AuditEventKind::WatchOverflow) {
                 warn!("failed to record audit watch overflow event: {error:#}");
             }
+            notify_security_event("watch_overflow", "审计监听队列溢出，可能出现审计疏漏");
         }
 
         if event.mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT) != 0 {
@@ -327,6 +328,7 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
                 if let Err(error) = global_audit::record_event(AuditEventKind::AuditStoreMissing) {
                     warn!("failed to record audit store missing event: {error:#}");
                 }
+                notify_security_event("audit_store_missing", "模块审计根目录丢失");
                 *store_missing_recorded = true;
             }
             warn!(
@@ -356,6 +358,15 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
                     module_ids: next.iter().cloned().collect(),
                 }) {
                     warn!("failed to record audit containment event: {error:#}");
+                }
+                if !next.is_empty() {
+                    notify_security_event(
+                        "containment_applied",
+                        &format!(
+                            "模块 {} 已隔离，请处理",
+                            next.iter().cloned().collect::<Vec<_>>().join("、")
+                        ),
+                    );
                 }
             }
             *last_contained = next;
@@ -467,6 +478,35 @@ pub fn record_restart_notify() {
     }
     if let Err(error) = append_restart_marker() {
         warn!("failed to persist auditd restart marker: {error:#}");
+    }
+    notify_security_event("auditd_restart", "auditd 被重启");
+}
+
+fn notify_security_event(kind: &str, message: &str) {
+    let component = format!(
+        "{}/me.weishu.kernelsu.ui.AuditEventReceiver",
+        defs::DEFAULT_PACKAGE_NAME
+    );
+    let result = Command::new("/system/bin/am")
+        .arg("broadcast")
+        .arg("--user")
+        .arg("0")
+        .arg("-n")
+        .arg(component)
+        .arg("-a")
+        .arg("me.weishu.kernelsu.action.AUDIT_SECURITY_EVENT")
+        .arg("--es")
+        .arg("kind")
+        .arg(kind)
+        .arg("--es")
+        .arg("message")
+        .arg(message)
+        .status();
+
+    match result {
+        Ok(status) if status.success() => {}
+        Ok(status) => warn!("audit security broadcast exited with status {status}"),
+        Err(error) => warn!("failed to run audit security broadcast: {error:#}"),
     }
 }
 
