@@ -278,17 +278,21 @@ pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Resul
 }
 
 pub fn uninstall(package_name: &str) -> Result<()> {
+    println!("- Stopping audit daemon..");
+    let status = Command::new("stop")
+        .arg("ksud-auditd")
+        .status()
+        .context("stop audit daemon before uninstall")?;
+    anyhow::ensure!(
+        status.success(),
+        "failed to stop audit daemon before uninstall"
+    );
+
     if Path::new(defs::MODULE_DIR).exists() {
         println!("- Uninstall modules..");
         module::uninstall_all_modules()?;
         module::prune_modules()?;
     }
-    println!("- Removing directories..");
-    std::fs::remove_dir_all(defs::WORKING_DIR).ok();
-    std::fs::remove_file(defs::DAEMON_PATH).ok();
-    std::fs::remove_dir_all(defs::MODULE_DIR).ok();
-    std::fs::remove_dir_all(defs::PREINIT_DIR_WATCHDOG).ok();
-    std::fs::remove_dir_all(defs::PREINIT_DIR_DEFAULT).ok();
     println!("- Restore boot image..");
     boot_patch::restore(BootRestoreArgs {
         boot: None,
@@ -296,6 +300,16 @@ pub fn uninstall(package_name: &str) -> Result<()> {
         out: None,
         out_name: None,
     })?;
+
+    println!("- Removing directories..");
+    remove_uninstall_path(Path::new(defs::MODULE_UPDATE_DIR))?;
+    remove_uninstall_path(Path::new(defs::MODULE_DIR))?;
+    remove_uninstall_path(Path::new(defs::METAMODULE_DIR))?;
+    remove_uninstall_path(Path::new(defs::PREINIT_DIR_WATCHDOG))?;
+    remove_uninstall_path(Path::new(defs::PREINIT_DIR_DEFAULT))?;
+    remove_uninstall_path(Path::new(defs::WORKING_DIR))?;
+    remove_uninstall_path(Path::new(defs::DAEMON_PATH))?;
+
     println!("- Uninstall KernelSU manager..");
     Command::new("pm")
         .args(["uninstall", package_name])
@@ -304,6 +318,24 @@ pub fn uninstall(package_name: &str) -> Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(5));
     Command::new("reboot").spawn()?;
     Ok(())
+}
+
+fn remove_uninstall_path(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        std::result::Result::Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect uninstall path {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove uninstall directory {}", path.display()))
+    } else {
+        std::fs::remove_file(path)
+            .with_context(|| format!("remove uninstall file {}", path.display()))
+    }
 }
 
 pub fn reset_std() -> Result<()> {

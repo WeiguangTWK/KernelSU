@@ -29,12 +29,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.security.sealModuleAuditAfterInstall
 import me.weishu.kernelsu.ui.util.FlashResult
 import me.weishu.kernelsu.ui.util.LkmSelection
+import me.weishu.kernelsu.ui.util.beginAuditInstallSession
 import me.weishu.kernelsu.ui.util.flashModule
 import me.weishu.kernelsu.ui.util.installBoot
+import me.weishu.kernelsu.ui.util.listModules
+import me.weishu.kernelsu.ui.util.releaseAuditInstallSession
 import me.weishu.kernelsu.ui.util.restoreBoot
+import me.weishu.kernelsu.ui.util.toggleModule
 import me.weishu.kernelsu.ui.util.uninstallPermanently
+import org.json.JSONArray
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -89,22 +95,63 @@ sealed class FlashIt : Parcelable {
     data object FlashUninstall : FlashIt()
 }
 
-fun flashModulesSequentially(
+suspend fun flashModulesSequentially(
     uris: List<Uri>,
     onStdout: (String) -> Unit,
     onStderr: (String) -> Unit
 ): FlashResult {
-    for (uri in uris) {
-        flashModule(uri, onStdout, onStderr).apply {
-            if (code != 0) {
-                return FlashResult(code, err, showReboot)
+    val session = runCatching { beginAuditInstallSession() }.getOrElse { error ->
+        return FlashResult(1, error.message ?: "Unable to protect module installation", false)
+    }
+    var result = FlashResult(0, "", true)
+    try {
+        // Establish and seal an empty Manager-trusted baseline before the first
+        // installation operation is written. Initializing after flashing would
+        // correctly be rejected because an unpaired Manager must not bless
+        // pre-existing operations.
+        sealModuleAuditAfterInstall(session)
+        val before = moduleEnabledStates()
+        for (uri in uris) {
+            val installed = flashModule(uri, onStdout, onStderr)
+            if (installed.code != 0) {
+                result = installed
+                break
             }
         }
+        if (result.code == 0) {
+            val after = moduleEnabledStates()
+            val intendedEnabled = before.filterValues { it }.keys + (after.keys - before.keys)
+            val trust = sealModuleAuditAfterInstall(session)
+            val restore = intendedEnabled.intersect(trust.releasableModuleIds)
+            val failed = restore.filterNot { toggleModule(it, enable = true) }
+            check(failed.isEmpty()) {
+                "Unable to release sealed module isolation: ${failed.joinToString()}"
+            }
+        }
+    } catch (error: Throwable) {
+        val message = error.message ?: error::class.java.simpleName
+        onStderr(message)
+        result = FlashResult(1, message, false)
     }
-    return FlashResult(0, "", true)
+    runCatching { releaseAuditInstallSession(session) }.onFailure { error ->
+        val message = error.message ?: "Unable to restart audit protection"
+        onStderr(message)
+        if (result.code == 0) result = FlashResult(1, message, false)
+    }
+    return result
 }
 
-fun flashIt(
+private fun moduleEnabledStates(): Map<String, Boolean> {
+    val modules = JSONArray(listModules())
+    return buildMap {
+        for (index in 0 until modules.length()) {
+            val module = modules.getJSONObject(index)
+            put(module.getString("id"), module.getBoolean("enabled"))
+        }
+    }
+}
+
+suspend fun flashIt(
     flashIt: FlashIt,
     onStdout: (String) -> Unit,
     onStderr: (String) -> Unit

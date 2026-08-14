@@ -14,6 +14,7 @@ mod android {
     pub const AUDITD_LOCK_PATH: &str = concatcp!(WORKING_DIR, "auditd.lock");
     pub const AUDITD_RESTART_LOG_PATH: &str = concatcp!(WORKING_DIR, "auditd.restart.log");
     pub const AUDIT_COORD_LOCK_PATH: &str = concatcp!(WORKING_DIR, "audit-coord.lock");
+    pub const AUDIT_INSTALL_SESSION_DIR: &str = concatcp!(WORKING_DIR, "audit_install_sessions/");
 
     pub const PROFILE_DIR: &str = concatcp!(WORKING_DIR, "profile/");
     pub const PROFILE_SELINUX_DIR: &str = concatcp!(PROFILE_DIR, "selinux/");

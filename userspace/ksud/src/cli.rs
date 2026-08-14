@@ -48,6 +48,13 @@ enum Commands {
     #[command(hide = true)]
     AuditdRestartNotify,
 
+    /// Temporarily suspend auditd for a Manager-sealed module installation transaction.
+    #[command(hide = true)]
+    AuditInstallSession {
+        #[command(subcommand)]
+        command: AuditInstallSessionCommand,
+    },
+
     /// Manage the KernelSU global security event audit store
     GlobalAudit {
         #[command(subcommand)]
@@ -167,6 +174,21 @@ enum Commands {
     Initrc {
         #[command(subcommand)]
         command: Initrc,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuditInstallSessionCommand {
+    Begin {
+        id: String,
+        #[arg(long, default_value_t = 180)]
+        timeout_seconds: u64,
+    },
+    Status {
+        id: String,
+    },
+    Release {
+        id: String,
     },
 }
 
@@ -333,7 +355,11 @@ enum Module {
     },
 
     /// Stream a consolidated Security & Audit Center dashboard as JSON Lines
-    AuditDashboard,
+    AuditDashboard {
+        /// Active Manager installation session allowed to seal before containment.
+        #[arg(long)]
+        install_session: Option<String>,
+    },
 
     /// Wait briefly for the audit store to change, then request re-verification
     AuditWatch {
@@ -720,10 +746,20 @@ fn emit_audit_dashboard_line(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn stream_audit_dashboard() -> Result<()> {
+fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
     let root = std::path::Path::new(defs::MODULE_AUDIT_DIR);
     let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
-    crate::module_response::enforce_containment(false)?;
+    if let Some(id) = install_session {
+        anyhow::ensure!(
+            crate::auditd::install_session_active(id)?,
+            "audit installation session is not active"
+        );
+        if crate::module_audit_log::dashboard_store_uninitialized(root)? {
+            crate::module_audit_log::initialize_empty_store(root)?;
+        }
+    } else {
+        crate::module_response::enforce_containment(false)?;
+    }
     if crate::module_audit_log::dashboard_store_uninitialized(root)? {
         emit_audit_dashboard_line(&serde_json::json!({
             "type": "start",
@@ -948,7 +984,9 @@ pub fn run() -> Result<()> {
                     }
                     Ok(())
                 }
-                Module::AuditDashboard => stream_audit_dashboard(),
+                Module::AuditDashboard { install_session } => {
+                    stream_audit_dashboard(install_session.as_deref())
+                }
                 Module::AuditWatch {
                     baseline,
                     timeout_seconds,
@@ -1275,6 +1313,14 @@ pub fn run() -> Result<()> {
             auditd::record_restart_notify();
             Ok(())
         }
+        Commands::AuditInstallSession { command } => match command {
+            AuditInstallSessionCommand::Begin {
+                id,
+                timeout_seconds,
+            } => auditd::begin_install_session(&id, timeout_seconds),
+            AuditInstallSessionCommand::Status { id } => auditd::print_install_session_status(&id),
+            AuditInstallSessionCommand::Release { id } => auditd::release_install_session(&id),
+        },
         Commands::GlobalAudit { command } => match command {
             GlobalAuditCommand::Status => {
                 println!(

@@ -14,6 +14,7 @@ import com.topjohnwu.superuser.CallbackList
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.superuser.ShellUtils
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.BuildConfig
@@ -23,6 +24,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executor
+import java.util.UUID
 
 /**
  * @author weishu
@@ -100,6 +102,44 @@ fun execKsud(args: String, newShell: Boolean = false, globalMnt: Boolean = false
         }
     } else {
         ShellUtils.fastCmdResult(getRootShell(globalMnt), "${getKsuDaemonPath()} $args")
+    }
+}
+
+suspend fun beginAuditInstallSession(): String = withContext(Dispatchers.IO) {
+    val id = UUID.randomUUID().toString().replace("-", "")
+    check(execKsud("audit-install-session begin $id --timeout-seconds 180", newShell = true)) {
+        "Unable to start the audit installation session"
+    }
+    repeat(100) {
+        val stdout = ArrayList<String>()
+        val stderr = ArrayList<String>()
+        val result = getRootShell().newJob()
+            .add("${getKsuDaemonPath()} audit-install-session status $id")
+            .to(stdout, stderr)
+            .exec()
+        if (result.isSuccess) {
+            val status = stdout.firstOrNull()?.let { JSONObject(it) }
+            val error = status
+                ?.takeUnless { it.isNull("error") }
+                ?.optString("error")
+                ?.takeIf(String::isNotBlank)
+            if (error != null) {
+                runCatching { releaseAuditInstallSession(id) }
+                throw IllegalStateException(error)
+            }
+            if (status?.optBoolean("ready") == true) return@withContext id
+        }
+        delay(100)
+    }
+    error("Timed out waiting for the audit installation session")
+}
+
+suspend fun releaseAuditInstallSession(id: String) = withContext(Dispatchers.IO) {
+    check(id.length == 32 && id.all { it in '0'..'9' || it in 'a'..'f' }) {
+        "Invalid audit installation session id"
+    }
+    check(execKsud("audit-install-session release $id", newShell = true)) {
+        "Unable to release the audit installation session"
     }
 }
 
@@ -208,8 +248,15 @@ suspend fun waitForGlobalAuditChange(baseline: String): Boolean = withContext(Di
     }
 }
 
-suspend fun streamModuleAuditDashboard(onLine: (String) -> Unit): Unit =
+suspend fun streamModuleAuditDashboard(
+    installSession: String? = null,
+    onLine: (String) -> Unit,
+): Unit =
     withContext(Dispatchers.IO) {
+        check(
+            installSession == null ||
+                (installSession.length == 32 && installSession.all { it.isLowerHexDigit() })
+        ) { "Invalid audit installation session id" }
         val stderr = ArrayList<String>()
         val stdout = object : CallbackList<String?>(Executor { command -> command.run() }) {
             override fun onAddElement(value: String?) {
@@ -218,7 +265,10 @@ suspend fun streamModuleAuditDashboard(onLine: (String) -> Unit): Unit =
         }
         val result = withNewRootShell {
             newJob()
-                .add("${getKsuDaemonPath()} module audit-dashboard")
+                .add(
+                    "${getKsuDaemonPath()} module audit-dashboard" +
+                        (installSession?.let { " --install-session $it" } ?: "")
+                )
                 .to(stdout, stderr)
                 .exec()
         }

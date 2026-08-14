@@ -11,6 +11,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
 use std::time::Duration;
 
@@ -22,6 +24,10 @@ const AUDITD_LOCK_WAIT: Duration = Duration::from_secs(1);
 const EVENT_BUF_SIZE: usize = 64 * 1024;
 const DEBOUNCE_DELAY: Duration = Duration::from_millis(150);
 const PERIODIC_VERIFY_INTERVAL: Duration = Duration::from_secs(30);
+const SECURITY_EVENT_QUEUE_CAPACITY: usize = 8;
+const MAX_INSTALL_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
+const INSTALL_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const INSTALL_SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(8);
 
 const IN_ATTRIB: u32 = 0x0000_0004;
 const IN_CLOSE_WRITE: u32 = 0x0000_0008;
@@ -50,6 +56,10 @@ struct AuditdLockGuard {
     _lock_file: File,
 }
 
+struct AuditdResumeGuard {
+    services: Vec<&'static str>,
+}
+
 pub struct AuditCoordinatorGuard {
     _lock_file: File,
 }
@@ -69,6 +79,14 @@ struct InotifyWatcher {
     needs_refresh: bool,
 }
 
+#[derive(Debug)]
+struct SecurityEvent {
+    kind: String,
+    message: String,
+}
+
+static SECURITY_EVENT_SENDER: OnceLock<Option<SyncSender<SecurityEvent>>> = OnceLock::new();
+
 impl AuditdLockGuard {
     fn acquire() -> Result<Option<Self>> {
         utils::ensure_dir_exists(defs::WORKING_DIR)?;
@@ -84,6 +102,18 @@ impl AuditdLockGuard {
             Ok(Some(Self { _lock_file: file }))
         } else {
             Ok(None)
+        }
+    }
+}
+
+impl Drop for AuditdResumeGuard {
+    fn drop(&mut self) {
+        for service in &self.services {
+            match Command::new("start").arg(service).status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => warn!("failed to restart auditd service {service}: {status}"),
+                Err(error) => warn!("failed to restart auditd service {service}: {error:#}"),
+            }
         }
     }
 }
@@ -309,7 +339,7 @@ fn event_name(name_bytes: &[u8]) -> String {
 }
 
 fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recorded: &mut bool) {
-    let _coordinator = match AuditCoordinatorGuard::try_acquire() {
+    let coordinator = match AuditCoordinatorGuard::try_acquire() {
         Ok(Some(guard)) => guard,
         Ok(None) => {
             info!("audit dashboard snapshot in progress; deferring auditd verification");
@@ -321,9 +351,22 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
         }
     };
 
+    let notification = verify_and_respond_locked(last_contained, store_missing_recorded);
+    drop(coordinator);
+
+    if let Some(event) = notification {
+        notify_security_event(&event.kind, &event.message);
+    }
+}
+
+fn verify_and_respond_locked(
+    last_contained: &mut BTreeSet<String>,
+    store_missing_recorded: &mut bool,
+) -> Option<SecurityEvent> {
     match module_response::enforce_containment(false) {
         Ok(outcome) => {
             let next: BTreeSet<String> = outcome.module_ids.into_iter().collect();
+            let mut notification = None;
             if outcome.audit_unavailable {
                 if !*store_missing_recorded {
                     if let Err(error) =
@@ -331,10 +374,10 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
                     {
                         warn!("failed to record audit store missing event: {error:#}");
                     }
-                    notify_security_event(
-                        "audit_store_missing",
-                        "模块审计状态不可用，已执行全量隔离",
-                    );
+                    notification = Some(SecurityEvent {
+                        kind: "audit_store_missing".to_owned(),
+                        message: "模块审计状态不可用，已执行全量隔离".to_owned(),
+                    });
                     *store_missing_recorded = true;
                 }
                 warn!(
@@ -343,7 +386,7 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
                     outcome.audit_error.as_deref().unwrap_or("unknown error")
                 );
                 *last_contained = next;
-                return;
+                return notification;
             }
 
             *store_missing_recorded = false;
@@ -355,18 +398,20 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
                     warn!("failed to record audit containment event: {error:#}");
                 }
                 if !next.is_empty() {
-                    notify_security_event(
-                        "containment_applied",
-                        &format!(
+                    notification = Some(SecurityEvent {
+                        kind: "containment_applied".to_owned(),
+                        message: format!(
                             "模块 {} 已隔离，请处理",
                             next.iter().cloned().collect::<Vec<_>>().join("、")
                         ),
-                    );
+                    });
                 }
             }
             *last_contained = next;
+            notification
         }
         Err(error) => {
+            let mut notification = None;
             warn!("audit verification and containment failed: {error:#}");
             if !*store_missing_recorded {
                 if let Err(record_error) =
@@ -374,7 +419,10 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
                 {
                     warn!("failed to record audit failure event: {record_error:#}");
                 }
-                notify_security_event("audit_store_missing", "模块审计验证或全量隔离失败");
+                notification = Some(SecurityEvent {
+                    kind: "audit_store_missing".to_owned(),
+                    message: "模块审计验证或全量隔离失败".to_owned(),
+                });
                 *store_missing_recorded = true;
             }
             if !last_contained.is_empty()
@@ -383,6 +431,7 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
             {
                 warn!("failed to retain previous in-memory containment: {memory_error:#}");
             }
+            notification
         }
     }
 }
@@ -442,6 +491,11 @@ pub fn run_auditd() -> Result<()> {
         info!("auditd lock is held; waiting for it to become available");
         thread::sleep(AUDITD_LOCK_WAIT);
     };
+    if let Err(error) = std::fs::remove_dir_all(defs::AUDIT_INSTALL_SESSION_DIR)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        warn!("failed to clean stale audit install sessions: {error:#}");
+    }
 
     let mut last_contained = BTreeSet::new();
     let mut store_missing_recorded = false;
@@ -479,6 +533,171 @@ pub fn ensure_auditd_running() -> Result<()> {
     spawn_auditd()
 }
 
+fn install_session_dir(id: &str) -> Result<PathBuf> {
+    ensure!(
+        id.len() == 32
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "invalid audit install session id"
+    );
+    Ok(Path::new(defs::AUDIT_INSTALL_SESSION_DIR).join(id))
+}
+
+pub fn begin_install_session(id: &str, timeout_seconds: u64) -> Result<()> {
+    let session_dir = install_session_dir(id)?;
+    let timeout = Duration::from_secs(timeout_seconds);
+    ensure!(
+        !timeout.is_zero() && timeout <= MAX_INSTALL_SESSION_TIMEOUT,
+        "audit install session timeout must be between 1 and {} seconds",
+        MAX_INSTALL_SESSION_TIMEOUT.as_secs()
+    );
+    utils::ensure_dir_exists(defs::AUDIT_INSTALL_SESSION_DIR)?;
+    ensure!(
+        !session_dir.exists(),
+        "audit install session already exists"
+    );
+    utils::ensure_dir_exists(&session_dir)?;
+
+    if utils::create_daemon(true)? {
+        match run_install_session(&session_dir, timeout) {
+            Ok(()) => {
+                if let Err(error) = std::fs::remove_dir_all(&session_dir) {
+                    warn!(
+                        "failed to clean audit install session {}: {error:#}",
+                        session_dir.display()
+                    );
+                }
+            }
+            Err(error) => {
+                log::error!("audit install session failed: {error:#}");
+                let message = format!("{error:#}");
+                if let Err(write_error) = std::fs::write(session_dir.join("error"), message) {
+                    log::error!("failed to persist audit install session error: {write_error:#}");
+                }
+            }
+        }
+        unsafe { libc::_exit(0) };
+    }
+    Ok(())
+}
+
+fn run_install_session(session_dir: &Path, timeout: Duration) -> Result<()> {
+    let coordinator = AuditCoordinatorGuard::acquire_blocking()?;
+    for entry in std::fs::read_dir(defs::AUDIT_INSTALL_SESSION_DIR)? {
+        let path = entry?.path();
+        ensure!(
+            path == session_dir || !path.is_dir(),
+            "another audit installation session is active"
+        );
+    }
+    let stopped_services = stop_auditd_services()?;
+    let resume_guard = AuditdResumeGuard {
+        services: stopped_services,
+    };
+    let lock_deadline = std::time::Instant::now() + INSTALL_SESSION_LOCK_TIMEOUT;
+    let auditd_lock = loop {
+        if let Some(guard) = AuditdLockGuard::acquire()? {
+            break guard;
+        }
+        ensure!(
+            std::time::Instant::now() < lock_deadline,
+            "auditd lock remained held after stopping init services; terminate duplicate or debug auditd processes"
+        );
+        thread::sleep(INSTALL_SESSION_POLL_INTERVAL);
+    };
+    drop(coordinator);
+
+    utils::ensure_file_exists(session_dir.join("ready"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline && !session_dir.join("release").is_file() {
+        thread::sleep(INSTALL_SESSION_POLL_INTERVAL);
+    }
+
+    drop(auditd_lock);
+    drop(resume_guard);
+    Ok(())
+}
+
+fn stop_auditd_services() -> Result<Vec<&'static str>> {
+    let services = ["ksud-auditd", "kernelsu_auditd"]
+        .into_iter()
+        .filter_map(|service| {
+            utils::getprop(&format!("init.svc.{service}")).map(|state| (service, state))
+        })
+        .collect::<Vec<_>>();
+    // A freshly generated modules.rc is not visible to Android init until the
+    // next boot.  In that legitimate first-install state there is no service
+    // to stop or resume.  The caller still has to acquire AUDITD_LOCK_PATH
+    // before declaring the installation session ready, so an independently
+    // running auditd (or a stale debug instance) cannot be bypassed here.
+    if services.is_empty() {
+        info!("no auditd init service is registered in the current boot");
+        return Ok(Vec::new());
+    }
+
+    let active = services
+        .iter()
+        .filter(|(_, state)| matches!(state.as_str(), "running" | "restarting" | "stopping"))
+        .map(|(service, _)| *service)
+        .collect::<Vec<_>>();
+    for (service, state) in &services {
+        if matches!(state.as_str(), "running" | "restarting") {
+            let status = Command::new("stop")
+                .arg(service)
+                .status()
+                .with_context(|| format!("stop auditd service {service}"))?;
+            ensure!(status.success(), "failed to stop auditd service {service}");
+        }
+    }
+
+    let resume = if active.contains(&"ksud-auditd") {
+        "ksud-auditd"
+    } else if let Some(service) = active.first() {
+        service
+    } else if services
+        .iter()
+        .any(|(service, _)| *service == "ksud-auditd")
+    {
+        "ksud-auditd"
+    } else {
+        services[0].0
+    };
+    Ok(vec![resume])
+}
+
+pub fn print_install_session_status(id: &str) -> Result<()> {
+    let session_dir = install_session_dir(id)?;
+    let error = std::fs::read_to_string(session_dir.join("error")).ok();
+    println!(
+        "{}",
+        serde_json::json!({
+            "ready": session_dir.join("ready").is_file(),
+            "released": session_dir.join("release").is_file(),
+            "error": error,
+        })
+    );
+    Ok(())
+}
+
+pub fn install_session_active(id: &str) -> Result<bool> {
+    let session_dir = install_session_dir(id)?;
+    Ok(session_dir.join("ready").is_file() && !session_dir.join("release").exists())
+}
+
+pub fn release_install_session(id: &str) -> Result<()> {
+    let session_dir = install_session_dir(id)?;
+    if session_dir.join("error").is_file() {
+        std::fs::remove_dir_all(&session_dir).context("clean failed audit install session")?;
+        return Ok(());
+    }
+    ensure!(
+        session_dir.join("ready").is_file(),
+        "audit install session is not ready"
+    );
+    utils::ensure_file_exists(session_dir.join("release"))
+}
+
 pub fn record_restart_notify() {
     log::error!("auditd restarted by init");
     if let Err(error) = global_audit::record_event(AuditEventKind::AuditdRestart {
@@ -493,6 +712,52 @@ pub fn record_restart_notify() {
 }
 
 fn notify_security_event(kind: &str, message: &str) {
+    let Some(sender) = SECURITY_EVENT_SENDER
+        .get_or_init(start_security_event_worker)
+        .as_ref()
+    else {
+        return;
+    };
+    let event = SecurityEvent {
+        kind: kind.to_owned(),
+        message: message.to_owned(),
+    };
+
+    match sender.try_send(event) {
+        Ok(()) => {}
+        Err(TrySendError::Full(event)) => {
+            warn!(
+                "dropping audit security notification because its queue is full: {}",
+                event.kind
+            );
+        }
+        Err(TrySendError::Disconnected(event)) => {
+            warn!(
+                "dropping audit security notification because its worker stopped: {}",
+                event.kind
+            );
+        }
+    }
+}
+
+fn start_security_event_worker() -> Option<SyncSender<SecurityEvent>> {
+    let (sender, receiver) = mpsc::sync_channel(SECURITY_EVENT_QUEUE_CAPACITY);
+    match thread::Builder::new()
+        .name("audit-notify".to_owned())
+        .spawn(move || {
+            for event in receiver {
+                send_security_event(&event);
+            }
+        }) {
+        Ok(_) => Some(sender),
+        Err(error) => {
+            warn!("failed to start audit security notification worker: {error:#}");
+            None
+        }
+    }
+}
+
+fn send_security_event(event: &SecurityEvent) {
     let component = format!(
         "{}/me.weishu.kernelsu.ui.AuditEventReceiver",
         defs::DEFAULT_PACKAGE_NAME
@@ -507,10 +772,10 @@ fn notify_security_event(kind: &str, message: &str) {
         .arg("me.weishu.kernelsu.action.AUDIT_SECURITY_EVENT")
         .arg("--es")
         .arg("kind")
-        .arg(kind)
+        .arg(&event.kind)
         .arg("--es")
         .arg("message")
-        .arg(message)
+        .arg(&event.message)
         .status();
 
     match result {

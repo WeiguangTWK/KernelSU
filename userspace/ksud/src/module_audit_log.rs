@@ -1533,6 +1533,23 @@ pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
     checkpoint_payload_unlocked(root)
 }
 
+/// Create the authentication material for a genuinely empty audit store.
+///
+/// This is used only while the Manager holds an audit installation session so
+/// it can seal an empty baseline before the first module installation creates
+/// an operation record.  Never initialize over pre-existing store content:
+/// doing so would let a newly-installed Manager bless unauthenticated history.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn initialize_empty_store(root: &Path) -> Result<()> {
+    let _lock = AuditLock::acquire(root, true)?;
+    ensure!(
+        dashboard_store_uninitialized(root)?,
+        "refusing to initialize a non-empty module audit store"
+    );
+    load_key(root, true)?;
+    Ok(())
+}
+
 fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
     let key = load_key(root, false)?;
     recover_operation_progress(root, &key)?;
@@ -1807,6 +1824,15 @@ struct VerifiedManagerSeal {
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn manager_audit_seal_status(root: &Path) -> Result<ManagerAuditSealStatus> {
+    if dashboard_store_uninitialized(root)? {
+        return Ok(ManagerAuditSealStatus {
+            configured: false,
+            generation: None,
+            seal_hash: None,
+            inventory_hash: None,
+            key_id: None,
+        });
+    }
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
     let registry = read_manager_auth_registry(root, &key)?;
@@ -5985,6 +6011,7 @@ mod tests {
 
         assert!(dashboard_store_uninitialized(&root).unwrap());
         assert!(list_histories(&root, true).unwrap().is_empty());
+        assert!(!manager_audit_seal_status(&root).unwrap().configured);
         assert!(!root.exists());
 
         std::fs::create_dir(&root).unwrap();
@@ -5993,6 +6020,26 @@ mod tests {
         assert!(dashboard_store_uninitialized(&root).unwrap());
         std::fs::write(root.join("unexpected"), b"").unwrap();
         assert!(!dashboard_store_uninitialized(&root).unwrap());
+    }
+
+    #[test]
+    fn empty_store_initialization_never_adopts_existing_content() {
+        let temp = TempDir::new().unwrap();
+        let empty_root = temp.path().join("empty");
+        initialize_empty_store(&empty_root).unwrap();
+        assert!(empty_root.join(KEY_FILE).is_file());
+        assert!(
+            checkpoint_payload(&empty_root)
+                .unwrap()
+                .operations
+                .is_empty()
+        );
+
+        let occupied_root = temp.path().join("occupied");
+        std::fs::create_dir(&occupied_root).unwrap();
+        std::fs::write(occupied_root.join("unexpected"), b"untrusted").unwrap();
+        assert!(initialize_empty_store(&occupied_root).is_err());
+        assert!(!occupied_root.join(KEY_FILE).exists());
     }
 
     #[test]
