@@ -1164,6 +1164,7 @@ pub fn run() -> Result<()> {
                         serde_json::json!({
                             "kernel_safe_mode": ksucalls::try_check_kernel_safemode()
                                 .context("query KernelSU safe mode for audit response")?,
+                            "emergency": crate::module_response::audit_emergency_status()?,
                         })
                     );
                     Ok(())

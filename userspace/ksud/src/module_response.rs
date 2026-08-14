@@ -1,9 +1,11 @@
 use crate::{defs, ksucalls, metamodule, module, module_audit_log};
 use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,11 +19,172 @@ const PERSISTENT_SCRIPT_DIRS: &[&str] = &[
     "/data/adb/bootcompleted.d",
 ];
 
+const AUDIT_EMERGENCY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEmergencyPhase {
+    Applying,
+    Contained,
+    Incomplete,
+    Recovered,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEmergencyReason {
+    AuditStateUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEmergencyRecoveryCondition {
+    ManagerSealedInventoryVerified,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuditEmergencyStatus {
+    pub schema_version: u32,
+    pub active: bool,
+    pub phase: AuditEmergencyPhase,
+    pub reason: AuditEmergencyReason,
+    pub detail: String,
+    pub affected_module_ids: Vec<String>,
+    pub script_quarantine_root: String,
+    pub containment_failures: Vec<String>,
+    pub recovery_condition: AuditEmergencyRecoveryCondition,
+    pub triggered_at_unix_seconds: u64,
+    pub updated_at_unix_seconds: u64,
+}
+
 #[derive(Debug)]
 pub struct ContainmentOutcome {
     pub module_ids: Vec<String>,
     pub audit_unavailable: bool,
     pub audit_error: Option<String>,
+}
+
+pub fn audit_emergency_status() -> Result<Option<AuditEmergencyStatus>> {
+    read_audit_emergency_status(Path::new(defs::AUDIT_EMERGENCY_STATUS_FILE))
+}
+
+fn read_audit_emergency_status(path: &Path) -> Result<Option<AuditEmergencyStatus>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read audit emergency status {}", path.display()));
+        }
+    };
+    let status: AuditEmergencyStatus = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse audit emergency status {}", path.display()))?;
+    ensure!(
+        status.schema_version == AUDIT_EMERGENCY_SCHEMA_VERSION,
+        "unsupported audit emergency status schema {}",
+        status.schema_version
+    );
+    Ok(Some(status))
+}
+
+fn write_audit_emergency_status(path: &Path, status: &AuditEmergencyStatus) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("audit emergency status path has no parent")?;
+    ensure_private_dir(parent)?;
+    let mut bytes = serde_json::to_vec_pretty(status)?;
+    bytes.push(b'\n');
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".status-{}-{unique}.tmp", std::process::id()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .context("create temporary audit emergency status")?;
+    file.write_all(&bytes)
+        .context("write temporary audit emergency status")?;
+    file.sync_all()
+        .context("sync temporary audit emergency status")?;
+    std::fs::rename(&temporary, path).context("commit audit emergency status")?;
+    sync_directory(parent)
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn best_effort_module_ids(module_roots: &[&Path]) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for root in module_roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                ids.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn persist_active_emergency_status(
+    path: &Path,
+    phase: AuditEmergencyPhase,
+    detail: &str,
+    affected_module_ids: Vec<String>,
+    script_quarantine_root: &Path,
+    containment_failures: Vec<String>,
+) -> Result<()> {
+    let now = unix_time_seconds();
+    let triggered_at = match read_audit_emergency_status(path) {
+        Ok(Some(status)) if status.active => status.triggered_at_unix_seconds,
+        Ok(_) => now,
+        Err(error) => {
+            warn!("cannot preserve previous audit emergency timestamp: {error:#}");
+            now
+        }
+    };
+    write_audit_emergency_status(
+        path,
+        &AuditEmergencyStatus {
+            schema_version: AUDIT_EMERGENCY_SCHEMA_VERSION,
+            active: true,
+            phase,
+            reason: AuditEmergencyReason::AuditStateUnavailable,
+            detail: detail.to_owned(),
+            affected_module_ids,
+            script_quarantine_root: script_quarantine_root.to_string_lossy().into_owned(),
+            containment_failures,
+            recovery_condition: AuditEmergencyRecoveryCondition::ManagerSealedInventoryVerified,
+            triggered_at_unix_seconds: triggered_at,
+            updated_at_unix_seconds: now,
+        },
+    )
+}
+
+fn mark_audit_emergency_recovered(path: &Path) -> Result<()> {
+    let Some(mut status) = read_audit_emergency_status(path)? else {
+        return Ok(());
+    };
+    if !status.active {
+        return Ok(());
+    }
+    status.active = false;
+    status.phase = AuditEmergencyPhase::Recovered;
+    status.updated_at_unix_seconds = unix_time_seconds();
+    write_audit_emergency_status(path, &status)
 }
 
 /// Reject ordinary module mutations while authenticated audit state requires
@@ -106,6 +269,8 @@ pub fn contain_for_secure_removal(id: &str) -> Result<()> {
 /// marker cannot make the module active again.
 pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome> {
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    let emergency_status_path = Path::new(defs::AUDIT_EMERGENCY_STATUS_FILE);
+    let emergency_root = Path::new(defs::AUDIT_EMERGENCY_DIR);
     let module_roots = [
         Path::new(defs::MODULE_DIR),
         Path::new(defs::MODULE_UPDATE_DIR),
@@ -117,20 +282,60 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome>
             warn!(
                 "module audit state is unavailable; applying emergency fail-closed containment: {reason}"
             );
-            let ids = enforce_fail_closed(
+            let discovered_ids = best_effort_module_ids(&module_roots);
+            if let Err(status_error) = persist_active_emergency_status(
+                emergency_status_path,
+                AuditEmergencyPhase::Applying,
+                &reason,
+                discovered_ids.clone(),
+                emergency_root,
+                Vec::new(),
+            ) {
+                warn!("failed to record applying audit emergency state: {status_error:#}");
+            }
+            let response = enforce_fail_closed(
                 &module_roots,
                 &PERSISTENT_SCRIPT_DIRS
                     .iter()
                     .map(|path| Path::new(*path))
                     .collect::<Vec<_>>(),
-                Path::new(defs::AUDIT_EMERGENCY_DIR),
+                emergency_root,
                 module::regenerate_preinit_rc,
-            )?;
-            return Ok(ContainmentOutcome {
-                module_ids: ids.into_iter().collect(),
-                audit_unavailable: true,
-                audit_error: Some(reason),
-            });
+            );
+            return match response {
+                Ok(ids) => {
+                    let module_ids = ids.into_iter().collect::<Vec<_>>();
+                    persist_active_emergency_status(
+                        emergency_status_path,
+                        AuditEmergencyPhase::Contained,
+                        &reason,
+                        module_ids.clone(),
+                        emergency_root,
+                        Vec::new(),
+                    )?;
+                    Ok(ContainmentOutcome {
+                        module_ids,
+                        audit_unavailable: true,
+                        audit_error: Some(reason),
+                    })
+                }
+                Err(containment_error) => {
+                    let failure = format!("{containment_error:#}");
+                    if let Err(status_error) = persist_active_emergency_status(
+                        emergency_status_path,
+                        AuditEmergencyPhase::Incomplete,
+                        &reason,
+                        discovered_ids,
+                        emergency_root,
+                        vec![failure.clone()],
+                    ) {
+                        bail!(
+                            "{failure}; persist incomplete audit emergency status: {status_error:#}"
+                        );
+                    }
+                    Err(containment_error)
+                }
+            };
         }
     };
 
@@ -190,6 +395,7 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome>
         }
     }
 
+    mark_audit_emergency_recovered(emergency_status_path)?;
     Ok(ContainmentOutcome {
         module_ids: ids.into_iter().collect(),
         audit_unavailable: false,
@@ -762,6 +968,53 @@ mod tests {
             }
         }
         count
+    }
+
+    #[test]
+    fn emergency_status_tracks_containment_and_verified_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let emergency_root = temp.path().join("audit-emergency");
+        let status_path = emergency_root.join("status.json");
+
+        persist_active_emergency_status(
+            &status_path,
+            AuditEmergencyPhase::Applying,
+            "audit root is missing",
+            vec!["module.alpha".into()],
+            &emergency_root,
+            Vec::new(),
+        )
+        .unwrap();
+        let applying = read_audit_emergency_status(&status_path).unwrap().unwrap();
+        assert!(applying.active);
+        assert_eq!(applying.phase, AuditEmergencyPhase::Applying);
+        assert_eq!(applying.affected_module_ids, ["module.alpha"]);
+
+        persist_active_emergency_status(
+            &status_path,
+            AuditEmergencyPhase::Contained,
+            "audit root is missing",
+            vec!["module.alpha".into(), "module.beta".into()],
+            &emergency_root,
+            Vec::new(),
+        )
+        .unwrap();
+        let contained = read_audit_emergency_status(&status_path).unwrap().unwrap();
+        assert!(contained.active);
+        assert_eq!(contained.phase, AuditEmergencyPhase::Contained);
+        assert_eq!(
+            contained.triggered_at_unix_seconds,
+            applying.triggered_at_unix_seconds
+        );
+
+        mark_audit_emergency_recovered(&status_path).unwrap();
+        let recovered = read_audit_emergency_status(&status_path).unwrap().unwrap();
+        assert!(!recovered.active);
+        assert_eq!(recovered.phase, AuditEmergencyPhase::Recovered);
+        assert_eq!(
+            recovered.recovery_condition,
+            AuditEmergencyRecoveryCondition::ManagerSealedInventoryVerified
+        );
     }
 
     #[test]
