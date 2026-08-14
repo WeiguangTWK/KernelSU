@@ -2156,7 +2156,7 @@ fn verified_sealed_prefix(
                         module_id: module.module_id.clone(),
                         corrupted_from_sequence: sequence,
                         reason: format!("{error:#}"),
-                        unexpected_paths: unexpected_paths.clone(),
+                        unexpected_paths,
                     }),
                 ));
             }
@@ -3143,7 +3143,7 @@ pub fn recover_manager_sealed_module(
                 previous_operation.state == AuditOperationState::Applied,
                 "previous sealed recovery is still active; cannot start a new recovery"
             );
-            write_record(&recovery_path, recovery.clone(), &key)?;
+            write_record(&recovery_path, recovery, &key)?;
         }
     } else {
         write_record(&recovery_path, recovery, &key)?;
@@ -3196,7 +3196,7 @@ pub fn recover_manager_sealed_module(
             &key,
             &mut chain.events,
             failure.corrupted_from_sequence,
-            failure.reason.clone(),
+            failure.reason,
             &quarantine,
         )?;
         write_risk(root, module_id, &key, "audit history integrity failure")?;

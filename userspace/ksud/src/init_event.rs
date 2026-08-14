@@ -46,16 +46,20 @@ pub fn on_post_data_fs() -> Result<()> {
 
     // Resolve and materialize audit containment before any persistent or
     // module-controlled startup script is allowed to run.
-    if let Err(e) = crate::module_response::enforce_containment(true) {
+    let audit_containment_failed = if let Err(e) = crate::module_response::enforce_containment(true)
+    {
         warn!("enforce module audit containment failed: {e:#}");
-    }
+        true
+    } else {
+        false
+    };
 
-    let safe_mode = crate::utils::is_safe_mode();
+    let safe_mode = crate::utils::is_safe_mode() || audit_containment_failed;
 
     if safe_mode {
         // we should still ensure module directory exists in safe mode
         // because we may need to operate the module dir in safe mode
-        warn!("safe mode, skip common post-fs-data.d scripts");
+        warn!("safe mode or failed audit containment, skip common post-fs-data.d scripts");
     } else {
         // Then exec common post-fs-data scripts
         if let Err(e) = crate::module::exec_common_scripts("post-fs-data.d", true) {
@@ -69,7 +73,9 @@ pub fn on_post_data_fs() -> Result<()> {
 
     // if we are in safe mode, we should disable all modules
     if safe_mode {
-        warn!("safe mode, skip post-fs-data scripts and disable all modules!");
+        warn!(
+            "safe mode or failed audit containment, skip startup scripts and disable all modules!"
+        );
         if let Err(e) = crate::module::disable_all_modules() {
             warn!("disable all modules failed: {e}");
         }
@@ -154,6 +160,8 @@ pub fn run_stage(stage: &str, block: bool) {
 
     if let Err(e) = crate::module_response::enforce_containment(true) {
         warn!("refresh module audit containment before {stage}: {e:#}");
+        warn!("skip {stage} because fail-closed audit containment could not be completed");
+        return;
     }
 
     if let Err(e) = crate::module::exec_common_scripts(&format!("{stage}.d"), block) {

@@ -138,6 +138,11 @@ pub fn foreach_module(
         _ => defs::MODULE_DIR,
     });
     let dir = std::fs::read_dir(modules_dir)?;
+    let audit_containment = if module_type == Active {
+        Some(crate::module_response::active_containment_ids()?)
+    } else {
+        None
+    };
     for entry in dir.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -154,16 +159,12 @@ pub fn foreach_module(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            match crate::module_response::requires_containment(module_id) {
-                Ok(true) => {
-                    warn!("{} is audit-contained, skip", path.display());
-                    continue;
-                }
-                Ok(false) => {}
-                Err(error) => warn!(
-                    "cannot determine audit containment for {}: {error:#}",
-                    path.display()
-                ),
+            if audit_containment
+                .as_ref()
+                .is_some_and(|contained| contained.contains(module_id))
+            {
+                warn!("{} is audit-contained, skip", path.display());
+                continue;
             }
         }
         if module_type == Active && path.join(defs::REMOVE_FILE_NAME).exists() {

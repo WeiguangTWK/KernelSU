@@ -723,6 +723,7 @@ fn emit_audit_dashboard_line(value: &serde_json::Value) -> Result<()> {
 fn stream_audit_dashboard() -> Result<()> {
     let root = std::path::Path::new(defs::MODULE_AUDIT_DIR);
     let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+    crate::module_response::enforce_containment(false)?;
     if crate::module_audit_log::dashboard_store_uninitialized(root)? {
         emit_audit_dashboard_line(&serde_json::json!({
             "type": "start",
@@ -735,7 +736,6 @@ fn stream_audit_dashboard() -> Result<()> {
         }));
     }
 
-    crate::module_response::enforce_containment(false)?;
     let module_ids = crate::module_audit_log::dashboard_module_ids(root)?;
     emit_audit_dashboard_line(&serde_json::json!({
         "type": "start",

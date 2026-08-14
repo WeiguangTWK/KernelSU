@@ -9,6 +9,7 @@ mod android {
     pub const LOG_DIR: &str = concatcp!(WORKING_DIR, "log/");
     pub const MODULE_AUDIT_DIR: &str = concatcp!(WORKING_DIR, "module_audit/");
     pub const GLOBAL_AUDIT_DIR: &str = concatcp!(WORKING_DIR, "global_audit/");
+    pub const AUDIT_EMERGENCY_DIR: &str = concatcp!(WORKING_DIR, "audit_emergency/");
     pub const SULOGD_LOCK_PATH: &str = concatcp!(WORKING_DIR, "sulogd.lock");
     pub const AUDITD_LOCK_PATH: &str = concatcp!(WORKING_DIR, "auditd.lock");
     pub const AUDITD_RESTART_LOG_PATH: &str = concatcp!(WORKING_DIR, "auditd.restart.log");

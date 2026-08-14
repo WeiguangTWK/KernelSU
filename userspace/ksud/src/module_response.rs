@@ -1,14 +1,28 @@
 use crate::{defs, ksucalls, metamodule, module, module_audit_log};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::ffi::OsString;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 const PERSISTENT_SCRIPT_DIRS: &[&str] = &[
+    "/data/adb/post-fs-data.d",
     "/data/adb/service.d",
     "/data/adb/boot-completed.d",
     "/data/adb/bootcompleted.d",
 ];
+
+#[derive(Debug)]
+pub struct ContainmentOutcome {
+    pub module_ids: Vec<String>,
+    pub audit_unavailable: bool,
+    pub audit_error: Option<String>,
+}
 
 /// Reject ordinary module mutations while authenticated audit state requires
 /// incident response. The audit store remains authoritative; callers must not
@@ -21,8 +35,14 @@ pub fn ensure_action_allowed(id: &str, action: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn requires_containment(id: &str) -> Result<bool> {
-    module_audit_log::module_requires_containment(Path::new(defs::MODULE_AUDIT_DIR), id)
+pub fn active_containment_ids() -> Result<BTreeSet<String>> {
+    trusted_containment_ids(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        &[
+            Path::new(defs::MODULE_DIR),
+            Path::new(defs::MODULE_UPDATE_DIR),
+        ],
+    )
 }
 
 /// Cancel a conventional uninstall marker before untrusted module code can run.
@@ -84,24 +104,35 @@ pub fn contain_for_secure_removal(id: &str) -> Result<()> {
 /// Materialize authenticated audit containment into KernelSU's conventional
 /// module-disable markers. The audit state remains authoritative, so deleting a
 /// marker cannot make the module active again.
-pub fn enforce_containment(boot_enforcement: bool) -> Result<Vec<String>> {
+pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome> {
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    if !audit_root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut ids = BTreeSet::new();
-    if let Ok(status) = module_audit_log::sealed_integrity_status(audit_root) {
-        ids.extend(status.failures.into_iter().map(|failure| failure.module_id));
-    }
-    if let Ok(statuses) = module_audit_log::list_modules_resilient(audit_root, false) {
-        ids.extend(
-            statuses
-                .into_iter()
-                .filter(|status| status.unresolved_risk)
-                .map(|status| status.module_id),
-        );
-    }
+    let module_roots = [
+        Path::new(defs::MODULE_DIR),
+        Path::new(defs::MODULE_UPDATE_DIR),
+    ];
+    let ids = match trusted_containment_ids(audit_root, &module_roots) {
+        Ok(ids) => ids,
+        Err(error) => {
+            let reason = format!("{error:#}");
+            warn!(
+                "module audit state is unavailable; applying emergency fail-closed containment: {reason}"
+            );
+            let ids = enforce_fail_closed(
+                &module_roots,
+                &PERSISTENT_SCRIPT_DIRS
+                    .iter()
+                    .map(|path| Path::new(*path))
+                    .collect::<Vec<_>>(),
+                Path::new(defs::AUDIT_EMERGENCY_DIR),
+                module::regenerate_preinit_rc,
+            )?;
+            return Ok(ContainmentOutcome {
+                module_ids: ids.into_iter().collect(),
+                audit_unavailable: true,
+                audit_error: Some(reason),
+            });
+        }
+    };
 
     // Exclude the module first. Auxiliary persistent-script quarantine must not
     // weaken the primary response if a malicious filesystem object makes an
@@ -159,7 +190,294 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<Vec<String>> {
         }
     }
 
-    Ok(ids.into_iter().collect())
+    Ok(ContainmentOutcome {
+        module_ids: ids.into_iter().collect(),
+        audit_unavailable: false,
+        audit_error: None,
+    })
+}
+
+fn trusted_containment_ids(audit_root: &Path, module_roots: &[&Path]) -> Result<BTreeSet<String>> {
+    let revision_before = module_audit_log::dashboard_store_revision(audit_root)
+        .context("read module audit revision before containment verification")?;
+    let sealed = module_audit_log::sealed_integrity_status(audit_root)
+        .context("verify Manager-sealed module audit inventory")?;
+    let statuses = module_audit_log::list_modules_resilient(audit_root, false)
+        .context("verify current module audit histories")?;
+    let revision_after = module_audit_log::dashboard_store_revision(audit_root)
+        .context("read module audit revision after containment verification")?;
+    ensure!(
+        revision_before == revision_after,
+        "module audit store changed during containment verification"
+    );
+
+    let mut audited = BTreeSet::new();
+    let mut contained = sealed
+        .failures
+        .into_iter()
+        .map(|failure| failure.module_id)
+        .collect::<BTreeSet<_>>();
+    for status in statuses {
+        ensure!(
+            status.manager_checkpoint == module_audit_log::CheckpointState::Sealed,
+            "module {} has no Manager-sealed audit history",
+            status.module_id
+        );
+        if status.unresolved_risk || status.containment_state.is_some() {
+            contained.insert(status.module_id.clone());
+        }
+        audited.insert(status.module_id);
+    }
+
+    for (module_id, _) in managed_module_paths(module_roots)? {
+        module::validate_module_id(&module_id)
+            .with_context(|| format!("invalid installed or pending module id {module_id:?}"))?;
+        ensure!(
+            audited.contains(&module_id),
+            "installed or pending module {module_id} has no verified audit history"
+        );
+    }
+    Ok(contained)
+}
+
+fn managed_module_paths(module_roots: &[&Path]) -> Result<Vec<(String, PathBuf)>> {
+    let mut modules = Vec::new();
+    for root in module_roots {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("read module root {}", root.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            modules.push((
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+            ));
+        }
+    }
+    modules.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(modules)
+}
+
+fn enforce_fail_closed(
+    module_roots: &[&Path],
+    persistent_dirs: &[&Path],
+    quarantine_root: &Path,
+    regenerate_preinit_rc: impl FnOnce() -> Result<()>,
+) -> Result<BTreeSet<String>> {
+    let mut errors = Vec::new();
+    let mut ids = BTreeSet::new();
+    for root in module_roots {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push(format!(
+                    "read fail-closed module root {}: {error:#}",
+                    root.display()
+                ));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push(format!(
+                        "read fail-closed module entry in {}: {error:#}",
+                        root.display()
+                    ));
+                    continue;
+                }
+            };
+            let module_path = entry.path();
+            if !module_path.is_dir() {
+                continue;
+            }
+            ids.insert(entry.file_name().to_string_lossy().into_owned());
+            if let Err(error) =
+                ensure_fail_closed_disable(&module_path.join(defs::DISABLE_FILE_NAME))
+            {
+                errors.push(format!(
+                    "disable fail-closed module {}: {error:#}",
+                    module_path.display()
+                ));
+            }
+            let remove = module_path.join(defs::REMOVE_FILE_NAME);
+            match std::fs::symlink_metadata(&remove) {
+                Ok(_) => {
+                    if let Err(error) = std::fs::remove_file(&remove) {
+                        errors.push(format!(
+                            "remove untrusted uninstall marker {}: {error:#}",
+                            remove.display()
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!(
+                    "inspect untrusted uninstall marker {}: {error:#}",
+                    remove.display()
+                )),
+            }
+        }
+    }
+
+    match quarantine_all_persistent_scripts(persistent_dirs, quarantine_root) {
+        Ok(paths) if !paths.is_empty() => warn!(
+            "quarantined {} persistent startup entries because module audit state is unavailable",
+            paths.len()
+        ),
+        Ok(_) => {}
+        Err(error) => errors.push(format!(
+            "quarantine persistent startup entries without trusted ownership: {error:#}"
+        )),
+    }
+
+    if let Err(error) = regenerate_preinit_rc() {
+        errors.push(format!("regenerate fail-closed modules.rc: {error:#}"));
+    }
+    if !errors.is_empty() {
+        bail!(errors.join("; "));
+    }
+    Ok(ids)
+}
+
+fn ensure_fail_closed_disable(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("remove symlinked disable marker {}", path.display()))?;
+            crate::utils::ensure_file_exists(path)
+        }
+        Ok(_) => bail!("{} is not a regular disable marker", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            crate::utils::ensure_file_exists(path)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect disable marker {}", path.display()))
+        }
+    }
+}
+
+fn quarantine_all_persistent_scripts(
+    source_dirs: &[&Path],
+    quarantine_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut pending = Vec::<(usize, PathBuf, OsString)>::new();
+    for (index, source_dir) in source_dirs.iter().enumerate() {
+        let entries = match std::fs::read_dir(source_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read persistent startup directory {}", source_dir.display())
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            pending.push((index, entry.path(), entry.file_name()));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let session = create_emergency_quarantine_session(quarantine_root)?;
+    let mut moved = Vec::new();
+    let mut errors = Vec::new();
+    let mut destination_dirs = BTreeSet::new();
+    for (index, source, name) in pending {
+        let destination_dir = session.join(index.to_string());
+        if let Err(error) = ensure_private_dir(&destination_dir) {
+            errors.push(format!(
+                "prepare emergency quarantine for {}: {error:#}",
+                source.display()
+            ));
+            continue;
+        }
+        destination_dirs.insert(destination_dir.clone());
+        let destination = destination_dir.join(name);
+        match std::fs::rename(&source, &destination) {
+            Ok(()) => moved.push(source),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!(
+                "move {} into emergency quarantine: {error:#}",
+                source.display()
+            )),
+        }
+    }
+    for destination_dir in destination_dirs {
+        sync_directory(&destination_dir)?;
+    }
+    sync_directory(&session)?;
+    for source_dir in source_dirs {
+        if source_dir.is_dir() {
+            sync_directory(source_dir)?;
+        }
+    }
+    if !errors.is_empty() {
+        bail!(errors.join("; "));
+    }
+    Ok(moved)
+}
+
+fn create_emergency_quarantine_session(root: &Path) -> Result<PathBuf> {
+    ensure_private_dir(root)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for counter in 0_u32..1024 {
+        let session = root.join(format!(
+            "persistent-{timestamp}-{}-{counter}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&session) {
+            Ok(()) => {
+                set_private_permissions(&session)?;
+                sync_directory(root)?;
+                return Ok(session);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error).context("create emergency quarantine session"),
+        }
+    }
+    bail!("cannot allocate a unique emergency quarantine session")
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("create private directory {}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect private directory {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_dir(),
+        "{} is not a real directory",
+        path.display()
+    );
+    set_private_permissions(path)
+}
+
+fn set_private_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("set private permissions on {}", path.display()))?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .with_context(|| format!("open directory {} for sync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync directory {}", path.display()))
 }
 
 /// Apply the last known containment set when the authenticated audit root is
@@ -420,4 +738,97 @@ pub fn recover_manager_sealed_audit(
         module_id,
         authorization,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn quarantined_entry_count(root: &Path) -> usize {
+        let mut count = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn unavailable_audit_state_disables_every_module_and_quarantines_startup_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let installed = temp.path().join("modules");
+        let pending = temp.path().join("modules_update");
+        let post_fs_data = temp.path().join("post-fs-data.d");
+        let service = temp.path().join("service.d");
+        let quarantine = temp.path().join("audit-emergency");
+        for path in [&installed, &pending, &post_fs_data, &service] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let installed_module = installed.join("installed.module");
+        let pending_module = pending.join("pending.module");
+        std::fs::create_dir(&installed_module).unwrap();
+        std::fs::create_dir(&pending_module).unwrap();
+        std::fs::write(installed_module.join(defs::REMOVE_FILE_NAME), b"").unwrap();
+        std::fs::write(post_fs_data.join("early.sh"), b"#!/system/bin/sh\n").unwrap();
+        std::fs::write(service.join("late.sh"), b"#!/system/bin/sh\n").unwrap();
+
+        let regenerated = Cell::new(false);
+        let ids = enforce_fail_closed(
+            &[&installed, &pending],
+            &[&post_fs_data, &service],
+            &quarantine,
+            || {
+                regenerated.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            ids,
+            BTreeSet::from(["installed.module".into(), "pending.module".into()])
+        );
+        assert!(installed_module.join(defs::DISABLE_FILE_NAME).is_file());
+        assert!(pending_module.join(defs::DISABLE_FILE_NAME).is_file());
+        assert!(!installed_module.join(defs::REMOVE_FILE_NAME).exists());
+        assert_eq!(std::fs::read_dir(&post_fs_data).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&service).unwrap().count(), 0);
+        assert_eq!(quarantined_entry_count(&quarantine), 2);
+        assert!(regenerated.get());
+    }
+
+    #[test]
+    fn fail_closed_attempts_every_response_before_returning_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let modules = temp.path().join("modules");
+        let persistent = temp.path().join("service.d");
+        let quarantine = temp.path().join("audit-emergency");
+        let module_path = modules.join("broken.module");
+        std::fs::create_dir_all(module_path.join(defs::DISABLE_FILE_NAME)).unwrap();
+        std::fs::create_dir_all(&persistent).unwrap();
+        std::fs::write(persistent.join("payload.sh"), b"#!/system/bin/sh\n").unwrap();
+
+        let regenerated = Cell::new(false);
+        let error = enforce_fail_closed(&[&modules], &[&persistent], &quarantine, || {
+            regenerated.set(true);
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("disable fail-closed module"));
+        assert_eq!(std::fs::read_dir(&persistent).unwrap().count(), 0);
+        assert_eq!(quarantined_entry_count(&quarantine), 1);
+        assert!(regenerated.get());
+    }
 }

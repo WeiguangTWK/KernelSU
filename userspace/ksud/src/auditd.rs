@@ -321,37 +321,32 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
         }
     };
 
-    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    if !audit_root.exists() {
-        if !last_contained.is_empty() {
-            if !*store_missing_recorded {
-                if let Err(error) = global_audit::record_event(AuditEventKind::AuditStoreMissing) {
-                    warn!("failed to record audit store missing event: {error:#}");
-                }
-                notify_security_event("audit_store_missing", "模块审计根目录丢失");
-                *store_missing_recorded = true;
-            }
-            warn!(
-                "module audit root is missing; applying in-memory containment for {} modules",
-                last_contained.len()
-            );
-            match module_response::enforce_memory_containment(last_contained) {
-                Ok(contained) => info!(
-                    "enforced in-memory containment for {} modules",
-                    contained.len()
-                ),
-                Err(error) => {
-                    warn!("failed to enforce in-memory containment: {error:#}");
-                }
-            }
-        }
-        return;
-    }
-    *store_missing_recorded = false;
-
     match module_response::enforce_containment(false) {
-        Ok(contained) => {
-            let next: BTreeSet<String> = contained.into_iter().collect();
+        Ok(outcome) => {
+            let next: BTreeSet<String> = outcome.module_ids.into_iter().collect();
+            if outcome.audit_unavailable {
+                if !*store_missing_recorded {
+                    if let Err(error) =
+                        global_audit::record_event(AuditEventKind::AuditStoreMissing)
+                    {
+                        warn!("failed to record audit store missing event: {error:#}");
+                    }
+                    notify_security_event(
+                        "audit_store_missing",
+                        "模块审计状态不可用，已执行全量隔离",
+                    );
+                    *store_missing_recorded = true;
+                }
+                warn!(
+                    "module audit state is unavailable; fail-closed containment covers {} modules: {}",
+                    next.len(),
+                    outcome.audit_error.as_deref().unwrap_or("unknown error")
+                );
+                *last_contained = next;
+                return;
+            }
+
+            *store_missing_recorded = false;
             if next != *last_contained {
                 info!("audit containment set changed: {} modules", next.len());
                 if let Err(error) = global_audit::record_event(AuditEventKind::ContainmentApplied {
@@ -373,6 +368,21 @@ fn verify_and_respond(last_contained: &mut BTreeSet<String>, store_missing_recor
         }
         Err(error) => {
             warn!("audit verification and containment failed: {error:#}");
+            if !*store_missing_recorded {
+                if let Err(record_error) =
+                    global_audit::record_event(AuditEventKind::AuditStoreMissing)
+                {
+                    warn!("failed to record audit failure event: {record_error:#}");
+                }
+                notify_security_event("audit_store_missing", "模块审计验证或全量隔离失败");
+                *store_missing_recorded = true;
+            }
+            if !last_contained.is_empty()
+                && let Err(memory_error) =
+                    module_response::enforce_memory_containment(last_contained)
+            {
+                warn!("failed to retain previous in-memory containment: {memory_error:#}");
+            }
         }
     }
 }
