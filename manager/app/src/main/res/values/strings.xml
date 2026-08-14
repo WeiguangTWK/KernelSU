@@ -43,6 +43,10 @@
     <string name="sulog_entry_title_dropped_events">Dropped events</string>
     <string name="module_failed_to_enable">Failed to enable module: %s</string>
     <string name="module_failed_to_disable">Failed to disable module: %s</string>
+    <string name="module_enable_blocked_emergency">Cannot enable %1$s: global emergency containment is active. The switch remains off until trusted audit state is restored and verified.</string>
+    <string name="module_enable_audit_status_unavailable">Cannot enable %1$s because Manager could not verify the module audit response state. The switch remains off.</string>
+    <string name="module_audit_emergency_banner">Global emergency containment disabled %1$d modules. Module activation remains blocked. Open Security &amp; audit center for details.</string>
+    <string name="module_audit_status_unavailable_banner">Module audit response state cannot be verified. Module activation is blocked until verification succeeds.</string>
     <string name="module_empty">No module installed</string>
     <string name="module">Module</string>
     <string name="module_install_prompt_with_name">The following modules will be installed: %1$s</string>
@@ -55,6 +59,14 @@
     <string name="module_repos_sort_stars">Stars</string>
     <string name="module_repos_source_code">Source code</string>
     <string name="security_audit_center">Security &amp; audit center</string>
+    <string name="security_audit_emergency_title">Global emergency containment active</string>
+    <string name="security_audit_emergency_summary">Trusted module audit state is unavailable. %1$d installed or pending modules were disabled.</string>
+    <string name="security_audit_emergency_state">Response state: %1$s · Reason: %2$s</string>
+    <string name="security_audit_emergency_modules">Affected modules: %1$s</string>
+    <string name="security_audit_emergency_trigger">Trigger: %1$s</string>
+    <string name="security_audit_emergency_scripts">Persistent startup script isolation location: %1$s</string>
+    <string name="security_audit_emergency_failures">Containment is incomplete: %1$s</string>
+    <string name="security_audit_emergency_recovery">Recovery condition: restore a complete module audit inventory and verify its Manager seal. Module activation remains blocked until ksud confirms recovery.</string>
     <string name="security_audit_overview">Overview</string>
     <string name="security_audit_snapshot_syncing">Showing the last verified snapshot · synchronizing</string>
     <string name="security_audit_verifying_module">Verifying %1$s · %2$d/%3$d</string>

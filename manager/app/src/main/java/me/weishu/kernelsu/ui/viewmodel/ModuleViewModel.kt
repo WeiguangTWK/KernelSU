@@ -29,6 +29,8 @@ import me.weishu.kernelsu.data.repository.ModuleRepositoryImpl
 import me.weishu.kernelsu.data.repository.SettingsRepository
 import me.weishu.kernelsu.data.repository.SettingsRepositoryImpl
 import me.weishu.kernelsu.ksuApp
+import me.weishu.kernelsu.security.ModuleAuditResponseStatus
+import me.weishu.kernelsu.security.parseModuleAuditResponseStatus
 import me.weishu.kernelsu.ui.component.SearchStatus
 import me.weishu.kernelsu.ui.screen.module.ModuleConfirmDialogState
 import me.weishu.kernelsu.ui.screen.module.ModuleConfirmRequest
@@ -126,15 +128,17 @@ class ModuleViewModel(
     fun refreshEnvironmentState() {
         viewModelScope.launch {
             val magiskInstalled = withContext(Dispatchers.IO) { hasMagisk() }
-            val isSafeMode = withContext(Dispatchers.IO) {
+            val auditResponse = withContext(Dispatchers.IO) {
                 runCatching {
-                    JSONObject(getModuleAuditResponseStatus()).getBoolean("kernel_safe_mode")
-                }.getOrDefault(false)
+                    parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
+                }
             }
             _uiState.update {
                 it.copy(
                     magiskInstalled = magiskInstalled,
-                    isSafeMode = isSafeMode,
+                    isSafeMode = auditResponse.getOrNull()?.kernelSafeMode ?: false,
+                    auditResponseAvailable = auditResponse.isSuccess,
+                    auditEmergencyStatus = auditResponse.getOrNull()?.emergency,
                 )
             }
         }
@@ -278,6 +282,11 @@ class ModuleViewModel(
                 }
             Triple(modules, restricted.first, restricted.second)
         }
+        val auditResponse = withContext(Dispatchers.IO) {
+            runCatching {
+                parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
+            }
+        }
 
         withContext(Dispatchers.Main) {
             _uiState.update {
@@ -285,6 +294,9 @@ class ModuleViewModel(
                     modules = parsedModules,
                     secureRemovalModuleIds = secureRemovalModuleIds,
                     secureRemovalStates = secureRemovalStates,
+                    isSafeMode = auditResponse.getOrNull()?.kernelSafeMode ?: it.isSafeMode,
+                    auditResponseAvailable = auditResponse.isSuccess,
+                    auditEmergencyStatus = auditResponse.getOrNull()?.emergency,
                 )
             }
             // Trigger recalculation of moduleList
@@ -418,6 +430,30 @@ class ModuleViewModel(
     fun toggleModule(module: Module) {
         viewModelScope.launch {
             val res = ksuApp.resources
+            if (!module.enabled) {
+                val auditResponse = withContext(Dispatchers.IO) {
+                    runCatching {
+                        parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
+                    }
+                }
+                applyAuditResponse(auditResponse)
+                if (auditResponse.isFailure) {
+                    emitEffect(
+                        ModuleEffect.Toast(
+                            res.getString(R.string.module_enable_audit_status_unavailable, module.name),
+                        )
+                    )
+                    return@launch
+                }
+                if (auditResponse.getOrThrow().emergency?.active == true) {
+                    emitEffect(
+                        ModuleEffect.Toast(
+                            res.getString(R.string.module_enable_blocked_emergency, module.name),
+                        )
+                    )
+                    return@launch
+                }
+            }
             val success = withContext(Dispatchers.IO) {
                 toggleModuleUtil(module.id, !module.enabled)
             }
@@ -425,9 +461,36 @@ class ModuleViewModel(
                 fetchModuleList(checkUpdate = true, resort = false)
                 emitEffect(ModuleEffect.SnackBar(res.getString(R.string.reboot_to_apply)))
             } else {
+                if (!module.enabled) {
+                    val auditResponse = withContext(Dispatchers.IO) {
+                        runCatching {
+                            parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
+                        }
+                    }
+                    applyAuditResponse(auditResponse)
+                    if (auditResponse.getOrNull()?.emergency?.active == true) {
+                        emitEffect(
+                            ModuleEffect.Toast(
+                                res.getString(R.string.module_enable_blocked_emergency, module.name),
+                            )
+                        )
+                        fetchModuleList(checkUpdate = true, resort = false)
+                        return@launch
+                    }
+                }
                 val message = if (module.enabled) R.string.module_failed_to_disable else R.string.module_failed_to_enable
                 emitEffect(ModuleEffect.SnackBar(res.getString(message).format(module.name)))
             }
+        }
+    }
+
+    private fun applyAuditResponse(result: Result<ModuleAuditResponseStatus>) {
+        _uiState.update { state ->
+            state.copy(
+                isSafeMode = result.getOrNull()?.kernelSafeMode ?: state.isSafeMode,
+                auditResponseAvailable = result.isSuccess,
+                auditEmergencyStatus = result.getOrNull()?.emergency,
+            )
         }
     }
 

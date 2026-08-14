@@ -26,6 +26,10 @@
     <string name="superuser">超级用户</string>
     <string name="module_failed_to_enable">无法启用模块：%s</string>
     <string name="module_failed_to_disable">无法禁用模块：%s</string>
+    <string name="module_enable_blocked_emergency">无法启用 %1$s：全局应急隔离已生效。在可信审计状态恢复并通过验证前，开关将保持关闭。</string>
+    <string name="module_enable_audit_status_unavailable">无法启用 %1$s，因为管理器无法验证模块审计响应状态。开关将保持关闭。</string>
+    <string name="module_audit_emergency_banner">全局应急隔离已禁用 %1$d 个模块，并将继续阻止启用模块。请打开“安全与审计中心”查看详情。</string>
+    <string name="module_audit_status_unavailable_banner">无法验证模块审计响应状态。在验证成功前，将阻止启用模块。</string>
     <string name="module_empty">没有安装模块</string>
     <string name="module">模块</string>
     <string name="module_sort_action_first">可执行优先</string>
@@ -37,6 +41,14 @@
     <string name="module_repos_sort_stars">星标数</string>
     <string name="module_repos_source_code">源码</string>
     <string name="security_audit_center">安全与审计中心</string>
+    <string name="security_audit_emergency_title">全局应急隔离已生效</string>
+    <string name="security_audit_emergency_summary">可信模块审计状态不可用。已禁用 %1$d 个已安装或待处理的模块。</string>
+    <string name="security_audit_emergency_state">响应状态：%1$s · 原因：%2$s</string>
+    <string name="security_audit_emergency_modules">受影响模块：%1$s</string>
+    <string name="security_audit_emergency_trigger">触发详情：%1$s</string>
+    <string name="security_audit_emergency_scripts">持久化启动脚本隔离位置：%1$s</string>
+    <string name="security_audit_emergency_failures">隔离尚未完成：%1$s</string>
+    <string name="security_audit_emergency_recovery">恢复条件：还原完整的模块审计清单，并验证其 Manager seal。在 ksud 确认恢复前，将继续阻止启用模块。</string>
     <string name="security_audit_overview">总览</string>
     <string name="security_audit_snapshot_syncing">正在显示上次验证快照 · 状态同步中</string>
     <string name="security_audit_verifying_module">正在验证 %1$s · %2$d/%3$d</string>

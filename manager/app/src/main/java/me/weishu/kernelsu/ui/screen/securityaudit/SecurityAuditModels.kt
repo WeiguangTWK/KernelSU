@@ -1,6 +1,7 @@
 package me.weishu.kernelsu.ui.screen.securityaudit
 
 import me.weishu.kernelsu.security.AuditKeyProtection
+import me.weishu.kernelsu.security.AuditEmergencyStatus
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -97,6 +98,7 @@ data class SecurityAuditUiState(
     val auditInitialized: Boolean = true,
     val keyProtection: AuditKeyProtection = AuditKeyProtection.Unavailable,
     val auditAuthorizationReady: Boolean = false,
+    val emergencyStatus: AuditEmergencyStatus? = null,
     val errorMessage: String? = null,
 ) {
     val auditMutationBlocked: Boolean

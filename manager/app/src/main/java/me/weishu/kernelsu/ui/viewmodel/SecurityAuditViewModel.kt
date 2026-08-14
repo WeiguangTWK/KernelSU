@@ -17,6 +17,8 @@ import me.weishu.kernelsu.security.AuditCheckpointTrust
 import me.weishu.kernelsu.security.AuditCheckpointVerification
 import me.weishu.kernelsu.security.AuditDashboardCache
 import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
+import me.weishu.kernelsu.security.AuditEmergencyStatus
+import me.weishu.kernelsu.security.parseModuleAuditResponseStatus
 import me.weishu.kernelsu.security.requiresAuditSealCommit
 import me.weishu.kernelsu.ui.screen.securityaudit.AuditHistory
 import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditUiState
@@ -170,12 +172,14 @@ class SecurityAuditViewModel : ViewModel() {
         }
         refreshJob = viewModelScope.launch(Dispatchers.IO) {
             checkpointStore.readDashboardCache()?.let(::applyCachedDashboard)
-            val recoverySafeMode = runCatching {
-                JSONObject(getModuleAuditResponseStatus()).getBoolean("kernel_safe_mode")
-            }.getOrDefault(false)
+            val initialResponseStatus = runCatching {
+                parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
+            }.getOrNull()
+            val recoverySafeMode = initialResponseStatus?.kernelSafeMode ?: false
             runCatching {
                 val stream = loadDashboardStream(generation)
                 val completion = stream.completion
+                val responseStatus = parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
                 if (completion.optBoolean("uninitialized", false)) {
                     val checkpoint = checkpointStore.checkpointUnavailable(
                         "Module audit history is not initialized"
@@ -187,6 +191,7 @@ class SecurityAuditViewModel : ViewModel() {
                         initialized = false,
                         authorizationReady = false,
                         sealedRecoveryModuleIds = emptyList(),
+                        emergencyStatus = responseStatus.emergency,
                         storeRevision = completion.getString("store_revision"),
                         error = null,
                     )
@@ -251,6 +256,7 @@ class SecurityAuditViewModel : ViewModel() {
                     checkpoint = checkpoint,
                     authorizationReady = sealResult.getOrDefault(false),
                     sealedRecoveryModuleIds = sealedRecoveryModuleIds,
+                    emergencyStatus = responseStatus.emergency,
                     storeRevision = completion.getString("store_revision"),
                     error = sealResult.exceptionOrNull() ?: authorizationResult.exceptionOrNull(),
                 )
@@ -274,6 +280,7 @@ class SecurityAuditViewModel : ViewModel() {
                     auditInitialized = result.initialized,
                     keyProtection = result.checkpoint.protection,
                     auditAuthorizationReady = result.authorizationReady,
+                    emergencyStatus = result.emergencyStatus,
                     errorMessage = result.error?.let {
                         it.message ?: it::class.java.simpleName
                     },
@@ -286,6 +293,9 @@ class SecurityAuditViewModel : ViewModel() {
                         .getJSONArray("failures")
                         .moduleIds()
                 }.getOrDefault(emptyList())
+                val emergencyStatus = runCatching {
+                    parseModuleAuditResponseStatus(getModuleAuditResponseStatus()).emergency
+                }.getOrNull() ?: initialResponseStatus?.emergency
                 _uiState.update {
                     it.copy(
                         isLoading = false,
@@ -296,6 +306,7 @@ class SecurityAuditViewModel : ViewModel() {
                         checkpointCompromised = it.checkpointCompromised ||
                             sealedRecoveryModuleIds.isNotEmpty(),
                         recoverySafeMode = recoverySafeMode,
+                        emergencyStatus = emergencyStatus,
                         errorMessage = error.message ?: error::class.java.simpleName,
                     )
                 }
@@ -310,6 +321,7 @@ class SecurityAuditViewModel : ViewModel() {
         val initialized: Boolean = true,
         val authorizationReady: Boolean,
         val sealedRecoveryModuleIds: List<String>,
+        val emergencyStatus: AuditEmergencyStatus?,
         val storeRevision: String,
         val error: Throwable?,
     )

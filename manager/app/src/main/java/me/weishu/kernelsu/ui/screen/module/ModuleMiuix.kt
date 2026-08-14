@@ -113,6 +113,7 @@ import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.data.model.Module
 import me.weishu.kernelsu.data.model.ModuleUpdateInfo
+import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.ui.component.ListPopupDefaults
 import me.weishu.kernelsu.ui.component.ObserveAsEvents
 import me.weishu.kernelsu.ui.component.ScrollToTopOnChange
@@ -131,6 +132,7 @@ import me.weishu.kernelsu.ui.util.reboot
 import me.weishu.kernelsu.ui.util.rememberBlurBackdrop
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
+import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.DropdownImpl
 import top.yukonga.miuix.kmp.basic.FloatingActionButton
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
@@ -491,6 +493,8 @@ fun ModulePagerMiuix(
                     secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                     secureRemovalStates = uiState.secureRemovalStates,
                     isSafeMode = uiState.isSafeMode,
+                    auditResponseAvailable = uiState.auditResponseAvailable,
+                    auditEmergencyStatus = uiState.auditEmergencyStatus,
                     actions = actions,
                     onModuleAddShortcut = ::onModuleAddShortcut,
                     contentPadding = PaddingValues(
@@ -599,6 +603,8 @@ fun ModulePagerMiuix(
                             secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                             secureRemovalStates = uiState.secureRemovalStates,
                             isSafeMode = uiState.isSafeMode,
+                            auditResponseAvailable = uiState.auditResponseAvailable,
+                            auditEmergencyStatus = uiState.auditEmergencyStatus,
                             actions = actions,
                             onModuleAddShortcut = { module, type ->
                                 onModuleAddShortcut(module, type)
@@ -757,6 +763,8 @@ private fun ModuleList(
     secureRemovalModuleIds: Set<String>,
     secureRemovalStates: Map<String, String>,
     isSafeMode: Boolean,
+    auditResponseAvailable: Boolean,
+    auditEmergencyStatus: AuditEmergencyStatus?,
     actions: ModuleActions,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
     contentPadding: PaddingValues,
@@ -770,6 +778,15 @@ private fun ModuleList(
         contentPadding = contentPadding,
         overscrollEffect = null,
     ) {
+        if (!auditResponseAvailable || auditEmergencyStatus?.active == true) {
+            item(key = "audit-emergency") {
+                ModuleEmergencyCardMiuix(
+                    auditResponseAvailable = auditResponseAvailable,
+                    status = auditEmergencyStatus,
+                    onClick = actions.onOpenSecurityAudit,
+                )
+            }
+        }
         items(
             items = modules,
             key = { it.id },
@@ -829,6 +846,40 @@ private fun ModuleList(
             }
 
             content()
+        }
+    }
+}
+
+@Composable
+private fun ModuleEmergencyCardMiuix(
+    auditResponseAvailable: Boolean,
+    status: AuditEmergencyStatus?,
+    onClick: () -> Unit,
+) {
+    val message = if (auditResponseAvailable && status?.active == true) {
+        stringResource(
+            R.string.module_audit_emergency_banner,
+            status.affectedModuleIds.size,
+        )
+    } else {
+        stringResource(R.string.module_audit_status_unavailable_banner)
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+        colors = CardDefaults.defaultColors(
+            color = colorScheme.errorContainer,
+            contentColor = colorScheme.onErrorContainer,
+        ),
+        onClick = onClick,
+    ) {
+        Column {
+            Text(
+                stringResource(R.string.security_audit_emergency_title),
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.heightIn(min = 4.dp))
+            Text(message)
         }
     }
 }

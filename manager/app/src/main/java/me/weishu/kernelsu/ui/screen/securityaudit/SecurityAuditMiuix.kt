@@ -59,6 +59,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.security.AuditKeyProtection
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
@@ -89,6 +90,9 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
         if (state.isRefreshing) {
             item { AuditVerificationProgressMiuix(state) }
         }
+        state.emergencyStatus?.takeIf { it.active }?.let { emergency ->
+            item { AuditEmergencyMiuix(emergency) }
+        }
         item { AuditOverviewMiuix(state, actions.onOpenCategory) }
         if (state.interruptedInstalls > 0) {
             item { AuditMessageCardMiuix(stringResource(R.string.security_audit_interrupted_count, state.interruptedInstalls), true) }
@@ -113,6 +117,72 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
             items(state.histories, key = { it.status.moduleId }) { history ->
                 AuditModuleCardMiuix(history) { actions.onOpenModule(history.status.moduleId) }
             }
+        }
+    }
+}
+
+@Composable
+private fun AuditEmergencyMiuix(status: AuditEmergencyStatus) {
+    Card(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+        colors = CardDefaults.defaultColors(color = colorScheme.errorContainer),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                stringResource(R.string.security_audit_emergency_title),
+                color = colorScheme.onErrorContainer,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                stringResource(
+                    R.string.security_audit_emergency_summary,
+                    status.affectedModuleIds.size,
+                ),
+                color = colorScheme.onErrorContainer,
+            )
+            Text(
+                stringResource(
+                    R.string.security_audit_emergency_state,
+                    status.phase,
+                    status.reason,
+                ),
+                color = colorScheme.onErrorContainer,
+            )
+            if (status.affectedModuleIds.isNotEmpty()) {
+                Text(
+                    stringResource(
+                        R.string.security_audit_emergency_modules,
+                        status.affectedModuleIds.joinToString(", "),
+                    ),
+                    color = colorScheme.onErrorContainer,
+                )
+            }
+            Text(
+                stringResource(R.string.security_audit_emergency_trigger, status.detail),
+                color = colorScheme.onErrorContainer,
+            )
+            Text(
+                stringResource(
+                    R.string.security_audit_emergency_scripts,
+                    status.scriptQuarantineRoot,
+                ),
+                color = colorScheme.onErrorContainer,
+            )
+            if (status.containmentFailures.isNotEmpty()) {
+                Text(
+                    stringResource(
+                        R.string.security_audit_emergency_failures,
+                        status.containmentFailures.joinToString("; "),
+                    ),
+                    color = colorScheme.onErrorContainer,
+                )
+            }
+            Text(
+                stringResource(R.string.security_audit_emergency_recovery),
+                color = colorScheme.onErrorContainer,
+                fontWeight = FontWeight.SemiBold,
+            )
         }
     }
 }

@@ -136,6 +136,7 @@ import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.data.model.Module
 import me.weishu.kernelsu.data.model.ModuleUpdateInfo
+import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.ui.component.ObserveAsEvents
 import me.weishu.kernelsu.ui.component.ScrollToTopOnChange
 import me.weishu.kernelsu.ui.component.dialog.rememberConfirmDialog
@@ -366,6 +367,8 @@ fun ModulePagerMaterial(
                         secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                         secureRemovalStates = uiState.secureRemovalStates,
                         isSafeMode = uiState.isSafeMode,
+                        auditResponseAvailable = uiState.auditResponseAvailable,
+                        auditEmergencyStatus = uiState.auditEmergencyStatus,
                         actions = actions,
                         onClickModule = { module ->
                             if (module.hasWebUi) {
@@ -480,6 +483,8 @@ fun ModulePagerMaterial(
                 secureRemovalModuleIds = uiState.secureRemovalModuleIds,
                 secureRemovalStates = uiState.secureRemovalStates,
                 isSafeMode = uiState.isSafeMode,
+                auditResponseAvailable = uiState.auditResponseAvailable,
+                auditEmergencyStatus = uiState.auditEmergencyStatus,
                 actions = actions,
                 onClickModule = { module ->
                     if (module.hasWebUi) {
@@ -517,6 +522,8 @@ private fun ModuleList(
     secureRemovalModuleIds: Set<String>,
     secureRemovalStates: Map<String, String>,
     isSafeMode: Boolean,
+    auditResponseAvailable: Boolean,
+    auditEmergencyStatus: AuditEmergencyStatus?,
     actions: ModuleActions,
     onClickModule: (Module) -> Unit,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
@@ -533,6 +540,15 @@ private fun ModuleList(
             bottom = 16.dp + bottomInnerPadding + 56.dp + 16.dp
         ),
     ) {
+        if (!auditResponseAvailable || auditEmergencyStatus?.active == true) {
+            item(key = "audit-emergency") {
+                ModuleEmergencyCardMaterial(
+                    auditResponseAvailable = auditResponseAvailable,
+                    status = auditEmergencyStatus,
+                    onClick = actions.onOpenSecurityAudit,
+                )
+            }
+        }
         items(displayModules, key = { it.id }, contentType = { "module" }) { module ->
             val scope = rememberCoroutineScope()
             val moduleUpdateInfo = updateInfoMap[module.id] ?: ModuleUpdateInfo.Empty
@@ -571,6 +587,37 @@ private fun ModuleList(
                 onExecuteAction = { actions.onExecuteModuleAction(module) },
                 closeSearch = { closeSearch() }
             )
+        }
+    }
+}
+
+@Composable
+private fun ModuleEmergencyCardMaterial(
+    auditResponseAvailable: Boolean,
+    status: AuditEmergencyStatus?,
+    onClick: () -> Unit,
+) {
+    val message = if (auditResponseAvailable && status?.active == true) {
+        stringResource(
+            R.string.module_audit_emergency_banner,
+            status.affectedModuleIds.size,
+        )
+    } else {
+        stringResource(R.string.module_audit_status_unavailable_banner)
+    }
+    TonalCard(
+        modifier = Modifier.fillMaxWidth(),
+        containerColor = MaterialTheme.colorScheme.errorContainer,
+        onClick = onClick,
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                stringResource(R.string.security_audit_emergency_title),
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(message, color = MaterialTheme.colorScheme.onErrorContainer)
         }
     }
 }
