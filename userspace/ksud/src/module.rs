@@ -815,10 +815,12 @@ pub fn run_action(id: &str) -> Result<()> {
 
 pub fn enable_module(id: &str) -> Result<()> {
     validate_module_id(id)?;
-    crate::module_response::ensure_action_allowed(id, "enable")?;
 
     let module_path = Path::new(defs::MODULE_DIR).join(id);
     ensure!(module_path.exists(), "Module {id} not found");
+
+    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+    crate::module_response::ensure_activation_allowed(id)?;
 
     let disable_path = module_path.join(defs::DISABLE_FILE_NAME);
     if disable_path.exists() {

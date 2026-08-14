@@ -20,6 +20,8 @@ const PERSISTENT_SCRIPT_DIRS: &[&str] = &[
 ];
 
 const AUDIT_EMERGENCY_SCHEMA_VERSION: u32 = 1;
+const AUDIT_STATE_UNAVAILABLE_ERROR: &str = "audit_state_unavailable";
+const AUDIT_MODULE_CONTAINED_ERROR: &str = "audit_module_contained";
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -206,6 +208,32 @@ pub fn active_containment_ids() -> Result<BTreeSet<String>> {
             Path::new(defs::MODULE_UPDATE_DIR),
         ],
     )
+}
+
+/// Verify the complete Manager-sealed inventory before allowing a module to
+/// become active. The caller must hold the audit coordinator until activation
+/// has been materialized, so the verified inventory cannot change in between.
+pub fn ensure_activation_allowed(id: &str) -> Result<()> {
+    module::validate_module_id(id)?;
+    let outcome = enforce_containment(false).with_context(|| {
+        format!(
+            "[{AUDIT_STATE_UNAVAILABLE_ERROR}] cannot verify module audit state before enabling {id}"
+        )
+    })?;
+    ensure_activation_outcome_allowed(id, &outcome)
+}
+
+fn ensure_activation_outcome_allowed(id: &str, outcome: &ContainmentOutcome) -> Result<()> {
+    ensure!(
+        !outcome.audit_unavailable,
+        "[{AUDIT_STATE_UNAVAILABLE_ERROR}] module audit state is unavailable; cannot enable {id}: {}",
+        outcome.audit_error.as_deref().unwrap_or("unknown error")
+    );
+    ensure!(
+        !outcome.module_ids.iter().any(|module_id| module_id == id),
+        "[{AUDIT_MODULE_CONTAINED_ERROR}] module {id} is contained by verified audit state; cannot enable it"
+    );
+    Ok(())
 }
 
 /// Cancel a conventional uninstall marker before untrusted module code can run.
@@ -1015,6 +1043,31 @@ mod tests {
             recovered.recovery_condition,
             AuditEmergencyRecoveryCondition::ManagerSealedInventoryVerified
         );
+    }
+
+    #[test]
+    fn unavailable_audit_state_rejects_module_activation() {
+        let outcome = ContainmentOutcome {
+            module_ids: Vec::new(),
+            audit_unavailable: true,
+            audit_error: Some("module audit root is missing".into()),
+        };
+
+        let error = ensure_activation_outcome_allowed("module.alpha", &outcome).unwrap_err();
+        assert!(format!("{error:#}").contains(AUDIT_STATE_UNAVAILABLE_ERROR));
+    }
+
+    #[test]
+    fn verified_containment_rejects_only_affected_module_activation() {
+        let outcome = ContainmentOutcome {
+            module_ids: vec!["module.alpha".into()],
+            audit_unavailable: false,
+            audit_error: None,
+        };
+
+        let error = ensure_activation_outcome_allowed("module.alpha", &outcome).unwrap_err();
+        assert!(format!("{error:#}").contains(AUDIT_MODULE_CONTAINED_ERROR));
+        ensure_activation_outcome_allowed("module.beta", &outcome).unwrap();
     }
 
     #[test]
