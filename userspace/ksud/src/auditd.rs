@@ -65,8 +65,19 @@ struct AuditdResumeGuard {
     services: Vec<&'static str>,
 }
 
+pub struct AuditdShutdownGuard {
+    _auditd_lock: AuditdLockGuard,
+    _coordinator: AuditCoordinatorGuard,
+}
+
 pub struct AuditCoordinatorGuard {
     _lock_file: File,
+}
+
+struct AuditdServiceStopOutcome {
+    services: Vec<(&'static str, String)>,
+    active: Vec<&'static str>,
+    failures: Vec<String>,
 }
 
 #[repr(C)]
@@ -630,6 +641,16 @@ fn run_install_session(session_dir: &Path, timeout: Duration) -> Result<()> {
 }
 
 fn stop_auditd_services() -> Result<Vec<&'static str>> {
+    let outcome = request_auditd_services_stop();
+    ensure!(
+        outcome.failures.is_empty(),
+        "{}",
+        outcome.failures.join("; ")
+    );
+    Ok(auditd_services_to_resume(&outcome))
+}
+
+fn request_auditd_services_stop() -> AuditdServiceStopOutcome {
     let services = ["ksud-auditd", "kernelsu_auditd"]
         .into_iter()
         .filter_map(|service| {
@@ -643,7 +664,11 @@ fn stop_auditd_services() -> Result<Vec<&'static str>> {
     // running auditd (or a stale debug instance) cannot be bypassed here.
     if services.is_empty() {
         info!("no auditd init service is registered in the current boot");
-        return Ok(Vec::new());
+        return AuditdServiceStopOutcome {
+            services,
+            active: Vec::new(),
+            failures: Vec::new(),
+        };
     }
 
     let active = services
@@ -651,29 +676,73 @@ fn stop_auditd_services() -> Result<Vec<&'static str>> {
         .filter(|(_, state)| matches!(state.as_str(), "running" | "restarting" | "stopping"))
         .map(|(service, _)| *service)
         .collect::<Vec<_>>();
+    let mut failures = Vec::new();
     for (service, state) in &services {
         if matches!(state.as_str(), "running" | "restarting") {
-            let status = Command::new("stop")
-                .arg(service)
-                .status()
-                .with_context(|| format!("stop auditd service {service}"))?;
-            ensure!(status.success(), "failed to stop auditd service {service}");
+            match Command::new("stop").arg(service).status() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    failures.push(format!("failed to stop auditd service {service}: {status}"));
+                }
+                Err(error) => {
+                    failures.push(format!("stop auditd service {service}: {error}"));
+                }
+            }
         }
     }
 
-    let resume = if active.contains(&"ksud-auditd") {
+    AuditdServiceStopOutcome {
+        services,
+        active,
+        failures,
+    }
+}
+
+fn auditd_services_to_resume(outcome: &AuditdServiceStopOutcome) -> Vec<&'static str> {
+    let resume = if outcome.active.contains(&"ksud-auditd") {
         "ksud-auditd"
-    } else if let Some(service) = active.first() {
+    } else if let Some(service) = outcome.active.first() {
         service
-    } else if services
+    } else if outcome
+        .services
         .iter()
         .any(|(service, _)| *service == "ksud-auditd")
     {
         "ksud-auditd"
     } else {
-        services[0].0
+        let Some((service, _)) = outcome.services.first() else {
+            return Vec::new();
+        };
+        service
     };
-    Ok(vec![resume])
+    vec![resume]
+}
+
+pub fn stop_auditd_for_uninstall() -> Result<AuditdShutdownGuard> {
+    let coordinator = AuditCoordinatorGuard::acquire_blocking()?;
+    let outcome = request_auditd_services_stop();
+    let lock_deadline = std::time::Instant::now() + INSTALL_SESSION_LOCK_TIMEOUT;
+    loop {
+        if let Some(auditd_lock) = AuditdLockGuard::acquire()? {
+            for failure in outcome.failures {
+                warn!("{failure}; auditd lock is free, continuing permanent uninstall");
+            }
+            return Ok(AuditdShutdownGuard {
+                _auditd_lock: auditd_lock,
+                _coordinator: coordinator,
+            });
+        }
+        ensure!(
+            std::time::Instant::now() < lock_deadline,
+            "auditd remained active after stop request{}",
+            if outcome.failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", outcome.failures.join("; "))
+            }
+        );
+        thread::sleep(INSTALL_SESSION_POLL_INTERVAL);
+    }
 }
 
 pub fn print_install_session_status(id: &str) -> Result<()> {

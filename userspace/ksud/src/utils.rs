@@ -279,14 +279,8 @@ pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Resul
 
 pub fn uninstall(package_name: &str) -> Result<()> {
     println!("- Stopping audit daemon..");
-    let status = Command::new("stop")
-        .arg("ksud-auditd")
-        .status()
-        .context("stop audit daemon before uninstall")?;
-    anyhow::ensure!(
-        status.success(),
-        "failed to stop audit daemon before uninstall"
-    );
+    let _auditd_shutdown =
+        crate::auditd::stop_auditd_for_uninstall().context("stop audit daemon before uninstall")?;
 
     if Path::new(defs::MODULE_DIR).exists() {
         println!("- Uninstall modules..");
