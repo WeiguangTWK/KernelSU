@@ -16,7 +16,12 @@ use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
 use std::time::Duration;
 
-use crate::{defs, global_audit, module_audit_log::AuditEventKind, module_response, utils};
+use crate::{
+    defs, global_audit,
+    module_audit_log::AuditEventKind,
+    module_response::{self, AuditStateAvailability},
+    utils,
+};
 
 const AUDITD_LOCK_MODE: u32 = 0o600;
 const AUDITD_RESTART_DELAY: Duration = Duration::from_secs(3);
@@ -367,7 +372,12 @@ fn verify_and_respond_locked(
         Ok(outcome) => {
             let next: BTreeSet<String> = outcome.module_ids.into_iter().collect();
             let mut notification = None;
-            if outcome.audit_unavailable {
+            if outcome.audit_state == AuditStateAvailability::CleanUninitialized {
+                *store_missing_recorded = false;
+                last_contained.clear();
+                return None;
+            }
+            if outcome.audit_state == AuditStateAvailability::Unavailable {
                 if !*store_missing_recorded {
                     if let Err(error) =
                         global_audit::record_event(AuditEventKind::AuditStoreMissing)

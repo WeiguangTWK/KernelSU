@@ -10,10 +10,23 @@ data class AuditEmergencyStatus(
     val detail: String,
     val affectedModuleIds: List<String>,
     val scriptQuarantineRoot: String,
+    val scriptQuarantines: List<AuditEmergencyScriptQuarantine>,
     val containmentFailures: List<String>,
     val recoveryCondition: String,
     val triggeredAtUnixSeconds: Long,
     val updatedAtUnixSeconds: Long,
+)
+
+data class AuditEmergencyScriptQuarantine(
+    val sessionPath: String,
+    val entries: List<AuditEmergencyScriptQuarantineEntry>,
+)
+
+data class AuditEmergencyScriptQuarantineEntry(
+    val sourcePath: String,
+    val quarantinePath: String,
+    val state: String,
+    val error: String?,
 )
 
 data class ModuleAuditResponseStatus(
@@ -37,6 +50,19 @@ fun parseModuleAuditResponseStatus(raw: String): ModuleAuditResponseStatus {
             detail = value.getString("detail"),
             affectedModuleIds = value.getJSONArray("affected_module_ids").strings(),
             scriptQuarantineRoot = value.getString("script_quarantine_root"),
+            scriptQuarantines = value.optJSONArray("script_quarantines")?.objects()?.map {
+                AuditEmergencyScriptQuarantine(
+                    sessionPath = it.getString("session_path"),
+                    entries = it.getJSONArray("entries").objects().map { entry ->
+                        AuditEmergencyScriptQuarantineEntry(
+                            sourcePath = entry.getString("source_path"),
+                            quarantinePath = entry.getString("quarantine_path"),
+                            state = entry.getString("state"),
+                            error = entry.nullableString("error"),
+                        )
+                    },
+                )
+            }.orEmpty(),
             containmentFailures = value.getJSONArray("containment_failures").strings(),
             recoveryCondition = value.getString("recovery_condition"),
             triggeredAtUnixSeconds = value.getLong("triggered_at_unix_seconds"),
@@ -52,5 +78,12 @@ fun parseModuleAuditResponseStatus(raw: String): ModuleAuditResponseStatus {
 private fun JSONArray.strings(): List<String> = buildList {
     for (index in 0 until length()) add(getString(index))
 }
+
+private fun JSONArray.objects(): List<JSONObject> = buildList {
+    for (index in 0 until length()) add(getJSONObject(index))
+}
+
+private fun JSONObject.nullableString(name: String): String? =
+    if (!has(name) || isNull(name)) null else optString(name).takeIf(String::isNotBlank)
 
 private const val AUDIT_EMERGENCY_SCHEMA_VERSION = 1

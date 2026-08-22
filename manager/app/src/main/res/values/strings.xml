@@ -65,6 +65,9 @@
     <string name="security_audit_emergency_modules">Affected modules: %1$s</string>
     <string name="security_audit_emergency_trigger">Trigger: %1$s</string>
     <string name="security_audit_emergency_scripts">Persistent startup script isolation location: %1$s</string>
+    <string name="security_audit_emergency_script_session">Isolation session: %1$s</string>
+    <string name="security_audit_emergency_script_entry">%1$s\n→ %2$s\nState: %3$s</string>
+    <string name="security_audit_emergency_script_error">Script isolation error: %1$s</string>
     <string name="security_audit_emergency_failures">Containment is incomplete: %1$s</string>
     <string name="security_audit_emergency_recovery">Recovery condition: restore a complete module audit inventory and verify its Manager seal. Module activation remains blocked until ksud confirms recovery.</string>
     <string name="security_audit_overview">Overview</string>

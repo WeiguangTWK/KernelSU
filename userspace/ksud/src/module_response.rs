@@ -18,8 +18,11 @@ const PERSISTENT_SCRIPT_DIRS: &[&str] = &[
     "/data/adb/boot-completed.d",
     "/data/adb/bootcompleted.d",
 ];
+const PERSISTENT_INITRC_DIR: &str = "/data/adb/initrc.d";
 
 const AUDIT_EMERGENCY_SCHEMA_VERSION: u32 = 1;
+const SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const SCRIPT_QUARANTINE_MANIFEST_FILE: &str = "manifest.json";
 const AUDIT_STATE_UNAVAILABLE_ERROR: &str = "audit_state_unavailable";
 const AUDIT_MODULE_CONTAINED_ERROR: &str = "audit_module_contained";
 
@@ -44,6 +47,38 @@ pub enum AuditEmergencyRecoveryCondition {
     ManagerSealedInventoryVerified,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEmergencyScriptQuarantineState {
+    Planned,
+    Moved,
+    Failed,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuditEmergencyScriptQuarantineEntry {
+    pub source_path: String,
+    pub quarantine_path: String,
+    pub state: AuditEmergencyScriptQuarantineState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuditEmergencyScriptQuarantineManifest {
+    pub schema_version: u32,
+    pub session_path: String,
+    pub entries: Vec<AuditEmergencyScriptQuarantineEntry>,
+    pub created_at_unix_seconds: u64,
+    pub updated_at_unix_seconds: u64,
+}
+
+#[derive(Debug, Default)]
+struct ScriptQuarantineManifestCollection {
+    manifests: Vec<AuditEmergencyScriptQuarantineManifest>,
+    failures: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuditEmergencyStatus {
     pub schema_version: u32,
@@ -53,6 +88,8 @@ pub struct AuditEmergencyStatus {
     pub detail: String,
     pub affected_module_ids: Vec<String>,
     pub script_quarantine_root: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub script_quarantines: Vec<AuditEmergencyScriptQuarantineManifest>,
     pub containment_failures: Vec<String>,
     pub recovery_condition: AuditEmergencyRecoveryCondition,
     pub triggered_at_unix_seconds: u64,
@@ -62,12 +99,34 @@ pub struct AuditEmergencyStatus {
 #[derive(Debug)]
 pub struct ContainmentOutcome {
     pub module_ids: Vec<String>,
-    pub audit_unavailable: bool,
+    pub audit_state: AuditStateAvailability,
     pub audit_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditStateAvailability {
+    Verified,
+    CleanUninitialized,
+    Unavailable,
+}
+
 pub fn audit_emergency_status() -> Result<Option<AuditEmergencyStatus>> {
-    read_audit_emergency_status(Path::new(defs::AUDIT_EMERGENCY_STATUS_FILE))
+    let Some(mut status) =
+        read_audit_emergency_status(Path::new(defs::AUDIT_EMERGENCY_STATUS_FILE))?
+    else {
+        return Ok(None);
+    };
+    let quarantine_root = Path::new(&status.script_quarantine_root);
+    match read_script_quarantine_manifests(quarantine_root) {
+        Ok(collection) => {
+            status.script_quarantines = collection.manifests;
+            status.containment_failures.extend(collection.failures);
+        }
+        Err(error) => status.containment_failures.push(format!(
+            "read persistent startup script quarantine manifests: {error:#}"
+        )),
+    }
+    Ok(Some(status))
 }
 
 fn read_audit_emergency_status(path: &Path) -> Result<Option<AuditEmergencyStatus>> {
@@ -141,6 +200,94 @@ fn best_effort_module_ids(module_roots: &[&Path]) -> Vec<String> {
     ids.into_iter().collect()
 }
 
+fn directory_has_entries(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect directory {}", path.display()));
+        }
+    }
+    let mut entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Err(error).with_context(|| format!("read directory {}", path.display()));
+        }
+    };
+    match entries.next() {
+        Some(Ok(_)) => Ok(true),
+        Some(Err(error)) => Err(error).with_context(|| format!("read entry in {}", path.display())),
+        None => Ok(false),
+    }
+}
+
+fn clean_uninitialized_audit_state(
+    audit_root: &Path,
+    module_roots: &[&Path],
+    persistent_script_dirs: &[&Path],
+    persistent_initrc_dir: &Path,
+    metamodule_path: &Path,
+) -> Result<bool> {
+    match std::fs::symlink_metadata(audit_root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect audit root {}", audit_root.display()));
+        }
+    }
+    if !module_audit_log::dashboard_store_uninitialized(audit_root)? {
+        return Ok(false);
+    }
+    for path in module_roots
+        .iter()
+        .chain(persistent_script_dirs)
+        .copied()
+        .chain(std::iter::once(persistent_initrc_dir))
+    {
+        if directory_has_entries(path)? {
+            return Ok(false);
+        }
+    }
+    match std::fs::symlink_metadata(metamodule_path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect metamodule path {}", metamodule_path.display())),
+    }
+}
+
+fn discard_empty_emergency_status(path: &Path, quarantine_root: &Path) -> Result<()> {
+    let Some(status) = read_audit_emergency_status(path)? else {
+        return Ok(());
+    };
+    if !status.active
+        || !status.affected_module_ids.is_empty()
+        || !status.script_quarantines.is_empty()
+        || !status.containment_failures.is_empty()
+    {
+        return Ok(());
+    }
+    let manifests = read_script_quarantine_manifests(quarantine_root)?;
+    if !manifests.manifests.is_empty() || !manifests.failures.is_empty() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(quarantine_root)
+        .context("inspect payload-free audit emergency directory")?
+    {
+        if entry?.path() != path {
+            return Ok(());
+        }
+    }
+    std::fs::remove_file(path).context("remove payload-free audit emergency status")?;
+    sync_directory(
+        path.parent()
+            .context("audit emergency status path has no parent")?,
+    )
+}
+
 fn persist_active_emergency_status(
     path: &Path,
     phase: AuditEmergencyPhase,
@@ -168,6 +315,7 @@ fn persist_active_emergency_status(
             detail: detail.to_owned(),
             affected_module_ids,
             script_quarantine_root: script_quarantine_root.to_string_lossy().into_owned(),
+            script_quarantines: Vec::new(),
             containment_failures,
             recovery_condition: AuditEmergencyRecoveryCondition::ManagerSealedInventoryVerified,
             triggered_at_unix_seconds: triggered_at,
@@ -225,7 +373,7 @@ pub fn ensure_activation_allowed(id: &str) -> Result<()> {
 
 fn ensure_activation_outcome_allowed(id: &str, outcome: &ContainmentOutcome) -> Result<()> {
     ensure!(
-        !outcome.audit_unavailable,
+        outcome.audit_state == AuditStateAvailability::Verified,
         "[{AUDIT_STATE_UNAVAILABLE_ERROR}] module audit state is unavailable; cannot enable {id}: {}",
         outcome.audit_error.as_deref().unwrap_or("unknown error")
     );
@@ -303,6 +451,35 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome>
         Path::new(defs::MODULE_DIR),
         Path::new(defs::MODULE_UPDATE_DIR),
     ];
+    let persistent_script_dirs = PERSISTENT_SCRIPT_DIRS
+        .iter()
+        .map(|path| Path::new(*path))
+        .collect::<Vec<_>>();
+    let clean_uninitialized = clean_uninitialized_audit_state(
+        audit_root,
+        &module_roots,
+        &persistent_script_dirs,
+        Path::new(PERSISTENT_INITRC_DIR),
+        Path::new(defs::METAMODULE_DIR.trim_end_matches('/')),
+    );
+    match clean_uninitialized {
+        Ok(true) => {
+            if let Err(error) =
+                discard_empty_emergency_status(emergency_status_path, emergency_root)
+            {
+                warn!("failed to discard empty audit emergency status: {error:#}");
+            }
+            return Ok(ContainmentOutcome {
+                module_ids: Vec::new(),
+                audit_state: AuditStateAvailability::CleanUninitialized,
+                audit_error: Some("module audit state is not initialized".to_owned()),
+            });
+        }
+        Ok(false) => {}
+        Err(error) => warn!(
+            "cannot prove that the uninitialized audit state is payload-free; applying fail-closed containment: {error:#}"
+        ),
+    }
     let ids = match trusted_containment_ids(audit_root, &module_roots) {
         Ok(ids) => ids,
         Err(error) => {
@@ -323,10 +500,7 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome>
             }
             let response = enforce_fail_closed(
                 &module_roots,
-                &PERSISTENT_SCRIPT_DIRS
-                    .iter()
-                    .map(|path| Path::new(*path))
-                    .collect::<Vec<_>>(),
+                &persistent_script_dirs,
                 emergency_root,
                 module::regenerate_preinit_rc,
             );
@@ -343,7 +517,7 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome>
                     )?;
                     Ok(ContainmentOutcome {
                         module_ids,
-                        audit_unavailable: true,
+                        audit_state: AuditStateAvailability::Unavailable,
                         audit_error: Some(reason),
                     })
                 }
@@ -426,7 +600,7 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome>
     mark_audit_emergency_recovered(emergency_status_path)?;
     Ok(ContainmentOutcome {
         module_ids: ids.into_iter().collect(),
-        audit_unavailable: false,
+        audit_state: AuditStateAvailability::Verified,
         audit_error: None,
     })
 }
@@ -625,42 +799,223 @@ fn quarantine_all_persistent_scripts(
     }
 
     let session = create_emergency_quarantine_session(quarantine_root)?;
+    let now = unix_time_seconds();
+    let mut manifest = AuditEmergencyScriptQuarantineManifest {
+        schema_version: SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION,
+        session_path: session.to_string_lossy().into_owned(),
+        entries: pending
+            .iter()
+            .map(
+                |(index, source, name)| AuditEmergencyScriptQuarantineEntry {
+                    source_path: source.to_string_lossy().into_owned(),
+                    quarantine_path: session
+                        .join(index.to_string())
+                        .join(name)
+                        .to_string_lossy()
+                        .into_owned(),
+                    state: AuditEmergencyScriptQuarantineState::Planned,
+                    error: None,
+                },
+            )
+            .collect(),
+        created_at_unix_seconds: now,
+        updated_at_unix_seconds: now,
+    };
+    // Commit the complete source-to-destination plan before moving anything.
+    // After a crash, the manifest remains sufficient to locate either copy.
+    write_script_quarantine_manifest(&session, &manifest)?;
     let mut moved = Vec::new();
     let mut errors = Vec::new();
-    let mut destination_dirs = BTreeSet::new();
-    for (index, source, name) in pending {
+    for (entry_index, (index, source, name)) in pending.into_iter().enumerate() {
         let destination_dir = session.join(index.to_string());
         if let Err(error) = ensure_private_dir(&destination_dir) {
-            errors.push(format!(
+            let failure = format!(
                 "prepare emergency quarantine for {}: {error:#}",
                 source.display()
-            ));
+            );
+            manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Failed;
+            manifest.entries[entry_index].error = Some(failure.clone());
+            manifest.updated_at_unix_seconds = unix_time_seconds();
+            write_script_quarantine_manifest(&session, &manifest)?;
+            errors.push(failure);
             continue;
         }
-        destination_dirs.insert(destination_dir.clone());
         let destination = destination_dir.join(name);
-        match std::fs::rename(&source, &destination) {
-            Ok(()) => moved.push(source),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => errors.push(format!(
-                "move {} into emergency quarantine: {error:#}",
-                source.display()
-            )),
+        let move_result = (|| -> Result<()> {
+            std::fs::rename(&source, &destination)
+                .with_context(|| format!("move {} into emergency quarantine", source.display()))?;
+            sync_directory(&destination_dir)?;
+            if let Some(source_dir) = source.parent() {
+                sync_directory(source_dir)?;
+            }
+            Ok(())
+        })();
+        match move_result {
+            Ok(()) => {
+                moved.push(source);
+                manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Moved;
+                manifest.entries[entry_index].error = None;
+            }
+            Err(error) => {
+                let failure = format!("{error:#}");
+                manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Failed;
+                manifest.entries[entry_index].error = Some(failure.clone());
+                errors.push(failure);
+            }
         }
-    }
-    for destination_dir in destination_dirs {
-        sync_directory(&destination_dir)?;
-    }
-    sync_directory(&session)?;
-    for source_dir in source_dirs {
-        if source_dir.is_dir() {
-            sync_directory(source_dir)?;
-        }
+        manifest.updated_at_unix_seconds = unix_time_seconds();
+        write_script_quarantine_manifest(&session, &manifest)?;
     }
     if !errors.is_empty() {
         bail!(errors.join("; "));
     }
     Ok(moved)
+}
+
+fn write_script_quarantine_manifest(
+    session: &Path,
+    manifest: &AuditEmergencyScriptQuarantineManifest,
+) -> Result<()> {
+    let path = session.join(SCRIPT_QUARANTINE_MANIFEST_FILE);
+    let mut bytes = serde_json::to_vec_pretty(manifest)?;
+    bytes.push(b'\n');
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = session.join(format!(
+        ".{SCRIPT_QUARANTINE_MANIFEST_FILE}-{}-{unique}.tmp",
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .context("create temporary emergency script quarantine manifest")?;
+    file.write_all(&bytes)
+        .context("write emergency script quarantine manifest")?;
+    file.sync_all()
+        .context("sync emergency script quarantine manifest")?;
+    std::fs::rename(&temporary, &path).context("commit emergency script quarantine manifest")?;
+    sync_directory(session)
+}
+
+fn read_script_quarantine_manifests(root: &Path) -> Result<ScriptQuarantineManifestCollection> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ScriptQuarantineManifestCollection::default());
+        }
+        Err(error) => return Err(error).context("read emergency script quarantine root"),
+    };
+    let mut collection = ScriptQuarantineManifestCollection::default();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                collection.failures.push(format!(
+                    "read emergency script quarantine session: {error:#}"
+                ));
+                continue;
+            }
+        };
+        let session = entry.path();
+        let is_directory = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(error) => {
+                collection.failures.push(format!(
+                    "inspect emergency script quarantine session {}: {error:#}",
+                    session.display()
+                ));
+                continue;
+            }
+        };
+        if !is_directory
+            || !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("persistent-")
+        {
+            continue;
+        }
+        let path = session.join(SCRIPT_QUARANTINE_MANIFEST_FILE);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                collection.failures.push(format!(
+                    "inspect script quarantine manifest {}: {error:#}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        let loaded = (|| -> Result<AuditEmergencyScriptQuarantineManifest> {
+            ensure!(
+                metadata.file_type().is_file(),
+                "script quarantine manifest is not a regular file"
+            );
+            ensure!(
+                metadata.len() <= 1024 * 1024,
+                "script quarantine manifest is too large"
+            );
+            let bytes = std::fs::read(&path).context("read script quarantine manifest")?;
+            let mut manifest: AuditEmergencyScriptQuarantineManifest =
+                serde_json::from_slice(&bytes).context("parse script quarantine manifest")?;
+            ensure!(
+                manifest.schema_version == SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION,
+                "unsupported script quarantine manifest schema {}",
+                manifest.schema_version
+            );
+            ensure!(
+                Path::new(&manifest.session_path) == session,
+                "script quarantine manifest session path mismatch"
+            );
+            reconcile_script_quarantine_manifest(&mut manifest);
+            Ok(manifest)
+        })();
+        match loaded {
+            Ok(manifest) => collection.manifests.push(manifest),
+            Err(error) => {
+                collection.failures.push(format!(
+                    "read script quarantine manifest {}: {error:#}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    collection
+        .manifests
+        .sort_by(|left, right| left.session_path.cmp(&right.session_path));
+    Ok(collection)
+}
+
+fn reconcile_script_quarantine_manifest(manifest: &mut AuditEmergencyScriptQuarantineManifest) {
+    for entry in &mut manifest.entries {
+        let source_exists = std::fs::symlink_metadata(&entry.source_path).is_ok();
+        let quarantine_exists = std::fs::symlink_metadata(&entry.quarantine_path).is_ok();
+        match (source_exists, quarantine_exists) {
+            (false, true) => {
+                entry.state = AuditEmergencyScriptQuarantineState::Moved;
+                entry.error = None;
+            }
+            (true, false) => {}
+            (true, true) => {
+                entry.state = AuditEmergencyScriptQuarantineState::Failed;
+                entry.error =
+                    Some("startup entry exists at both source and quarantine paths".into());
+            }
+            (false, false) => {
+                entry.state = AuditEmergencyScriptQuarantineState::Failed;
+                entry.error = Some("startup entry is missing from both planned paths".into());
+            }
+        }
+    }
 }
 
 fn create_emergency_quarantine_session(root: &Path) -> Result<PathBuf> {
@@ -990,7 +1345,9 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     pending.push(path);
-                } else {
+                } else if path.file_name().and_then(|name| name.to_str())
+                    != Some(SCRIPT_QUARANTINE_MANIFEST_FILE)
+                {
                     count += 1;
                 }
             }
@@ -1049,8 +1406,20 @@ mod tests {
     fn unavailable_audit_state_rejects_module_activation() {
         let outcome = ContainmentOutcome {
             module_ids: Vec::new(),
-            audit_unavailable: true,
+            audit_state: AuditStateAvailability::Unavailable,
             audit_error: Some("module audit root is missing".into()),
+        };
+
+        let error = ensure_activation_outcome_allowed("module.alpha", &outcome).unwrap_err();
+        assert!(format!("{error:#}").contains(AUDIT_STATE_UNAVAILABLE_ERROR));
+    }
+
+    #[test]
+    fn clean_uninitialized_audit_state_still_rejects_module_activation() {
+        let outcome = ContainmentOutcome {
+            module_ids: Vec::new(),
+            audit_state: AuditStateAvailability::CleanUninitialized,
+            audit_error: Some("module audit state is not initialized".into()),
         };
 
         let error = ensure_activation_outcome_allowed("module.alpha", &outcome).unwrap_err();
@@ -1061,13 +1430,109 @@ mod tests {
     fn verified_containment_rejects_only_affected_module_activation() {
         let outcome = ContainmentOutcome {
             module_ids: vec!["module.alpha".into()],
-            audit_unavailable: false,
+            audit_state: AuditStateAvailability::Verified,
             audit_error: None,
         };
 
         let error = ensure_activation_outcome_allowed("module.alpha", &outcome).unwrap_err();
         assert!(format!("{error:#}").contains(AUDIT_MODULE_CONTAINED_ERROR));
         ensure_activation_outcome_allowed("module.beta", &outcome).unwrap();
+    }
+
+    #[test]
+    fn uninitialized_store_is_clean_only_without_executable_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let audit_root = temp.path().join("audit");
+        let modules = temp.path().join("modules");
+        let modules_update = temp.path().join("modules_update");
+        let service = temp.path().join("service.d");
+        let initrc = temp.path().join("initrc.d");
+        let metamodule = temp.path().join("metamodule");
+
+        assert!(
+            clean_uninitialized_audit_state(
+                &audit_root,
+                &[&modules, &modules_update],
+                &[&service],
+                &initrc,
+                &metamodule,
+            )
+            .unwrap()
+        );
+
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(modules.join("unexpected"), b"").unwrap();
+        assert!(
+            !clean_uninitialized_audit_state(
+                &audit_root,
+                &[&modules, &modules_update],
+                &[&service],
+                &initrc,
+                &metamodule,
+            )
+            .unwrap()
+        );
+        std::fs::remove_file(modules.join("unexpected")).unwrap();
+
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::write(service.join("payload.sh"), b"").unwrap();
+        assert!(
+            !clean_uninitialized_audit_state(
+                &audit_root,
+                &[&modules, &modules_update],
+                &[&service],
+                &initrc,
+                &metamodule,
+            )
+            .unwrap()
+        );
+        std::fs::remove_file(service.join("payload.sh")).unwrap();
+
+        std::fs::create_dir_all(&initrc).unwrap();
+        std::fs::write(initrc.join("payload.rc"), b"").unwrap();
+        assert!(
+            !clean_uninitialized_audit_state(
+                &audit_root,
+                &[&modules, &modules_update],
+                &[&service],
+                &initrc,
+                &metamodule,
+            )
+            .unwrap()
+        );
+        std::fs::remove_file(initrc.join("payload.rc")).unwrap();
+
+        std::fs::write(&metamodule, b"").unwrap();
+        assert!(
+            !clean_uninitialized_audit_state(
+                &audit_root,
+                &[&modules, &modules_update],
+                &[&service],
+                &initrc,
+                &metamodule,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn payload_free_false_positive_emergency_status_is_discarded() {
+        let temp = tempfile::tempdir().unwrap();
+        let emergency_root = temp.path().join("audit-emergency");
+        let status_path = emergency_root.join("status.json");
+        persist_active_emergency_status(
+            &status_path,
+            AuditEmergencyPhase::Contained,
+            "audit root is missing",
+            Vec::new(),
+            &emergency_root,
+            Vec::new(),
+        )
+        .unwrap();
+
+        discard_empty_emergency_status(&status_path, &emergency_root).unwrap();
+
+        assert!(!status_path.exists());
     }
 
     #[test]
@@ -1111,7 +1576,60 @@ mod tests {
         assert_eq!(std::fs::read_dir(&post_fs_data).unwrap().count(), 0);
         assert_eq!(std::fs::read_dir(&service).unwrap().count(), 0);
         assert_eq!(quarantined_entry_count(&quarantine), 2);
+        let manifests = read_script_quarantine_manifests(&quarantine)
+            .unwrap()
+            .manifests;
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].entries.len(), 2);
+        assert!(manifests[0].entries.iter().all(|entry| {
+            entry.state == AuditEmergencyScriptQuarantineState::Moved
+                && Path::new(&entry.quarantine_path).is_file()
+                && !Path::new(&entry.source_path).exists()
+        }));
         assert!(regenerated.get());
+    }
+
+    #[test]
+    fn quarantine_manifest_recovers_move_completed_before_state_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("service.d");
+        let quarantine_root = temp.path().join("audit-emergency");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("payload.sh");
+        std::fs::write(&source, b"#!/system/bin/sh\n").unwrap();
+        let session = create_emergency_quarantine_session(&quarantine_root).unwrap();
+        let destination_dir = session.join("1");
+        std::fs::create_dir(&destination_dir).unwrap();
+        let destination = destination_dir.join("payload.sh");
+        let now = unix_time_seconds();
+        let manifest = AuditEmergencyScriptQuarantineManifest {
+            schema_version: SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION,
+            session_path: session.to_string_lossy().into_owned(),
+            entries: vec![AuditEmergencyScriptQuarantineEntry {
+                source_path: source.to_string_lossy().into_owned(),
+                quarantine_path: destination.to_string_lossy().into_owned(),
+                state: AuditEmergencyScriptQuarantineState::Planned,
+                error: None,
+            }],
+            created_at_unix_seconds: now,
+            updated_at_unix_seconds: now,
+        };
+        write_script_quarantine_manifest(&session, &manifest).unwrap();
+
+        std::fs::rename(&source, &destination).unwrap();
+
+        let manifests = read_script_quarantine_manifests(&quarantine_root)
+            .unwrap()
+            .manifests;
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(
+            manifests[0].entries[0].state,
+            AuditEmergencyScriptQuarantineState::Moved
+        );
+        assert_eq!(
+            manifests[0].entries[0].quarantine_path,
+            destination.to_string_lossy()
+        );
     }
 
     #[test]
@@ -1135,6 +1653,15 @@ mod tests {
         assert!(format!("{error:#}").contains("disable fail-closed module"));
         assert_eq!(std::fs::read_dir(&persistent).unwrap().count(), 0);
         assert_eq!(quarantined_entry_count(&quarantine), 1);
+        let manifests = read_script_quarantine_manifests(&quarantine)
+            .unwrap()
+            .manifests;
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].entries.len(), 1);
+        assert_eq!(
+            manifests[0].entries[0].state,
+            AuditEmergencyScriptQuarantineState::Moved
+        );
         assert!(regenerated.get());
     }
 }

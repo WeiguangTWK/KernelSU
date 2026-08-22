@@ -47,6 +47,9 @@
     <string name="security_audit_emergency_modules">受影响模块：%1$s</string>
     <string name="security_audit_emergency_trigger">触发详情：%1$s</string>
     <string name="security_audit_emergency_scripts">持久化启动脚本隔离位置：%1$s</string>
+    <string name="security_audit_emergency_script_session">隔离会话：%1$s</string>
+    <string name="security_audit_emergency_script_entry">%1$s\n→ %2$s\n状态：%3$s</string>
+    <string name="security_audit_emergency_script_error">脚本隔离错误：%1$s</string>
     <string name="security_audit_emergency_failures">隔离尚未完成：%1$s</string>
     <string name="security_audit_emergency_recovery">恢复条件：还原完整的模块审计清单，并验证其 Manager seal。在 ksud 确认恢复前，将继续阻止启用模块。</string>
     <string name="security_audit_overview">总览</string>

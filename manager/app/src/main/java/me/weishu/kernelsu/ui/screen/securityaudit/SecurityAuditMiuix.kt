@@ -169,6 +169,37 @@ private fun AuditEmergencyMiuix(status: AuditEmergencyStatus) {
                 ),
                 color = colorScheme.onErrorContainer,
             )
+            status.scriptQuarantines.forEach { quarantine ->
+                Text(
+                    stringResource(
+                        R.string.security_audit_emergency_script_session,
+                        quarantine.sessionPath,
+                    ),
+                    color = colorScheme.onErrorContainer,
+                    fontFamily = FontFamily.Monospace,
+                )
+                quarantine.entries.forEach { entry ->
+                    Text(
+                        stringResource(
+                            R.string.security_audit_emergency_script_entry,
+                            entry.sourcePath,
+                            entry.quarantinePath,
+                            entry.state,
+                        ),
+                        color = colorScheme.onErrorContainer,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                    entry.error?.let { error ->
+                        Text(
+                            stringResource(
+                                R.string.security_audit_emergency_script_error,
+                                error,
+                            ),
+                            color = colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+            }
             if (status.containmentFailures.isNotEmpty()) {
                 Text(
                     stringResource(
