@@ -43,6 +43,7 @@ import me.weishu.kernelsu.ui.util.listModules
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.recoverManagerSealedAudit
+import me.weishu.kernelsu.ui.util.reconcileModuleAuditResponse
 import me.weishu.kernelsu.ui.util.releaseAuditInstallSession
 import me.weishu.kernelsu.ui.util.retryQuarantinedAuditScriptContainment
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
@@ -65,6 +66,7 @@ class SecurityAuditViewModel : ViewModel() {
         try {
             val result = block()
             sealModuleAuditSession(session)
+            reconcileModuleAuditResponse()
             return result
         } catch (error: Throwable) {
             primaryFailure = error
@@ -153,7 +155,7 @@ class SecurityAuditViewModel : ViewModel() {
                             verificationTotal = line.getInt("total_modules"),
                             histories = sortedHistories(merged.values),
                             checkpointCompromised = state.checkpointCompromised ||
-                                history.status.unresolvedRisk,
+                                history.integrityError != null,
                             checkpointIncident = history.integrityError ?: state.checkpointIncident,
                         )
                     }
@@ -579,17 +581,16 @@ class SecurityAuditViewModel : ViewModel() {
         var sealedRecoveryModuleIds = emptyList<String>()
         while (true) {
             val state = _uiState.value
-            val history = state.histories.firstOrNull { it.status.moduleId == moduleId }
             val canRecoverSealedDamage =
                 state.checkpointCompromised && moduleId in state.sealedRecoveryModuleIds
-            if (
-                state.secureRemovalModuleId != null || state.isLoading || state.isRefreshing ||
-                state.isRecovering ||
-                !state.recoverySafeMode || history?.status?.unresolvedRisk != true ||
-                moduleId in state.staleModuleIds ||
-                (state.checkpointCompromised && !canRecoverSealedDamage) ||
-                (!state.auditAuthorizationReady && !canRecoverSealedDamage)
-            ) {
+            if (!state.canSecurelyRemove(moduleId)) {
+                _uiState.update {
+                    it.copy(
+                        errorMessage = ksuApp.getString(
+                            R.string.security_audit_secure_remove_unavailable
+                        ),
+                    )
+                }
                 return
             }
             sealedRecoveryModuleIds = if (canRecoverSealedDamage) {

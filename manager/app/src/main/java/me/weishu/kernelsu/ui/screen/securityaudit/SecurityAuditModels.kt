@@ -137,6 +137,18 @@ data class SecurityAuditUiState(
     val secureRemovalInProgress: Boolean
         get() = secureRemovalPhase != null && secureRemovalPhase != SecureRemovalPhase.Completed
 
+    fun canSecurelyRemove(moduleId: String): Boolean {
+        val history = histories.firstOrNull { it.status.moduleId == moduleId }
+        val canRecoverSealedDamage =
+            checkpointCompromised && moduleId in sealedRecoveryModuleIds
+        return secureRemovalModuleId == null && !isLoading && !isRefreshing &&
+            !isRecovering && closingIncidentId == null && deletingScriptEntryId == null &&
+            retryingScriptEntryId == null && recoverySafeMode &&
+            history?.status?.unresolvedRisk == true && moduleId !in staleModuleIds &&
+            (!checkpointCompromised || canRecoverSealedDamage) &&
+            (auditAuthorizationReady || canRecoverSealedDamage)
+    }
+
     val highRiskModules: Int
         get() = histories.count { it.isHighRisk() }
 

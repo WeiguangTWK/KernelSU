@@ -285,6 +285,13 @@ suspend fun getModuleAuditStatuses(): String = withContext(Dispatchers.IO) {
     )
 }
 
+suspend fun reconcileModuleAuditResponse(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-reconcile-response",
+        "Unable to reconcile module audit emergency response",
+    )
+}
+
 suspend fun getModuleAuditCheckpoint(): String = withContext(Dispatchers.IO) {
     val stdout = ArrayList<String>()
     val stderr = ArrayList<String>()

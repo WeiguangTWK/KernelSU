@@ -354,6 +354,9 @@ enum Module {
         json: bool,
     },
 
+    /// Reconcile global emergency response against the sealed audit inventory
+    AuditReconcileResponse,
+
     /// Stream a consolidated Security & Audit Center dashboard as JSON Lines
     AuditDashboard {
         /// Active Manager installation session allowed to seal before containment.
@@ -1015,6 +1018,27 @@ pub fn run() -> Result<()> {
                             );
                         }
                     }
+                    Ok(())
+                }
+                Module::AuditReconcileResponse => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    let outcome = crate::module_response::enforce_containment(false)?;
+                    anyhow::ensure!(
+                        outcome.audit_state
+                            == crate::module_response::AuditStateAvailability::Verified,
+                        "module audit response reconciliation did not reach verified state: {}",
+                        outcome
+                            .audit_error
+                            .as_deref()
+                            .unwrap_or("audit state is not initialized")
+                    );
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "verified": true,
+                            "contained_module_ids": outcome.module_ids,
+                        })
+                    );
                     Ok(())
                 }
                 Module::AuditDashboard { install_session } => {

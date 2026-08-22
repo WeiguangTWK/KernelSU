@@ -187,10 +187,11 @@ fun SecurityAuditModuleScreen(
         }
     )
     var removalPromptShown by remember(moduleId, requestSecureRemoval) { mutableStateOf(false) }
-    LaunchedEffect(requestSecureRemoval, state.isLoading, state.recoverySafeMode) {
+    val secureRemovalAvailable = state.canSecurelyRemove(moduleId)
+    LaunchedEffect(requestSecureRemoval, secureRemovalAvailable) {
         if (
             requestSecureRemoval && !removalPromptShown &&
-            !state.isLoading && state.recoverySafeMode
+            secureRemovalAvailable
         ) {
             removalPromptShown = true
             secureRemovalDialog.showConfirm(

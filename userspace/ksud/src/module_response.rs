@@ -1049,18 +1049,8 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome>
 }
 
 fn trusted_containment_ids(audit_root: &Path, module_roots: &[&Path]) -> Result<BTreeSet<String>> {
-    let revision_before = module_audit_log::dashboard_store_revision(audit_root)
-        .context("read module audit revision before containment verification")?;
-    let sealed = module_audit_log::sealed_integrity_status(audit_root)
-        .context("verify Manager-sealed module audit inventory")?;
-    let statuses = module_audit_log::list_modules_resilient(audit_root, false)
+    let (sealed, statuses) = module_audit_log::containment_inventory_snapshot(audit_root)
         .context("verify current module audit histories")?;
-    let revision_after = module_audit_log::dashboard_store_revision(audit_root)
-        .context("read module audit revision after containment verification")?;
-    ensure!(
-        revision_before == revision_after,
-        "module audit store changed during containment verification"
-    );
 
     let mut audited = BTreeSet::new();
     let mut contained = sealed

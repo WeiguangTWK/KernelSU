@@ -112,6 +112,7 @@
     <string name="security_audit_secure_remove_message">KernelSU will quarantine and remove %1$s without running uninstall.sh, metauninstall.sh, or any other module-controlled code. External files created by the module are not deleted automatically.</string>
     <string name="security_audit_secure_remove_reboot_guide">%1$s is not trusted, so its normal uninstall path has been disabled. KernelSU will disable it and cancel any pending scripted uninstall, then reboot.\n\nThis is not Android safe mode. After the first boot screen appears, quickly press and release Volume Down at least three times. Reopen Security &amp; Audit Center after boot to finish removal.</string>
     <string name="security_audit_secure_remove_confirm">Securely remove</string>
+    <string name="security_audit_secure_remove_unavailable">Secure removal is not ready because audit verification or another incident operation is still in progress. Wait for the audit refresh to finish and try again.</string>
     <string name="security_audit_secure_remove_reboot">Disable and reboot</string>
     <string name="security_audit_module_contained">Module contained · Open Security &amp; Audit Center</string>
     <string name="security_audit_containment_pending">Containment pending reboot</string>

@@ -94,6 +94,7 @@
     <string name="security_audit_secure_remove_message">KernelSU 将隔离并移除 %1$s，不会执行 uninstall.sh、metauninstall.sh 或其他由模块控制的代码。模块写入外部目录的文件不会被自动删除。</string>
     <string name="security_audit_secure_remove_reboot_guide">%1$s 已不受信任，因此普通卸载流程已被禁用。KernelSU 将先禁用模块并取消待执行的脚本卸载，然后重启。\n\n这不是 Android 安全模式。出现开机第一屏后，请快速按下并松开音量减键至少三次；启动完成后重新打开“安全与审计中心”完成移除。</string>
     <string name="security_audit_secure_remove_confirm">安全卸载</string>
+    <string name="security_audit_secure_remove_unavailable">审计验证或其他事故操作仍在进行，暂时无法安全卸载。请等待审计刷新完成后重试。</string>
     <string name="security_audit_secure_remove_reboot">禁用并重启</string>
     <string name="security_audit_module_contained">模块已隔离 · 前往安全与审计中心</string>
     <string name="security_audit_containment_pending">重启后完成隔离</string>

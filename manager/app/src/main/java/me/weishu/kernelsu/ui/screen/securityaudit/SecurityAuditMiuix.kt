@@ -465,7 +465,12 @@ fun SecurityAuditModuleMiuix(
                                 stringResource(R.string.security_audit_secure_remove_action, moduleId)
                             },
                             onClick = { actions.onRequestSecureRemoval(moduleId) },
-                            enabled = state.secureRemovalModuleId == null && !state.isLoading,
+                            enabled = if (state.recoverySafeMode) {
+                                state.canSecurelyRemove(moduleId)
+                            } else {
+                                state.secureRemovalModuleId == null && !state.isLoading &&
+                                    !state.isRefreshing && !state.isRecovering
+                            },
                             modifier = Modifier.fillMaxWidth(),
                         )
                     }

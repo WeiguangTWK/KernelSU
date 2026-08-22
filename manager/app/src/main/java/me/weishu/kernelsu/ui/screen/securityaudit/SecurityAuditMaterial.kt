@@ -456,7 +456,12 @@ fun SecurityAuditModuleMaterial(
                     item {
                         Button(
                             onClick = { actions.onRequestSecureRemoval(moduleId) },
-                            enabled = state.secureRemovalModuleId == null && !state.isLoading,
+                            enabled = if (state.recoverySafeMode) {
+                                state.canSecurelyRemove(moduleId)
+                            } else {
+                                state.secureRemovalModuleId == null && !state.isLoading &&
+                                    !state.isRefreshing && !state.isRecovering
+                            },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
                             if (state.secureRemovalModuleId == moduleId) {

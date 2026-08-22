@@ -1013,9 +1013,12 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         .events
         .iter()
         .any(|entry| matches!(entry.event.kind, AuditEventKind::IntegrityIncident { .. }));
-    match read_risk(root, module_id, &key) {
-        Ok(Some(risk)) => high_risk |= risk.high_risk,
-        Ok(None) => {}
+    let risk_record_high_risk = match read_risk(root, module_id, &key) {
+        Ok(Some(risk)) => {
+            high_risk |= risk.high_risk;
+            Some(risk.high_risk)
+        }
+        Ok(None) => None,
         Err(error) => {
             ensure!(repair, "audit risk registry integrity failure: {error:#}");
             let risk_path = risk_path(root, module_id);
@@ -1032,9 +1035,10 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
             )?;
             chain.state = VerificationState::Recovered;
             high_risk = true;
+            None
         }
-    }
-    if high_risk {
+    };
+    if high_risk && risk_record_high_risk != Some(true) {
         write_risk(root, module_id, &key, "audit history integrity failure")?;
     }
     let last_secure_removal = chain
@@ -1317,6 +1321,15 @@ fn compromised_sealed_history(
 ) -> Result<ModuleAuditHistory> {
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
+    compromised_sealed_history_unlocked(root, module_id, source, &key)
+}
+
+fn compromised_sealed_history_unlocked(
+    root: &Path,
+    module_id: &str,
+    source: &anyhow::Error,
+    key: &[u8; 32],
+) -> Result<ModuleAuditHistory> {
     let registry = read_manager_auth_registry(root, &key)?
         .context("Manager audit authorization key is not configured")?;
     let seal = load_verified_manager_seal(root, &registry)?
@@ -2408,6 +2421,45 @@ pub fn sealed_integrity_status(root: &Path) -> Result<SealedIntegrityStatus> {
     sealed_integrity_status_unlocked(root, &key)
 }
 
+/// Verify the Manager seal and every module history against one locked audit
+/// store snapshot. The revision guard still detects direct filesystem changes
+/// from writers that do not participate in the audit lock protocol.
+pub fn containment_inventory_snapshot(
+    root: &Path,
+) -> Result<(SealedIntegrityStatus, Vec<ModuleAuditStatus>)> {
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    verify_tombstones(root, &key)?;
+
+    let revision_before = dashboard_store_revision(root)
+        .context("read module audit revision before containment verification")?;
+    let sealed = sealed_integrity_status_unlocked(root, &key)
+        .context("verify Manager-sealed module audit inventory")?;
+    let statuses = if root.join("modules").exists() {
+        audit_module_ids(&root.join("modules"))?
+            .into_iter()
+            .map(
+                |module_id| match verify_module_unlocked(root, &module_id, false) {
+                    Ok(status) => Ok(status),
+                    Err(error) => {
+                        compromised_sealed_history_unlocked(root, &module_id, &error, &key)
+                            .map(|history| history.status)
+                    }
+                },
+            )
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let revision_after = dashboard_store_revision(root)
+        .context("read module audit revision after containment verification")?;
+    ensure!(
+        revision_before == revision_after,
+        "module audit store changed during containment verification"
+    );
+    Ok((sealed, statuses))
+}
+
 fn sealed_integrity_status_unlocked(root: &Path, key: &[u8; 32]) -> Result<SealedIntegrityStatus> {
     let registry = read_manager_auth_registry(root, key)?
         .context("Manager audit authorization key is not configured")?;
@@ -3174,7 +3226,13 @@ fn validate_checkpoint_operation(operation: &CheckpointOperation) -> Result<()> 
     ensure!(
         matches!(
             operation.action.as_str(),
-            "rescan" | "prune" | "secure-remove" | "recover-sealed"
+            "rescan"
+                | "prune"
+                | "secure-remove"
+                | "recover-sealed"
+                | "close-incident"
+                | "delete-quarantined-script"
+                | "retry-script-containment"
         ),
         "unsupported checkpoint audit operation"
     );
