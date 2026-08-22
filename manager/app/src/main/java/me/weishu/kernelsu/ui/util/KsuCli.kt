@@ -105,9 +105,10 @@ fun execKsud(args: String, newShell: Boolean = false, globalMnt: Boolean = false
     }
 }
 
-suspend fun beginAuditInstallSession(): String = withContext(Dispatchers.IO) {
+suspend fun beginAuditInstallSession(timeoutSeconds: Int = 180): String = withContext(Dispatchers.IO) {
+    require(timeoutSeconds in 1..600) { "Invalid audit installation session timeout" }
     val id = UUID.randomUUID().toString().replace("-", "")
-    check(execKsud("audit-install-session begin $id --timeout-seconds 180", newShell = true)) {
+    check(execKsud("audit-install-session begin $id --timeout-seconds $timeoutSeconds", newShell = true)) {
         "Unable to start the audit installation session"
     }
     repeat(100) {

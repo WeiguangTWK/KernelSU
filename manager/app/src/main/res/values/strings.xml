@@ -410,5 +410,7 @@
     <string name="security_audit_global_restart">auditd was restarted</string>
     <string name="security_audit_global_containment">Module isolation detected. Open Security &amp; Audit Center to review.</string>
     <string name="security_audit_global_store_missing">Module audit store is missing</string>
+    <string name="security_audit_global_state_unavailable">Module audit state is unavailable. Fail-closed isolation was applied.</string>
+    <string name="security_audit_global_verification_failed">Module audit verification or fail-closed isolation failed.</string>
     <string name="security_audit_global_watch_overflow">Audit event queue overflowed. Some changes may not have been observed.</string>
 </resources>

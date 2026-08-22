@@ -19,6 +19,8 @@ class AuditEventReceiver : BroadcastReceiver() {
             "auditd_restart" -> context.getString(R.string.security_audit_global_restart)
             "containment_applied" -> context.getString(R.string.security_audit_global_containment)
             "audit_store_missing" -> context.getString(R.string.security_audit_global_store_missing)
+            "audit_state_unavailable" -> context.getString(R.string.security_audit_global_state_unavailable)
+            "audit_verification_failed" -> context.getString(R.string.security_audit_global_verification_failed)
             "watch_overflow" -> context.getString(R.string.security_audit_global_watch_overflow)
             else -> fallbackMessage ?: return
         }

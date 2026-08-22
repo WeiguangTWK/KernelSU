@@ -1025,6 +1025,8 @@ pub fn run() -> Result<()> {
                             Ok(())
                         }
                         AuditAuth::Register { public_key } => {
+                            let _coordinator =
+                                crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
                             let status = crate::module_audit_log::register_manager_audit_auth_key(
                                 root,
                                 &public_key,
@@ -1034,6 +1036,8 @@ pub fn run() -> Result<()> {
                             Ok(())
                         }
                         AuditAuth::Recover { public_key } => {
+                            let _coordinator =
+                                crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
                             anyhow::ensure!(
                                 ksucalls::try_check_kernel_safemode()
                                     .context("query KernelSU safe mode for Manager key recovery")?,
@@ -1048,6 +1052,8 @@ pub fn run() -> Result<()> {
                             Ok(())
                         }
                         AuditAuth::Challenge { action, id } => {
+                            let _coordinator =
+                                crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
                             let arguments_hash = match action.as_str() {
                                 "rescan" => {
                                     anyhow::ensure!(id.is_none(), "rescan does not accept --id");
@@ -1089,6 +1095,7 @@ pub fn run() -> Result<()> {
                 }
                 Module::AuditSeal { command } => {
                     let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
                     let status = match command {
                         AuditSeal::Status => {
                             crate::module_audit_log::manager_audit_seal_status(root)?
@@ -1113,19 +1120,28 @@ pub fn run() -> Result<()> {
                 Module::AuditRescan {
                     json,
                     authorization,
-                } => module::audit_installed_modules(json, &authorization),
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    module::audit_installed_modules(json, &authorization)
+                }
                 Module::AuditPrune {
                     id,
                     dry_run,
                     json,
                     authorization,
-                } => module::prune_module_audit_histories(
-                    id.as_deref(),
-                    dry_run,
-                    json,
-                    authorization.as_deref(),
-                ),
+                } => {
+                    let _coordinator = (!dry_run)
+                        .then(crate::auditd::AuditCoordinatorGuard::acquire_blocking)
+                        .transpose()?;
+                    module::prune_module_audit_histories(
+                        id.as_deref(),
+                        dry_run,
+                        json,
+                        authorization.as_deref(),
+                    )
+                }
                 Module::AuditContain { id } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
                     crate::module_response::contain_for_secure_removal(&id)
                 }
                 Module::AuditSecureRemove {
@@ -1133,6 +1149,7 @@ pub fn run() -> Result<()> {
                     json,
                     authorization,
                 } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
                     crate::module_response::secure_remove(&id, &authorization)?;
                     if json {
                         println!(
@@ -1149,6 +1166,7 @@ pub fn run() -> Result<()> {
                     json,
                     authorization,
                 } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
                     let status =
                         crate::module_response::recover_manager_sealed_audit(&id, &authorization)?;
                     if json {

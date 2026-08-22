@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,12 +21,14 @@ import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
 import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.security.parseModuleAuditResponseStatus
 import me.weishu.kernelsu.security.requiresAuditSealCommit
+import me.weishu.kernelsu.security.sealModuleAuditSession
 import me.weishu.kernelsu.ui.screen.securityaudit.AuditHistory
 import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditUiState
 import me.weishu.kernelsu.ui.screen.securityaudit.SecureRemovalPhase
 import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
 import me.weishu.kernelsu.ui.util.commitModuleAuditSeal
+import me.weishu.kernelsu.ui.util.beginAuditInstallSession
 import me.weishu.kernelsu.ui.util.containModuleForSecureRemoval
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
 import me.weishu.kernelsu.ui.util.getModuleAuditRecoveryStatus
@@ -38,6 +41,7 @@ import me.weishu.kernelsu.ui.util.listModules
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.recoverManagerSealedAudit
+import me.weishu.kernelsu.ui.util.releaseAuditInstallSession
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
 import me.weishu.kernelsu.ui.util.securelyRemoveModule as runSecureModuleRemoval
 import me.weishu.kernelsu.ui.util.streamModuleAuditDashboard
@@ -51,6 +55,29 @@ class SecurityAuditViewModel : ViewModel() {
     private var refreshJob: Job? = null
     private val refreshGeneration = AtomicLong()
     private val checkpointStore by lazy { ModuleAuditCheckpointStore(ksuApp) }
+
+    private suspend fun <T> withAuditMutationSession(block: suspend () -> T): T {
+        val session = beginAuditInstallSession(timeoutSeconds = 600)
+        var primaryFailure: Throwable? = null
+        try {
+            val result = block()
+            sealModuleAuditSession(session)
+            return result
+        } catch (error: Throwable) {
+            primaryFailure = error
+            throw error
+        } finally {
+            try {
+                withContext(NonCancellable) {
+                    releaseAuditInstallSession(session)
+                }
+            } catch (releaseError: Throwable) {
+                val failure = primaryFailure
+                if (failure == null) throw releaseError
+                failure.addSuppressed(releaseError)
+            }
+        }
+    }
 
     private data class DashboardStreamResult(
         val rawHistories: String,
@@ -427,7 +454,9 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                recoverSealedHistories(_uiState.value.sealedRecoveryModuleIds)
+                withAuditMutationSession {
+                    recoverSealedHistories(_uiState.value.sealedRecoveryModuleIds)
+                }
             }.onFailure { error ->
                 if (error is CancellationException) throw error
                 _uiState.update {
@@ -460,7 +489,9 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                runInstalledModuleRescan(createAuthorization("rescan"))
+                withAuditMutationSession {
+                    runInstalledModuleRescan(createAuthorization("rescan"))
+                }
             }.onFailure { error ->
                 if (error is CancellationException) throw error
                 _uiState.update {
@@ -494,7 +525,9 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             val result = runCatching {
-                pruneStaleModuleAuditHistories(createAuthorization("prune"))
+                withAuditMutationSession {
+                    pruneStaleModuleAuditHistories(createAuthorization("prune"))
+                }
             }
             result.onFailure { error ->
                 if (error is CancellationException) throw error
@@ -519,7 +552,11 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch {
             runCatching {
-                withContext(Dispatchers.IO) { containModuleForSecureRemoval(moduleId) }
+                withContext(Dispatchers.IO) {
+                    withAuditMutationSession {
+                        containModuleForSecureRemoval(moduleId)
+                    }
+                }
             }.onSuccess {
                 onContained()
             }.onFailure { error ->
@@ -571,17 +608,19 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             val result = runCatching {
-                if (sealedRecoveryModuleIds.isNotEmpty()) {
-                    recoverSealedHistories(sealedRecoveryModuleIds, trackSecureRemoval = true)
-                }
-                _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RemovingModule) }
-                runSecureModuleRemoval(moduleId, createAuthorization("secure-remove", moduleId))
-                _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RefreshingModules) }
-                val modules = JSONArray(listModules())
-                check((0 until modules.length()).none { index ->
-                    modules.getJSONObject(index).optString("id") == moduleId
-                }) {
-                    "Secure removal completed but the module is still present"
+                withAuditMutationSession {
+                    if (sealedRecoveryModuleIds.isNotEmpty()) {
+                        recoverSealedHistories(sealedRecoveryModuleIds, trackSecureRemoval = true)
+                    }
+                    _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RemovingModule) }
+                    runSecureModuleRemoval(moduleId, createAuthorization("secure-remove", moduleId))
+                    _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RefreshingModules) }
+                    val modules = JSONArray(listModules())
+                    check((0 until modules.length()).none { index ->
+                        modules.getJSONObject(index).optString("id") == moduleId
+                    }) {
+                        "Secure removal completed but the module is still present"
+                    }
                 }
             }
             result.onSuccess {

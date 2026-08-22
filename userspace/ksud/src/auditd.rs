@@ -389,14 +389,20 @@ fn verify_and_respond_locked(
                 return None;
             }
             if outcome.audit_state == AuditStateAvailability::Unavailable {
+                let reason = outcome
+                    .audit_error
+                    .clone()
+                    .unwrap_or_else(|| "unknown error".to_owned());
                 if !*store_missing_recorded {
                     if let Err(error) =
-                        global_audit::record_event(AuditEventKind::AuditStoreMissing)
+                        global_audit::record_event(AuditEventKind::AuditStateUnavailable {
+                            reason: reason.clone(),
+                        })
                     {
-                        warn!("failed to record audit store missing event: {error:#}");
+                        warn!("failed to record unavailable audit state: {error:#}");
                     }
                     notification = Some(SecurityEvent {
-                        kind: "audit_store_missing".to_owned(),
+                        kind: "audit_state_unavailable".to_owned(),
                         message: "模块审计状态不可用，已执行全量隔离".to_owned(),
                     });
                     *store_missing_recorded = true;
@@ -404,7 +410,7 @@ fn verify_and_respond_locked(
                 warn!(
                     "module audit state is unavailable; fail-closed containment covers {} modules: {}",
                     next.len(),
-                    outcome.audit_error.as_deref().unwrap_or("unknown error")
+                    reason
                 );
                 *last_contained = next;
                 return notification;
@@ -436,12 +442,14 @@ fn verify_and_respond_locked(
             warn!("audit verification and containment failed: {error:#}");
             if !*store_missing_recorded {
                 if let Err(record_error) =
-                    global_audit::record_event(AuditEventKind::AuditStoreMissing)
+                    global_audit::record_event(AuditEventKind::AuditVerificationFailed {
+                        reason: format!("{error:#}"),
+                    })
                 {
                     warn!("failed to record audit failure event: {record_error:#}");
                 }
                 notification = Some(SecurityEvent {
-                    kind: "audit_store_missing".to_owned(),
+                    kind: "audit_verification_failed".to_owned(),
                     message: "模块审计验证或全量隔离失败".to_owned(),
                 });
                 *store_missing_recorded = true;

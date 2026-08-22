@@ -70,6 +70,12 @@ pub enum AuditEventKind {
         module_ids: Vec<String>,
     },
     AuditStoreMissing,
+    AuditStateUnavailable {
+        reason: String,
+    },
+    AuditVerificationFailed {
+        reason: String,
+    },
     WatchOverflow,
 }
 

@@ -29,7 +29,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.R
-import me.weishu.kernelsu.security.sealModuleAuditAfterInstall
+import me.weishu.kernelsu.security.sealModuleAuditSession
 import me.weishu.kernelsu.ui.util.FlashResult
 import me.weishu.kernelsu.ui.util.LkmSelection
 import me.weishu.kernelsu.ui.util.beginAuditInstallSession
@@ -109,7 +109,7 @@ suspend fun flashModulesSequentially(
         // installation operation is written. Initializing after flashing would
         // correctly be rejected because an unpaired Manager must not bless
         // pre-existing operations.
-        sealModuleAuditAfterInstall(session)
+        sealModuleAuditSession(session)
         val before = moduleEnabledStates()
         for (uri in uris) {
             val installed = flashModule(uri, onStdout, onStderr)
@@ -121,7 +121,7 @@ suspend fun flashModulesSequentially(
         if (result.code == 0) {
             val after = moduleEnabledStates()
             val intendedEnabled = before.filterValues { it }.keys + (after.keys - before.keys)
-            val trust = sealModuleAuditAfterInstall(session)
+            val trust = sealModuleAuditSession(session)
             val restore = intendedEnabled.intersect(trust.releasableModuleIds)
             val failed = restore.filterNot { toggleModule(it, enable = true) }
             check(failed.isEmpty()) {

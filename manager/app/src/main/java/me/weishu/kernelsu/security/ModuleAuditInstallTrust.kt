@@ -11,7 +11,7 @@ data class ModuleAuditInstallTrust(
     val releasableModuleIds: Set<String>,
 )
 
-suspend fun sealModuleAuditAfterInstall(installSession: String): ModuleAuditInstallTrust {
+suspend fun sealModuleAuditSession(installSession: String): ModuleAuditInstallTrust {
     val histories = linkedMapOf<String, JSONObject>()
     var completion: JSONObject? = null
     streamModuleAuditDashboard(installSession) { rawLine ->
