@@ -2,6 +2,7 @@ use crate::{defs, ksucalls, metamodule, module, module_audit_log};
 use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -21,7 +22,7 @@ const PERSISTENT_SCRIPT_DIRS: &[&str] = &[
 const PERSISTENT_INITRC_DIR: &str = "/data/adb/initrc.d";
 
 const AUDIT_EMERGENCY_SCHEMA_VERSION: u32 = 1;
-const SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION: u32 = 1;
+const SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const SCRIPT_QUARANTINE_MANIFEST_FILE: &str = "manifest.json";
 const AUDIT_STATE_UNAVAILABLE_ERROR: &str = "audit_state_unavailable";
 const AUDIT_MODULE_CONTAINED_ERROR: &str = "audit_module_contained";
@@ -53,15 +54,98 @@ pub enum AuditEmergencyScriptQuarantineState {
     Planned,
     Moved,
     Failed,
+    Deleted,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuditEmergencyScriptQuarantineEntry {
+    #[serde(default)]
+    pub entry_id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "module_audit_log::AuditIncidentCause::is_unknown"
+    )]
+    pub cause: module_audit_log::AuditIncidentCause,
     pub source_path: String,
     pub quarantine_path: String,
     pub state: AuditEmergencyScriptQuarantineState,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_routes: Vec<module_audit_log::AuditRecoveryRoute>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn script_quarantine_entry_id(session: &Path, source: &Path, quarantine: &Path) -> String {
+    let bytes = serde_json::to_vec(&(
+        "emergency-script-quarantine",
+        session.to_string_lossy(),
+        source.to_string_lossy(),
+        quarantine.to_string_lossy(),
+    ))
+    .unwrap_or_default();
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn script_delete_route(quarantine: &Path) -> module_audit_log::AuditRecoveryRoute {
+    let regular_file =
+        std::fs::symlink_metadata(quarantine).is_ok_and(|metadata| metadata.file_type().is_file());
+    module_audit_log::AuditRecoveryRoute {
+        action: "delete_quarantined_script".to_owned(),
+        available: regular_file,
+        destructive: true,
+        conditions: vec![
+            module_audit_log::AuditRecoveryCondition {
+                kind: "audit_state_verified".to_owned(),
+                state: module_audit_log::AuditRecoveryRequirementState::Required,
+            },
+            module_audit_log::AuditRecoveryCondition {
+                kind: "manager_authorization".to_owned(),
+                state: module_audit_log::AuditRecoveryRequirementState::Required,
+            },
+            module_audit_log::AuditRecoveryCondition {
+                kind: "quarantine_regular_file".to_owned(),
+                state: if regular_file {
+                    module_audit_log::AuditRecoveryRequirementState::Satisfied
+                } else {
+                    module_audit_log::AuditRecoveryRequirementState::Unsatisfied
+                },
+            },
+        ],
+    }
+}
+
+fn script_retry_route(source: &Path) -> module_audit_log::AuditRecoveryRoute {
+    let regular_file =
+        std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_file());
+    module_audit_log::AuditRecoveryRoute {
+        action: "retry_script_containment".to_owned(),
+        available: regular_file,
+        destructive: false,
+        conditions: vec![
+            module_audit_log::AuditRecoveryCondition {
+                kind: "audit_state_verified".to_owned(),
+                state: module_audit_log::AuditRecoveryRequirementState::Required,
+            },
+            module_audit_log::AuditRecoveryCondition {
+                kind: "manager_authorization".to_owned(),
+                state: module_audit_log::AuditRecoveryRequirementState::Required,
+            },
+            module_audit_log::AuditRecoveryCondition {
+                kind: "source_regular_file".to_owned(),
+                state: if regular_file {
+                    module_audit_log::AuditRecoveryRequirementState::Satisfied
+                } else {
+                    module_audit_log::AuditRecoveryRequirementState::Unsatisfied
+                },
+            },
+        ],
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -127,6 +211,365 @@ pub fn audit_emergency_status() -> Result<Option<AuditEmergencyStatus>> {
         )),
     }
     Ok(Some(status))
+}
+
+pub fn quarantined_script_delete_arguments_hash(entry_id: &str) -> Result<String> {
+    ensure!(
+        entry_id.len() == 64 && entry_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid quarantined script entry id"
+    );
+    let collection = read_script_quarantine_manifests(Path::new(defs::AUDIT_EMERGENCY_DIR))?;
+    ensure!(
+        collection.failures.is_empty(),
+        "cannot authorize deletion while quarantine manifests are unreadable: {}",
+        collection.failures.join("; ")
+    );
+    let matches = collection
+        .manifests
+        .iter()
+        .flat_map(|manifest| manifest.entries.iter().map(move |entry| (manifest, entry)))
+        .filter(|(_, entry)| entry.entry_id == entry_id)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "quarantined script entry is unavailable"
+    );
+    let (manifest, entry) = matches[0];
+    ensure!(
+        matches!(
+            entry.state,
+            AuditEmergencyScriptQuarantineState::Moved
+                | AuditEmergencyScriptQuarantineState::Deleted
+        ),
+        "quarantined script entry is not ready for deletion"
+    );
+    let bytes = serde_json::to_vec(&(
+        "delete-quarantined-script",
+        entry_id,
+        &manifest.session_path,
+        &entry.source_path,
+        &entry.quarantine_path,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub fn delete_quarantined_script(entry_id: &str, authorization: &str) -> Result<()> {
+    let arguments_hash = quarantined_script_delete_arguments_hash(entry_id)?;
+    let targets = vec![entry_id.to_owned()];
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    let operation = module_audit_log::begin_manager_audit_operation(
+        audit_root,
+        authorization,
+        "delete-quarantined-script",
+        &arguments_hash,
+        &targets,
+    )?;
+    if operation.applied {
+        return Ok(());
+    }
+
+    let collection = read_script_quarantine_manifests(Path::new(defs::AUDIT_EMERGENCY_DIR))?;
+    ensure!(
+        collection.failures.is_empty(),
+        "cannot delete while quarantine manifests are unreadable: {}",
+        collection.failures.join("; ")
+    );
+    let mut selected = collection
+        .manifests
+        .into_iter()
+        .filter(|manifest| {
+            manifest
+                .entries
+                .iter()
+                .any(|entry| entry.entry_id == entry_id)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        selected.len() == 1,
+        "quarantined script entry is unavailable"
+    );
+    let mut manifest = selected.remove(0);
+    let entry_index = manifest
+        .entries
+        .iter()
+        .position(|entry| entry.entry_id == entry_id)
+        .context("quarantined script entry disappeared")?;
+    let session = PathBuf::from(&manifest.session_path);
+    let quarantine = PathBuf::from(&manifest.entries[entry_index].quarantine_path);
+    ensure!(
+        quarantine.starts_with(&session),
+        "quarantined script path escapes its session"
+    );
+    ensure!(
+        std::fs::symlink_metadata(&manifest.entries[entry_index].source_path)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+        "refusing deletion while the startup source path exists"
+    );
+    manifest.schema_version = SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION;
+    manifest.entries[entry_index].delete_requested = true;
+    manifest.updated_at_unix_seconds = unix_time_seconds();
+    write_script_quarantine_manifest(&session, &manifest)?;
+
+    match std::fs::symlink_metadata(&quarantine) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "refusing to delete a non-regular quarantined startup entry"
+            );
+            std::fs::remove_file(&quarantine)
+                .with_context(|| format!("delete quarantined script {}", quarantine.display()))?;
+            sync_directory(
+                quarantine
+                    .parent()
+                    .context("quarantined script has no parent")?,
+            )?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect quarantined script before deletion"),
+    }
+    manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Deleted;
+    manifest.entries[entry_index].error = None;
+    manifest.entries[entry_index].recovery_routes.clear();
+    manifest.updated_at_unix_seconds = unix_time_seconds();
+    write_script_quarantine_manifest(&session, &manifest)?;
+    module_audit_log::complete_manager_audit_operation_target(
+        audit_root,
+        &operation.operation_id,
+        "delete-quarantined-script",
+        entry_id,
+    )?;
+    module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
+}
+
+pub fn quarantined_script_retry_arguments_hash(entry_id: &str) -> Result<String> {
+    let collection = read_script_quarantine_manifests(Path::new(defs::AUDIT_EMERGENCY_DIR))?;
+    ensure!(
+        collection.failures.is_empty(),
+        "quarantine manifests are unreadable"
+    );
+    let matches = collection
+        .manifests
+        .iter()
+        .flat_map(|manifest| manifest.entries.iter().map(move |entry| (manifest, entry)))
+        .filter(|(_, entry)| entry.entry_id == entry_id)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "quarantined script entry is unavailable"
+    );
+    let (manifest, entry) = matches[0];
+    ensure!(
+        matches!(
+            entry.state,
+            AuditEmergencyScriptQuarantineState::Planned
+                | AuditEmergencyScriptQuarantineState::Failed
+                | AuditEmergencyScriptQuarantineState::Moved
+        ),
+        "quarantined script entry cannot be retried"
+    );
+    let bytes = serde_json::to_vec(&(
+        "retry-script-containment",
+        entry_id,
+        &manifest.session_path,
+        &entry.source_path,
+        &entry.quarantine_path,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub fn retry_quarantined_script_containment(entry_id: &str, authorization: &str) -> Result<()> {
+    let arguments_hash = quarantined_script_retry_arguments_hash(entry_id)?;
+    let targets = vec![entry_id.to_owned()];
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    let operation = module_audit_log::begin_manager_audit_operation(
+        audit_root,
+        authorization,
+        "retry-script-containment",
+        &arguments_hash,
+        &targets,
+    )?;
+    if operation.applied {
+        return Ok(());
+    }
+    let collection = read_script_quarantine_manifests(Path::new(defs::AUDIT_EMERGENCY_DIR))?;
+    ensure!(
+        collection.failures.is_empty(),
+        "quarantine manifests are unreadable"
+    );
+    let mut selected = collection
+        .manifests
+        .into_iter()
+        .filter(|manifest| {
+            manifest
+                .entries
+                .iter()
+                .any(|entry| entry.entry_id == entry_id)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        selected.len() == 1,
+        "quarantined script entry is unavailable"
+    );
+    let mut manifest = selected.remove(0);
+    let entry_index = manifest
+        .entries
+        .iter()
+        .position(|entry| entry.entry_id == entry_id)
+        .context("quarantined script entry disappeared")?;
+    let session = PathBuf::from(&manifest.session_path);
+    let source = PathBuf::from(&manifest.entries[entry_index].source_path);
+    let quarantine = PathBuf::from(&manifest.entries[entry_index].quarantine_path);
+    validate_script_quarantine_entry(&session, &manifest.entries[entry_index])?;
+    let source_missing = std::fs::symlink_metadata(&source)
+        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+    let quarantine_metadata = std::fs::symlink_metadata(&quarantine);
+    if source_missing
+        && quarantine_metadata
+            .as_ref()
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Moved;
+    } else {
+        let metadata = std::fs::symlink_metadata(&source)
+            .context("inspect persistent script before containment retry")?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "refusing to quarantine a non-regular startup entry"
+        );
+        ensure!(
+            quarantine_metadata.is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+            "quarantine destination already exists"
+        );
+        ensure_private_dir(
+            quarantine
+                .parent()
+                .context("quarantine destination has no parent")?,
+        )?;
+        std::fs::rename(&source, &quarantine)
+            .context("retry persistent startup script containment")?;
+        sync_directory(source.parent().context("startup source has no parent")?)?;
+        sync_directory(
+            quarantine
+                .parent()
+                .context("quarantine destination has no parent")?,
+        )?;
+        manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Moved;
+    }
+    manifest.schema_version = SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION;
+    manifest.entries[entry_index].error = None;
+    manifest.entries[entry_index].recovery_routes = vec![script_delete_route(&quarantine)];
+    manifest.updated_at_unix_seconds = unix_time_seconds();
+    write_script_quarantine_manifest(&session, &manifest)?;
+    module_audit_log::complete_manager_audit_operation_target(
+        audit_root,
+        &operation.operation_id,
+        "retry-script-containment",
+        entry_id,
+    )?;
+    module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
+}
+
+pub(crate) fn quarantined_script_action_completed(entry_id: &str, action: &str) -> Result<bool> {
+    let collection = read_script_quarantine_manifests(Path::new(defs::AUDIT_EMERGENCY_DIR))?;
+    ensure!(
+        collection.failures.is_empty(),
+        "quarantine manifests are unreadable"
+    );
+    let mut manifests = collection
+        .manifests
+        .into_iter()
+        .filter(|manifest| {
+            manifest
+                .entries
+                .iter()
+                .any(|entry| entry.entry_id == entry_id)
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        manifests.len() == 1,
+        "quarantined script entry is unavailable"
+    );
+    let mut manifest = manifests.remove(0);
+    let entry_index = manifest
+        .entries
+        .iter()
+        .position(|entry| entry.entry_id == entry_id)
+        .context("quarantined script entry disappeared")?;
+    let session = PathBuf::from(&manifest.session_path);
+    validate_script_quarantine_entry(&session, &manifest.entries[entry_index])?;
+    let source = PathBuf::from(&manifest.entries[entry_index].source_path);
+    let quarantine = PathBuf::from(&manifest.entries[entry_index].quarantine_path);
+    match action {
+        "delete-quarantined-script" => {
+            if manifest.entries[entry_index].state == AuditEmergencyScriptQuarantineState::Deleted {
+                return Ok(true);
+            }
+            ensure!(
+                std::fs::symlink_metadata(&source)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                "refusing deletion while the startup source path exists"
+            );
+            manifest.schema_version = SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION;
+            manifest.entries[entry_index].delete_requested = true;
+            manifest.updated_at_unix_seconds = unix_time_seconds();
+            write_script_quarantine_manifest(&session, &manifest)?;
+            match std::fs::symlink_metadata(&quarantine) {
+                Ok(metadata) => {
+                    ensure!(
+                        metadata.file_type().is_file(),
+                        "refusing to delete a non-regular quarantined startup entry"
+                    );
+                    std::fs::remove_file(&quarantine)?;
+                    sync_directory(
+                        quarantine
+                            .parent()
+                            .context("quarantined script has no parent")?,
+                    )?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("resume quarantined script deletion"),
+            }
+            manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Deleted;
+            manifest.entries[entry_index].error = None;
+            manifest.entries[entry_index].recovery_routes.clear();
+        }
+        "retry-script-containment" => {
+            if manifest.entries[entry_index].state == AuditEmergencyScriptQuarantineState::Moved {
+                return Ok(true);
+            }
+            let metadata = std::fs::symlink_metadata(&source)
+                .context("inspect startup entry while resuming containment")?;
+            ensure!(
+                metadata.file_type().is_file(),
+                "refusing to quarantine a non-regular startup entry"
+            );
+            ensure!(
+                std::fs::symlink_metadata(&quarantine)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound),
+                "quarantine destination already exists"
+            );
+            ensure_private_dir(
+                quarantine
+                    .parent()
+                    .context("quarantine destination has no parent")?,
+            )?;
+            std::fs::rename(&source, &quarantine)?;
+            sync_directory(source.parent().context("startup source has no parent")?)?;
+            sync_directory(
+                quarantine
+                    .parent()
+                    .context("quarantine destination has no parent")?,
+            )?;
+            manifest.schema_version = SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION;
+            manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Moved;
+            manifest.entries[entry_index].error = None;
+            manifest.entries[entry_index].recovery_routes = vec![script_delete_route(&quarantine)];
+        }
+        _ => return Ok(false),
+    }
+    manifest.updated_at_unix_seconds = unix_time_seconds();
+    write_script_quarantine_manifest(&session, &manifest)?;
+    Ok(true)
 }
 
 fn read_audit_emergency_status(path: &Path) -> Result<Option<AuditEmergencyStatus>> {
@@ -807,6 +1250,12 @@ fn quarantine_all_persistent_scripts(
             .iter()
             .map(
                 |(index, source, name)| AuditEmergencyScriptQuarantineEntry {
+                    entry_id: script_quarantine_entry_id(
+                        &session,
+                        source,
+                        &session.join(index.to_string()).join(name),
+                    ),
+                    cause: module_audit_log::AuditIncidentCause::Unknown,
                     source_path: source.to_string_lossy().into_owned(),
                     quarantine_path: session
                         .join(index.to_string())
@@ -814,7 +1263,9 @@ fn quarantine_all_persistent_scripts(
                         .to_string_lossy()
                         .into_owned(),
                     state: AuditEmergencyScriptQuarantineState::Planned,
+                    delete_requested: false,
                     error: None,
+                    recovery_routes: Vec::new(),
                 },
             )
             .collect(),
@@ -905,6 +1356,47 @@ fn write_script_quarantine_manifest(
     sync_directory(session)
 }
 
+fn validate_script_quarantine_entry(
+    session: &Path,
+    entry: &AuditEmergencyScriptQuarantineEntry,
+) -> Result<()> {
+    let source = Path::new(&entry.source_path);
+    let quarantine = Path::new(&entry.quarantine_path);
+    #[cfg(not(test))]
+    let source_parent = source.parent().context("startup source has no parent")?;
+    let source_name = source
+        .file_name()
+        .context("startup source has no file name")?;
+    let relative = quarantine
+        .strip_prefix(session)
+        .context("quarantine path escapes its session")?;
+    let components = relative.components().collect::<Vec<_>>();
+    let encoded_index = components
+        .first()
+        .and_then(|component| component.as_os_str().to_str())
+        .and_then(|value| value.parse::<usize>().ok())
+        .context("quarantine path has no valid source directory index")?;
+    #[cfg(not(test))]
+    let source_index = PERSISTENT_SCRIPT_DIRS
+        .iter()
+        .position(|candidate| source_parent == Path::new(candidate))
+        .context("startup source is outside an approved persistent directory")?;
+    #[cfg(test)]
+    let source_index = encoded_index;
+    ensure!(
+        components.len() == 2
+            && encoded_index == source_index
+            && components[1].as_os_str() == source_name,
+        "quarantine path does not match its approved startup source"
+    );
+    let expected_id = script_quarantine_entry_id(session, source, quarantine);
+    ensure!(
+        entry.entry_id.is_empty() || entry.entry_id == expected_id,
+        "quarantine entry id mismatch"
+    );
+    Ok(())
+}
+
 fn read_script_quarantine_manifests(root: &Path) -> Result<ScriptQuarantineManifestCollection> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -968,7 +1460,10 @@ fn read_script_quarantine_manifests(root: &Path) -> Result<ScriptQuarantineManif
             let mut manifest: AuditEmergencyScriptQuarantineManifest =
                 serde_json::from_slice(&bytes).context("parse script quarantine manifest")?;
             ensure!(
-                manifest.schema_version == SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION,
+                matches!(
+                    manifest.schema_version,
+                    1 | SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION
+                ),
                 "unsupported script quarantine manifest schema {}",
                 manifest.schema_version
             );
@@ -976,6 +1471,9 @@ fn read_script_quarantine_manifests(root: &Path) -> Result<ScriptQuarantineManif
                 Path::new(&manifest.session_path) == session,
                 "script quarantine manifest session path mismatch"
             );
+            for entry in &manifest.entries {
+                validate_script_quarantine_entry(&session, entry)?;
+            }
             reconcile_script_quarantine_manifest(&mut manifest);
             Ok(manifest)
         })();
@@ -996,25 +1494,57 @@ fn read_script_quarantine_manifests(root: &Path) -> Result<ScriptQuarantineManif
 }
 
 fn reconcile_script_quarantine_manifest(manifest: &mut AuditEmergencyScriptQuarantineManifest) {
+    let session_path = manifest.session_path.clone();
     for entry in &mut manifest.entries {
+        if entry.entry_id.is_empty() {
+            entry.entry_id = script_quarantine_entry_id(
+                Path::new(&session_path),
+                Path::new(&entry.source_path),
+                Path::new(&entry.quarantine_path),
+            );
+        }
         let source_exists = std::fs::symlink_metadata(&entry.source_path).is_ok();
         let quarantine_exists = std::fs::symlink_metadata(&entry.quarantine_path).is_ok();
+        if entry.delete_requested && !source_exists && !quarantine_exists {
+            entry.state = AuditEmergencyScriptQuarantineState::Deleted;
+            entry.error = None;
+            entry.recovery_routes.clear();
+            continue;
+        }
         match (source_exists, quarantine_exists) {
             (false, true) => {
                 entry.state = AuditEmergencyScriptQuarantineState::Moved;
+                entry.cause = module_audit_log::AuditIncidentCause::UntrustedPersistentScript;
                 entry.error = None;
             }
             (true, false) => {}
             (true, true) => {
                 entry.state = AuditEmergencyScriptQuarantineState::Failed;
+                entry.cause = module_audit_log::AuditIncidentCause::ContainmentIncomplete;
                 entry.error =
                     Some("startup entry exists at both source and quarantine paths".into());
             }
             (false, false) => {
                 entry.state = AuditEmergencyScriptQuarantineState::Failed;
+                entry.cause = module_audit_log::AuditIncidentCause::ContainmentIncomplete;
                 entry.error = Some("startup entry is missing from both planned paths".into());
             }
         }
+        if source_exists && !quarantine_exists && entry.error.is_some() {
+            entry.cause = module_audit_log::AuditIncidentCause::PersistentScriptMoveFailed;
+        }
+        entry.recovery_routes = match entry.state {
+            AuditEmergencyScriptQuarantineState::Moved => {
+                vec![script_delete_route(Path::new(&entry.quarantine_path))]
+            }
+            AuditEmergencyScriptQuarantineState::Planned
+            | AuditEmergencyScriptQuarantineState::Failed
+                if source_exists && !quarantine_exists =>
+            {
+                vec![script_retry_route(Path::new(&entry.source_path))]
+            }
+            _ => Vec::new(),
+        };
     }
 }
 
@@ -1606,10 +2136,14 @@ mod tests {
             schema_version: SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION,
             session_path: session.to_string_lossy().into_owned(),
             entries: vec![AuditEmergencyScriptQuarantineEntry {
+                entry_id: script_quarantine_entry_id(&session, &source, &destination),
+                cause: module_audit_log::AuditIncidentCause::Unknown,
                 source_path: source.to_string_lossy().into_owned(),
                 quarantine_path: destination.to_string_lossy().into_owned(),
                 state: AuditEmergencyScriptQuarantineState::Planned,
+                delete_requested: false,
                 error: None,
+                recovery_routes: Vec::new(),
             }],
             created_at_unix_seconds: now,
             updated_at_unix_seconds: now,

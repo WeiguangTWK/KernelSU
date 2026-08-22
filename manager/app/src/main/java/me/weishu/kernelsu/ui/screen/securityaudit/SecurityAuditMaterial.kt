@@ -81,8 +81,13 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
         if (state.isRefreshing) {
             item { AuditVerificationProgressMaterial(state) }
         }
-        state.emergencyStatus?.takeIf { it.active }?.let { emergency ->
-            item { AuditEmergencyMaterial(emergency) }
+        state.emergencyStatus?.takeIf { emergency ->
+            emergency.active || emergency.containmentFailures.isNotEmpty() ||
+                emergency.scriptQuarantines.any { quarantine ->
+                quarantine.entries.any { it.state != "deleted" }
+            }
+        }?.let { emergency ->
+            item { AuditEmergencyMaterial(emergency, state, actions) }
         }
         item { AuditOverviewMaterial(state, actions.onOpenCategory) }
         if (state.interruptedInstalls > 0) {
@@ -113,7 +118,11 @@ fun SecurityAuditScreenMaterial(state: SecurityAuditUiState, actions: SecurityAu
 }
 
 @Composable
-private fun AuditEmergencyMaterial(status: AuditEmergencyStatus) {
+private fun AuditEmergencyMaterial(
+    status: AuditEmergencyStatus,
+    state: SecurityAuditUiState,
+    actions: SecurityAuditActions,
+) {
     TonalCard(
         Modifier.fillMaxWidth(),
         containerColor = MaterialTheme.colorScheme.errorContainer,
@@ -182,6 +191,14 @@ private fun AuditEmergencyMaterial(status: AuditEmergencyStatus) {
                         color = MaterialTheme.colorScheme.onErrorContainer,
                         fontFamily = FontFamily.Monospace,
                     )
+                    Text(
+                        stringResource(
+                            R.string.security_audit_incident_summary,
+                            entry.cause,
+                            entry.state,
+                        ),
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                    )
                     entry.error?.let { error ->
                         Text(
                             stringResource(
@@ -190,6 +207,46 @@ private fun AuditEmergencyMaterial(status: AuditEmergencyStatus) {
                             ),
                             color = MaterialTheme.colorScheme.onErrorContainer,
                         )
+                    }
+                    val deleteRoute = entry.recoveryRoutes.firstOrNull {
+                        it.action == "delete_quarantined_script"
+                    }
+                    if (deleteRoute != null) {
+                        Button(
+                            onClick = { actions.onDeleteQuarantinedScript(entry.entryId) },
+                            enabled = deleteRoute.available &&
+                                state.deletingScriptEntryId == null &&
+                                !state.auditMutationBlocked,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                if (state.deletingScriptEntryId == entry.entryId) {
+                                    stringResource(R.string.security_audit_script_delete_working)
+                                } else {
+                                    stringResource(R.string.security_audit_script_delete_action)
+                                }
+                            )
+                        }
+                    }
+                    val retryRoute = entry.recoveryRoutes.firstOrNull {
+                        it.action == "retry_script_containment"
+                    }
+                    if (retryRoute != null) {
+                        Button(
+                            onClick = { actions.onRetryScriptContainment(entry.entryId) },
+                            enabled = retryRoute.available &&
+                                state.retryingScriptEntryId == null &&
+                                !state.auditMutationBlocked,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                if (state.retryingScriptEntryId == entry.entryId) {
+                                    stringResource(R.string.security_audit_script_retry_working)
+                                } else {
+                                    stringResource(R.string.security_audit_script_retry_action)
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -383,6 +440,9 @@ fun SecurityAuditModuleMaterial(
             history == null && !state.isLoading -> item { AuditEmptyResultMaterial() }
             history != null -> {
                 item { AuditIntegrityMaterial(history) }
+                if (history.status.incidents.isNotEmpty()) {
+                    item { AuditIncidentsMaterial(history, state, actions) }
+                }
                 if (history.status.unresolvedRisk) {
                     item {
                         AuditErrorMaterial(stringResource(R.string.security_audit_isolation_reason))
@@ -421,6 +481,71 @@ fun SecurityAuditModuleMaterial(
                             group = group,
                             initiallyExpanded = focusCategory == null || group.category == focusedFindingCategory,
                         )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuditIncidentsMaterial(
+    history: AuditHistory,
+    state: SecurityAuditUiState,
+    actions: SecurityAuditActions,
+) {
+    TonalCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                stringResource(R.string.security_audit_incidents),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            history.status.incidents.forEach { incident ->
+                Text(
+                    stringResource(
+                        R.string.security_audit_incident_summary,
+                        incident.cause,
+                        incident.state,
+                    ),
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(incident.detail, style = MaterialTheme.typography.bodySmall)
+                if (incident.quarantinePath.isNotBlank()) {
+                    Text(
+                        incident.quarantinePath,
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+                incident.recoveryRoutes.forEach { route ->
+                    Text(
+                        stringResource(
+                            R.string.security_audit_recovery_route,
+                            route.action,
+                            route.conditions.joinToString { "${it.kind}:${it.state}" },
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    if (route.action == "close_incident") {
+                        Button(
+                            onClick = {
+                                actions.onCloseIncident(
+                                    history.status.moduleId,
+                                    incident.incidentId,
+                                )
+                            },
+                            enabled = route.available && state.closingIncidentId == null &&
+                                !state.auditMutationBlocked,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(
+                                if (state.closingIncidentId == incident.incidentId) {
+                                    stringResource(R.string.security_audit_incident_close_working)
+                                } else {
+                                    stringResource(R.string.security_audit_incident_close_action)
+                                }
+                            )
+                        }
                     }
                 }
             }

@@ -3,6 +3,7 @@ use ksu_module_audit::AuditReport;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -56,8 +57,15 @@ pub enum AuditEventKind {
     },
     IntegrityIncident {
         corrupted_from_sequence: u64,
+        #[serde(default, skip_serializing_if = "AuditIncidentCause::is_unknown")]
+        cause: AuditIncidentCause,
         reason: String,
         quarantine: String,
+    },
+    IncidentClosed {
+        incident_id: String,
+        operation_id: String,
+        resolution: String,
     },
     SecureRemovalCompleted {
         operation_id: String,
@@ -216,6 +224,72 @@ pub struct ModuleAuditStatus {
     pub quarantined_persistent_script_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub persistent_script_failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incidents: Vec<AuditIncidentStatus>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditIncidentCause {
+    AuditEventMissing,
+    AuditEventInvalid,
+    UnexpectedAuditPath,
+    IdentityRecordInvalid,
+    RiskRecordInvalid,
+    HeadRecordInvalid,
+    UntrustedPersistentScript,
+    PersistentScriptMoveFailed,
+    ContainmentIncomplete,
+    #[default]
+    Unknown,
+}
+
+impl AuditIncidentCause {
+    pub(crate) fn is_unknown(&self) -> bool {
+        *self == Self::Unknown
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditIncidentState {
+    Detected,
+    Resolved,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditRecoveryRequirementState {
+    Required,
+    Satisfied,
+    Unsatisfied,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuditRecoveryCondition {
+    pub kind: String,
+    pub state: AuditRecoveryRequirementState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuditRecoveryRoute {
+    pub action: String,
+    pub available: bool,
+    pub destructive: bool,
+    pub conditions: Vec<AuditRecoveryCondition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuditIncidentStatus {
+    pub incident_id: String,
+    pub cause: AuditIncidentCause,
+    pub state: AuditIncidentState,
+    pub detected_at_sequence: u64,
+    pub corrupted_from_sequence: u64,
+    pub detail: String,
+    pub quarantine_path: String,
+    pub recovery_routes: Vec<AuditRecoveryRoute>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -400,6 +474,7 @@ pub struct ManagerAuditSealStatus {
 pub struct SealedIntegrityFailure {
     pub module_id: String,
     pub corrupted_from_sequence: u64,
+    pub cause: AuditIncidentCause,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unexpected_paths: Vec<String>,
@@ -434,6 +509,8 @@ struct SealedRecoveryRecord {
     seal_hash: String,
     base_inventory_hash: String,
     corrupted_from_sequence: u64,
+    #[serde(default, skip_serializing_if = "AuditIncidentCause::is_unknown")]
+    cause: AuditIncidentCause,
     reason: String,
     #[serde(default)]
     unexpected_paths: Vec<String>,
@@ -712,10 +789,199 @@ pub fn finish_manager_audit_operation(root: &Path, operation_id: &str) -> Result
     write_record(&operation_path(root, operation_id), operation, &key)
 }
 
+pub fn complete_manager_audit_operation_target(
+    root: &Path,
+    operation_id: &str,
+    expected_action: &str,
+    target: &str,
+) -> Result<()> {
+    validate_sha256_hex(operation_id, "operation id")?;
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let mut operation =
+        read_operation(root, operation_id, &key)?.context("audit operation is unavailable")?;
+    ensure!(
+        operation.action == expected_action
+            && operation.state == AuditOperationState::Applying
+            && operation.targets == [target],
+        "audit operation target does not match"
+    );
+    operation.completed_targets = vec![target.to_owned()];
+    operation.updated_at_unix_seconds = now();
+    write_record(&operation_path(root, operation_id), operation, &key)
+}
+
 #[cfg(any(not(target_os = "android"), test))]
 pub fn verify_module(root: &Path, module_id: &str, repair: bool) -> Result<ModuleAuditStatus> {
     let _lock = AuditLock::acquire(root, false)?;
     verify_module_unlocked(root, module_id, repair)
+}
+
+fn incident_cause_from_legacy_reason(reason: &str) -> AuditIncidentCause {
+    if reason.contains("identity integrity") {
+        AuditIncidentCause::IdentityRecordInvalid
+    } else if reason.contains("risk registry integrity") {
+        AuditIncidentCause::RiskRecordInvalid
+    } else if reason.contains("head integrity") {
+        AuditIncidentCause::HeadRecordInvalid
+    } else if reason.contains("unexpected entr") {
+        AuditIncidentCause::UnexpectedAuditPath
+    } else if reason.contains("missing") {
+        AuditIncidentCause::AuditEventMissing
+    } else if reason.contains("event") || reason.contains("chain") {
+        AuditIncidentCause::AuditEventInvalid
+    } else {
+        AuditIncidentCause::Unknown
+    }
+}
+
+fn recovery_route(
+    action: &str,
+    destructive: bool,
+    conditions: &[(&str, AuditRecoveryRequirementState)],
+) -> AuditRecoveryRoute {
+    AuditRecoveryRoute {
+        action: action.to_owned(),
+        available: !conditions
+            .iter()
+            .any(|(_, state)| *state == AuditRecoveryRequirementState::Unsatisfied),
+        destructive,
+        conditions: conditions
+            .iter()
+            .map(|(kind, state)| AuditRecoveryCondition {
+                kind: (*kind).to_owned(),
+                state: *state,
+            })
+            .collect(),
+    }
+}
+
+fn incident_statuses(events: &[AuthenticatedEvent]) -> Vec<AuditIncidentStatus> {
+    let last_secure_removal = events
+        .iter()
+        .filter_map(|entry| match entry.event.kind {
+            AuditEventKind::SecureRemovalCompleted { .. } => Some(entry.event.sequence),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let closed = events
+        .iter()
+        .filter_map(|entry| match &entry.event.kind {
+            AuditEventKind::IncidentClosed { incident_id, .. } => Some(incident_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    events
+        .iter()
+        .filter_map(|entry| {
+            let AuditEventKind::IntegrityIncident {
+                corrupted_from_sequence,
+                cause,
+                reason,
+                quarantine,
+            } = &entry.event.kind
+            else {
+                return None;
+            };
+            let incident_id = entry.event_hash.clone();
+            let state = if closed.contains(&incident_id) {
+                AuditIncidentState::Closed
+            } else if entry.event.sequence < last_secure_removal {
+                AuditIncidentState::Resolved
+            } else {
+                AuditIncidentState::Detected
+            };
+            let recovery_routes = match state {
+                AuditIncidentState::Detected => vec![recovery_route(
+                    "secure_remove_module",
+                    true,
+                    &[
+                        ("kernel_safe_mode", AuditRecoveryRequirementState::Required),
+                        (
+                            "manager_authorization",
+                            AuditRecoveryRequirementState::Required,
+                        ),
+                        (
+                            "module_content_present",
+                            AuditRecoveryRequirementState::Required,
+                        ),
+                    ],
+                )],
+                AuditIncidentState::Resolved => vec![recovery_route(
+                    "close_incident",
+                    false,
+                    &[
+                        (
+                            "incident_resolved",
+                            AuditRecoveryRequirementState::Satisfied,
+                        ),
+                        (
+                            "manager_authorization",
+                            AuditRecoveryRequirementState::Required,
+                        ),
+                    ],
+                )],
+                AuditIncidentState::Closed => Vec::new(),
+            };
+            Some(AuditIncidentStatus {
+                incident_id,
+                cause: if cause.is_unknown() {
+                    incident_cause_from_legacy_reason(reason)
+                } else {
+                    *cause
+                },
+                state,
+                detected_at_sequence: entry.event.sequence,
+                corrupted_from_sequence: *corrupted_from_sequence,
+                detail: reason.clone(),
+                quarantine_path: quarantine.clone(),
+                recovery_routes,
+            })
+        })
+        .collect()
+}
+
+fn sealed_failure_incident(
+    seal_hash: &str,
+    failure: &SealedIntegrityFailure,
+) -> AuditIncidentStatus {
+    let incident_id = hex(&Sha256::digest(
+        serde_json::to_vec(&(
+            "sealed-integrity",
+            seal_hash,
+            &failure.module_id,
+            failure.corrupted_from_sequence,
+            failure.cause,
+            &failure.reason,
+            &failure.unexpected_paths,
+        ))
+        .unwrap_or_default(),
+    ));
+    AuditIncidentStatus {
+        incident_id,
+        cause: failure.cause,
+        state: AuditIncidentState::Detected,
+        detected_at_sequence: failure.corrupted_from_sequence,
+        corrupted_from_sequence: failure.corrupted_from_sequence,
+        detail: failure.reason.clone(),
+        quarantine_path: failure.unexpected_paths.join(", "),
+        recovery_routes: vec![recovery_route(
+            "recover_sealed_history",
+            false,
+            &[
+                ("kernel_safe_mode", AuditRecoveryRequirementState::Required),
+                (
+                    "manager_seal_verified",
+                    AuditRecoveryRequirementState::Satisfied,
+                ),
+                (
+                    "manager_authorization",
+                    AuditRecoveryRequirementState::Required,
+                ),
+            ],
+        )],
+    }
 }
 
 fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<ModuleAuditStatus> {
@@ -737,6 +1003,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
             &key,
             &mut chain.events,
             0,
+            AuditIncidentCause::IdentityRecordInvalid,
             format!("audit identity integrity failure: {error:#}"),
             &quarantine,
         )?;
@@ -759,6 +1026,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
                 &key,
                 &mut chain.events,
                 0,
+                AuditIncidentCause::RiskRecordInvalid,
                 format!("audit risk registry integrity failure: {error:#}"),
                 &quarantine,
             )?;
@@ -785,6 +1053,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
     // Static Critical findings are advisory after the user explicitly accepts an install.
     // Only authenticated runtime integrity incidents require containment and secure removal.
     let unresolved_risk = unresolved_integrity_risk;
+    let incidents = incident_statuses(&chain.events);
     let head_hash = chain
         .events
         .last()
@@ -817,6 +1086,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         persistent_script_ownership,
         quarantined_persistent_script_paths: persistent_result.quarantined_paths,
         persistent_script_failures: persistent_result.failures,
+        incidents,
     })
 }
 
@@ -1084,6 +1354,7 @@ fn compromised_sealed_history(
             persistent_script_ownership,
             quarantined_persistent_script_paths: persistent_result.quarantined_paths,
             persistent_script_failures: persistent_result.failures,
+            incidents: vec![sealed_failure_incident(&seal.seal_hash, &failure)],
         },
         events: Vec::new(),
         integrity_error: Some(format!(
@@ -1657,6 +1928,15 @@ fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
                 "recover-sealed" => {
                     operation_sealed_recovery_exists(root, target, &operation.operation_id, key)?
                 }
+                "close-incident" => {
+                    operation_incident_close_exists(root, target, &operation.operation_id, key)?
+                }
+                "delete-quarantined-script" | "retry-script-containment" => {
+                    crate::module_response::quarantined_script_action_completed(
+                        target,
+                        &operation.action,
+                    )?
+                }
                 _ => false,
             };
             if completed {
@@ -1741,6 +2021,27 @@ fn operation_sealed_recovery_exists(
         .is_some_and(|entry| {
             entry.event.sequence == recovery.corrupted_from_sequence
                 && matches!(entry.event.kind, AuditEventKind::IntegrityIncident { .. })
+        }))
+}
+
+fn operation_incident_close_exists(
+    root: &Path,
+    module_id: &str,
+    operation_id: &str,
+    key: &[u8; 32],
+) -> Result<bool> {
+    if !module_path(root, module_id).exists() {
+        return Ok(false);
+    }
+    Ok(verify_chain(root, module_id, key, true)?
+        .events
+        .iter()
+        .any(|entry| {
+            matches!(
+                &entry.event.kind,
+                AuditEventKind::IncidentClosed { operation_id: recorded, .. }
+                    if recorded == operation_id
+            )
         }))
 }
 
@@ -2088,6 +2389,7 @@ fn verify_sealed_recovery_record(
         &SealedIntegrityFailure {
             module_id: recovery.module_id.clone(),
             corrupted_from_sequence: recovery.corrupted_from_sequence,
+            cause: recovery.cause,
             reason: recovery.reason.clone(),
             unexpected_paths: recovery.unexpected_paths.clone(),
         },
@@ -2187,6 +2489,11 @@ fn verified_sealed_prefix(
                     Some(SealedIntegrityFailure {
                         module_id: module.module_id.clone(),
                         corrupted_from_sequence: sequence,
+                        cause: if path.is_file() {
+                            AuditIncidentCause::AuditEventInvalid
+                        } else {
+                            AuditIncidentCause::AuditEventMissing
+                        },
                         reason: format!("{error:#}"),
                         unexpected_paths,
                     }),
@@ -2211,6 +2518,7 @@ fn verified_sealed_prefix(
             corrupted_from_sequence: u64::try_from(module.event_hashes.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(1),
+            cause: AuditIncidentCause::UnexpectedAuditPath,
             reason,
             unexpected_paths,
         }
@@ -3161,6 +3469,7 @@ pub fn recover_manager_sealed_module(
         seal_hash: status.seal_hash,
         base_inventory_hash: status.inventory_hash,
         corrupted_from_sequence: failure.corrupted_from_sequence,
+        cause: failure.cause,
         reason: failure.reason.clone(),
         unexpected_paths: failure.unexpected_paths.clone(),
     };
@@ -3228,6 +3537,7 @@ pub fn recover_manager_sealed_module(
             &key,
             &mut chain.events,
             failure.corrupted_from_sequence,
+            failure.cause,
             failure.reason,
             &quarantine,
         )?;
@@ -3277,6 +3587,93 @@ pub fn begin_manager_audit_operation(
 pub fn manager_operation_arguments_hash(action: &str, targets: &[String]) -> Result<String> {
     let bytes = serde_json::to_vec(&(action, targets))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub fn incident_close_arguments_hash(
+    root: &Path,
+    module_id: &str,
+    incident_id: &str,
+) -> Result<String> {
+    validate_module_id(module_id)?;
+    validate_sha256_hex(incident_id, "incident id")?;
+    let history = read_module_history(root, module_id, true)?;
+    let incident = history
+        .status
+        .incidents
+        .iter()
+        .find(|incident| incident.incident_id == incident_id)
+        .context("audit incident does not exist")?;
+    ensure!(
+        matches!(
+            incident.state,
+            AuditIncidentState::Resolved | AuditIncidentState::Closed
+        ),
+        "audit incident is still active and cannot be closed"
+    );
+    let bytes = serde_json::to_vec(&("close-incident", module_id, incident_id))?;
+    Ok(hex(&Sha256::digest(bytes)))
+}
+
+pub fn close_incident_challenge(
+    root: &Path,
+    module_id: &str,
+    incident_id: &str,
+) -> Result<ManagerAuditAuthChallenge> {
+    let arguments_hash = incident_close_arguments_hash(root, module_id, incident_id)?;
+    manager_audit_auth_challenge(root, "close-incident", &arguments_hash)
+}
+
+pub fn close_incident(
+    root: &Path,
+    module_id: &str,
+    incident_id: &str,
+    encoded_authorization: &str,
+) -> Result<ModuleAuditStatus> {
+    let arguments_hash = incident_close_arguments_hash(root, module_id, incident_id)?;
+    let targets = vec![module_id.to_owned()];
+    let operation = begin_manager_audit_operation(
+        root,
+        encoded_authorization,
+        "close-incident",
+        &arguments_hash,
+        &targets,
+    )?;
+    if operation.applied {
+        return read_module_history(root, module_id, false).map(|history| history.status);
+    }
+
+    let lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let chain = verify_chain(root, module_id, &key, true)?;
+    let incident = incident_statuses(&chain.events)
+        .into_iter()
+        .find(|incident| incident.incident_id == incident_id)
+        .context("audit incident disappeared")?;
+    ensure!(
+        incident.state == AuditIncidentState::Resolved,
+        "audit incident is not resolved or was already closed"
+    );
+    append_event(
+        root,
+        module_id,
+        AuditEventKind::IncidentClosed {
+            incident_id: incident_id.to_owned(),
+            operation_id: operation.operation_id.clone(),
+            resolution: "secure_module_removal_verified".to_owned(),
+        },
+    )?;
+    let mut operation_record = read_operation(root, &operation.operation_id, &key)?
+        .context("incident close operation disappeared")?;
+    operation_record.completed_targets = targets;
+    operation_record.updated_at_unix_seconds = now();
+    write_record(
+        &operation_path(root, &operation.operation_id),
+        operation_record,
+        &key,
+    )?;
+    drop(lock);
+    finish_manager_audit_operation(root, &operation.operation_id)?;
+    read_module_history(root, module_id, false).map(|history| history.status)
 }
 
 fn begin_manager_audit_operation_at_inventory(
@@ -3841,6 +4238,7 @@ fn verify_chain(
                         key,
                         &mut valid,
                         0,
+                        AuditIncidentCause::HeadRecordInvalid,
                         format!("audit head integrity failure: {error:#}"),
                         &quarantine,
                     )?;
@@ -3871,6 +4269,11 @@ fn verify_chain(
         key,
         &mut valid,
         corrupted_from_sequence,
+        if corrupted_from_sequence > u64::try_from(paths.len()).unwrap_or(u64::MAX) {
+            AuditIncidentCause::UnexpectedAuditPath
+        } else {
+            AuditIncidentCause::AuditEventInvalid
+        },
         reason,
         &quarantine,
     )?;
@@ -3887,6 +4290,7 @@ fn append_incident(
     key: &[u8; 32],
     events: &mut Vec<AuthenticatedEvent>,
     corrupted_from_sequence: u64,
+    cause: AuditIncidentCause,
     reason: String,
     quarantine: &Path,
 ) -> Result<()> {
@@ -3904,6 +4308,7 @@ fn append_incident(
         previous_hash,
         kind: AuditEventKind::IntegrityIncident {
             corrupted_from_sequence,
+            cause,
             reason,
             quarantine: quarantine.to_string_lossy().into_owned(),
         },
@@ -5446,6 +5851,7 @@ mod tests {
                 seal_hash: status.seal_hash,
                 base_inventory_hash: status.inventory_hash,
                 corrupted_from_sequence: failure.corrupted_from_sequence,
+                cause: failure.cause,
                 reason: failure.reason.clone(),
                 unexpected_paths: failure.unexpected_paths.clone(),
             },

@@ -25,6 +25,30 @@ data class AuditStatus(
     val persistentScriptOwnership: String? = null,
     val quarantinedPersistentScriptPaths: List<String> = emptyList(),
     val persistentScriptFailures: List<String> = emptyList(),
+    val incidents: List<AuditIncident> = emptyList(),
+)
+
+data class AuditIncident(
+    val incidentId: String,
+    val cause: String,
+    val state: String,
+    val detectedAtSequence: Long,
+    val corruptedFromSequence: Long,
+    val detail: String,
+    val quarantinePath: String,
+    val recoveryRoutes: List<AuditRecoveryRoute>,
+)
+
+data class AuditRecoveryRoute(
+    val action: String,
+    val available: Boolean,
+    val destructive: Boolean,
+    val conditions: List<AuditRecoveryCondition>,
+)
+
+data class AuditRecoveryCondition(
+    val kind: String,
+    val state: String,
 )
 
 enum class SecureRemovalPhase {
@@ -87,6 +111,9 @@ data class SecurityAuditUiState(
     val isPruning: Boolean = false,
     val isRecovering: Boolean = false,
     val secureRemovalModuleId: String? = null,
+    val closingIncidentId: String? = null,
+    val deletingScriptEntryId: String? = null,
+    val retryingScriptEntryId: String? = null,
     val secureRemovalPhase: SecureRemovalPhase? = null,
     val histories: List<AuditHistory> = emptyList(),
     val staleModuleIds: List<String> = emptyList(),
@@ -104,7 +131,8 @@ data class SecurityAuditUiState(
     val auditMutationBlocked: Boolean
         get() =
             checkpointCompromised || !auditAuthorizationReady || isLoading || isRefreshing ||
-                isRecovering || secureRemovalInProgress
+                isRecovering || secureRemovalInProgress || closingIncidentId != null ||
+                deletingScriptEntryId != null || retryingScriptEntryId != null
 
     val secureRemovalInProgress: Boolean
         get() = secureRemovalPhase != null && secureRemovalPhase != SecureRemovalPhase.Completed
@@ -253,6 +281,30 @@ fun parseAuditHistories(raw: String): List<AuditHistory> = JSONArray(raw).mapObj
             persistentScriptFailures = status.optJSONArray("persistent_script_failures")
                 ?.mapStrings()
                 .orEmpty(),
+            incidents = status.optJSONArray("incidents")?.mapObjects { incident ->
+                AuditIncident(
+                    incidentId = incident.getString("incident_id"),
+                    cause = incident.getString("cause"),
+                    state = incident.getString("state"),
+                    detectedAtSequence = incident.getLong("detected_at_sequence"),
+                    corruptedFromSequence = incident.getLong("corrupted_from_sequence"),
+                    detail = incident.getString("detail"),
+                    quarantinePath = incident.getString("quarantine_path"),
+                    recoveryRoutes = incident.optJSONArray("recovery_routes")?.mapObjects { route ->
+                        AuditRecoveryRoute(
+                            action = route.getString("action"),
+                            available = route.getBoolean("available"),
+                            destructive = route.getBoolean("destructive"),
+                            conditions = route.optJSONArray("conditions")?.mapObjects { condition ->
+                                AuditRecoveryCondition(
+                                    kind = condition.getString("kind"),
+                                    state = condition.getString("state"),
+                                )
+                            }.orEmpty(),
+                        )
+                    }.orEmpty(),
+                )
+            }.orEmpty(),
         ),
         events = history.optJSONArray("events")?.mapObjects(::parseAuditEvent).orEmpty(),
         integrityError = history.optString("integrity_error").takeIf(String::isNotBlank),

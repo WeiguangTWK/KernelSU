@@ -23,10 +23,25 @@ data class AuditEmergencyScriptQuarantine(
 )
 
 data class AuditEmergencyScriptQuarantineEntry(
+    val entryId: String,
+    val cause: String,
     val sourcePath: String,
     val quarantinePath: String,
     val state: String,
     val error: String?,
+    val recoveryRoutes: List<AuditEmergencyRecoveryRoute>,
+)
+
+data class AuditEmergencyRecoveryRoute(
+    val action: String,
+    val available: Boolean,
+    val destructive: Boolean,
+    val conditions: List<AuditEmergencyRecoveryCondition>,
+)
+
+data class AuditEmergencyRecoveryCondition(
+    val kind: String,
+    val state: String,
 )
 
 data class ModuleAuditResponseStatus(
@@ -55,10 +70,25 @@ fun parseModuleAuditResponseStatus(raw: String): ModuleAuditResponseStatus {
                     sessionPath = it.getString("session_path"),
                     entries = it.getJSONArray("entries").objects().map { entry ->
                         AuditEmergencyScriptQuarantineEntry(
+                            entryId = entry.getString("entry_id"),
+                            cause = entry.optString("cause", "unknown"),
                             sourcePath = entry.getString("source_path"),
                             quarantinePath = entry.getString("quarantine_path"),
                             state = entry.getString("state"),
                             error = entry.nullableString("error"),
+                            recoveryRoutes = entry.optJSONArray("recovery_routes")?.objects()?.map { route ->
+                                AuditEmergencyRecoveryRoute(
+                                    action = route.getString("action"),
+                                    available = route.getBoolean("available"),
+                                    destructive = route.getBoolean("destructive"),
+                                    conditions = route.optJSONArray("conditions")?.objects()?.map { condition ->
+                                        AuditEmergencyRecoveryCondition(
+                                            kind = condition.getString("kind"),
+                                            state = condition.getString("state"),
+                                        )
+                                    }.orEmpty(),
+                                )
+                            }.orEmpty(),
                         )
                     },
                 )

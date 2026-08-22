@@ -406,5 +406,17 @@
     <string name="security_audit_global_store_missing">模块审计根目录丢失</string>
     <string name="security_audit_global_state_unavailable">模块审计状态不可用，已执行故障闭锁隔离</string>
     <string name="security_audit_global_verification_failed">模块审计验证或故障闭锁隔离失败</string>
+    <string name="security_audit_incidents">完整性事故</string>
+    <string name="security_audit_incident_summary">原因：%1$s · 状态：%2$s</string>
+    <string name="security_audit_recovery_route">恢复路线：%1$s（%2$s）</string>
+    <string name="security_audit_incident_close_action">关闭已解决事故</string>
+    <string name="security_audit_incident_close_working">正在关闭事故…</string>
+    <string name="security_audit_script_delete_action">永久删除隔离脚本</string>
+    <string name="security_audit_script_delete_working">正在删除隔离脚本…</string>
+    <string name="security_audit_script_delete_title">删除隔离脚本？</string>
+    <string name="security_audit_script_delete_message">该操作会永久删除隔离文件，且不会将其恢复到启动目录：\n%1$s</string>
+    <string name="security_audit_script_delete_confirm">永久删除</string>
+    <string name="security_audit_script_retry_action">重试脚本隔离</string>
+    <string name="security_audit_script_retry_working">正在重试隔离…</string>
     <string name="security_audit_global_watch_overflow">审计事件队列溢出，可能遗漏了部分变更</string>
 </resources>

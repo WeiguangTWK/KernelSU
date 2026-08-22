@@ -447,6 +447,36 @@ enum Module {
         authorization: String,
     },
 
+    /// Close one resolved module audit incident without deleting its evidence
+    AuditCloseIncident {
+        /// affected module id
+        id: String,
+        /// stable incident id
+        #[arg(long)]
+        incident: String,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// Permanently delete one regular file from emergency script quarantine
+    AuditDeleteQuarantinedScript {
+        /// stable quarantine entry id
+        entry: String,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// Retry moving one regular startup file into emergency quarantine
+    AuditRetryScriptContainment {
+        /// stable quarantine entry id
+        entry: String,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
     /// Query response prerequisites without reading the audit store
     AuditResponseStatus,
 
@@ -516,6 +546,9 @@ enum AuditAuth {
         /// optional stale module id for a targeted prune
         #[arg(long)]
         id: Option<String>,
+        /// stable incident or quarantine entry id
+        #[arg(long)]
+        incident: Option<String>,
     },
 }
 
@@ -1051,7 +1084,11 @@ pub fn run() -> Result<()> {
                             println!("{}", serde_json::to_string_pretty(&status)?);
                             Ok(())
                         }
-                        AuditAuth::Challenge { action, id } => {
+                        AuditAuth::Challenge {
+                            action,
+                            id,
+                            incident,
+                        } => {
                             let _coordinator =
                                 crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
                             let arguments_hash = match action.as_str() {
@@ -1074,12 +1111,48 @@ pub fn run() -> Result<()> {
                                         root, id,
                                     )
                                     .and_then(|challenge| {
-                                        println!(
-                                            "{}",
-                                            serde_json::to_string_pretty(&challenge)?
-                                        );
+                                        println!("{}", serde_json::to_string_pretty(&challenge)?);
                                         Ok(())
                                     });
+                                }
+                                "close-incident" => {
+                                    let id = id
+                                        .as_deref()
+                                        .context("close-incident authorization requires --id")?;
+                                    let incident = incident.as_deref().context(
+                                        "close-incident authorization requires --incident",
+                                    )?;
+                                    return crate::module_audit_log::close_incident_challenge(
+                                        root, id, incident,
+                                    )
+                                    .and_then(|challenge| {
+                                        println!("{}", serde_json::to_string_pretty(&challenge)?);
+                                        Ok(())
+                                    });
+                                }
+                                "delete-quarantined-script" => {
+                                    anyhow::ensure!(
+                                        id.is_none(),
+                                        "delete-quarantined-script does not accept --id"
+                                    );
+                                    let incident = incident.as_deref().context(
+                                        "delete-quarantined-script authorization requires --incident",
+                                    )?;
+                                    crate::module_response::quarantined_script_delete_arguments_hash(
+                                        incident,
+                                    )?
+                                }
+                                "retry-script-containment" => {
+                                    anyhow::ensure!(
+                                        id.is_none(),
+                                        "retry-script-containment does not accept --id"
+                                    );
+                                    let incident = incident.as_deref().context(
+                                        "retry-script-containment authorization requires --incident",
+                                    )?;
+                                    crate::module_response::quarantined_script_retry_arguments_hash(
+                                        incident,
+                                    )?
                                 }
                                 _ => anyhow::bail!("unsupported audit authorization action"),
                             };
@@ -1174,6 +1247,48 @@ pub fn run() -> Result<()> {
                     } else {
                         println!("- Rebuilt Manager-sealed audit history for {id}");
                     }
+                    Ok(())
+                }
+                Module::AuditCloseIncident {
+                    id,
+                    incident,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    let status = crate::module_audit_log::close_incident(
+                        std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),
+                        &id,
+                        &incident,
+                        &authorization,
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                    Ok(())
+                }
+                Module::AuditDeleteQuarantinedScript {
+                    entry,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    crate::module_response::delete_quarantined_script(&entry, &authorization)?;
+                    println!(
+                        "{}",
+                        serde_json::json!({ "entry_id": entry, "deleted": true })
+                    );
+                    Ok(())
+                }
+                Module::AuditRetryScriptContainment {
+                    entry,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    crate::module_response::retry_quarantined_script_containment(
+                        &entry,
+                        &authorization,
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::json!({ "entry_id": entry, "contained": true })
+                    );
                     Ok(())
                 }
                 Module::AuditResponseStatus => {

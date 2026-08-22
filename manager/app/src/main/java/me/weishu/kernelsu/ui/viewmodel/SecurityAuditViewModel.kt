@@ -28,8 +28,10 @@ import me.weishu.kernelsu.ui.screen.securityaudit.SecureRemovalPhase
 import me.weishu.kernelsu.ui.screen.securityaudit.isHighRisk
 import me.weishu.kernelsu.ui.screen.securityaudit.parseAuditHistories
 import me.weishu.kernelsu.ui.util.commitModuleAuditSeal
+import me.weishu.kernelsu.ui.util.closeModuleAuditIncident
 import me.weishu.kernelsu.ui.util.beginAuditInstallSession
 import me.weishu.kernelsu.ui.util.containModuleForSecureRemoval
+import me.weishu.kernelsu.ui.util.deleteQuarantinedAuditScript
 import me.weishu.kernelsu.ui.util.getModuleAuditHistories
 import me.weishu.kernelsu.ui.util.getModuleAuditRecoveryStatus
 import me.weishu.kernelsu.ui.util.getModuleAuditResponseStatus
@@ -42,6 +44,7 @@ import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.recoverManagerSealedAudit
 import me.weishu.kernelsu.ui.util.releaseAuditInstallSession
+import me.weishu.kernelsu.ui.util.retryQuarantinedAuditScriptContainment
 import me.weishu.kernelsu.ui.util.rescanInstalledModules as runInstalledModuleRescan
 import me.weishu.kernelsu.ui.util.securelyRemoveModule as runSecureModuleRemoval
 import me.weishu.kernelsu.ui.util.streamModuleAuditDashboard
@@ -396,9 +399,13 @@ class SecurityAuditViewModel : ViewModel() {
         error(ksuApp.getString(R.string.security_audit_authorization_changed))
     }
 
-    private suspend fun createAuthorization(action: String, moduleId: String? = null): String =
+    private suspend fun createAuthorization(
+        action: String,
+        moduleId: String? = null,
+        incidentId: String? = null,
+    ): String =
         checkpointStore.signAuditAuthorization(
-            getModuleAuditAuthorizationChallenge(action, moduleId)
+            getModuleAuditAuthorizationChallenge(action, moduleId, incidentId)
         )
 
     private suspend fun ensureAuditSeal(prefetchedStatus: JSONObject? = null): Boolean {
@@ -635,6 +642,111 @@ class SecurityAuditViewModel : ViewModel() {
                     )
                 }
             }
+        }
+    }
+
+    fun closeIncident(moduleId: String, incidentId: String) {
+        val incident = _uiState.value.histories
+            .firstOrNull { it.status.moduleId == moduleId }
+            ?.status
+            ?.incidents
+            ?.firstOrNull { it.incidentId == incidentId }
+        if (
+            incident?.state != "resolved" ||
+            incident.recoveryRoutes.none { it.action == "close_incident" && it.available } ||
+            _uiState.value.auditMutationBlocked ||
+            _uiState.value.closingIncidentId != null
+        ) return
+        _uiState.update { it.copy(closingIncidentId = incidentId, errorMessage = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withAuditMutationSession {
+                    closeModuleAuditIncident(
+                        moduleId,
+                        incidentId,
+                        createAuthorization("close-incident", moduleId, incidentId),
+                    )
+                }
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                _uiState.update {
+                    it.copy(errorMessage = error.message ?: error::class.java.simpleName)
+                }
+            }
+            _uiState.update { it.copy(closingIncidentId = null) }
+            refresh()
+        }
+    }
+
+    fun deleteQuarantinedScript(entryId: String) {
+        val entry = _uiState.value.emergencyStatus
+            ?.scriptQuarantines
+            ?.asSequence()
+            ?.flatMap { it.entries.asSequence() }
+            ?.firstOrNull { it.entryId == entryId }
+        if (
+            entry?.recoveryRoutes?.none {
+                it.action == "delete_quarantined_script" && it.available
+            } != false ||
+            _uiState.value.auditMutationBlocked ||
+            _uiState.value.deletingScriptEntryId != null
+        ) return
+        _uiState.update { it.copy(deletingScriptEntryId = entryId, errorMessage = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withAuditMutationSession {
+                    deleteQuarantinedAuditScript(
+                        entryId,
+                        createAuthorization(
+                            action = "delete-quarantined-script",
+                            incidentId = entryId,
+                        ),
+                    )
+                }
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                _uiState.update {
+                    it.copy(errorMessage = error.message ?: error::class.java.simpleName)
+                }
+            }
+            _uiState.update { it.copy(deletingScriptEntryId = null) }
+            refresh()
+        }
+    }
+
+    fun retryScriptContainment(entryId: String) {
+        val entry = _uiState.value.emergencyStatus
+            ?.scriptQuarantines
+            ?.asSequence()
+            ?.flatMap { it.entries.asSequence() }
+            ?.firstOrNull { it.entryId == entryId }
+        if (
+            entry?.recoveryRoutes?.none {
+                it.action == "retry_script_containment" && it.available
+            } != false ||
+            _uiState.value.auditMutationBlocked ||
+            _uiState.value.retryingScriptEntryId != null
+        ) return
+        _uiState.update { it.copy(retryingScriptEntryId = entryId, errorMessage = null) }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                withAuditMutationSession {
+                    retryQuarantinedAuditScriptContainment(
+                        entryId,
+                        createAuthorization(
+                            action = "retry-script-containment",
+                            incidentId = entryId,
+                        ),
+                    )
+                }
+            }.onFailure { error ->
+                if (error is CancellationException) throw error
+                _uiState.update {
+                    it.copy(errorMessage = error.message ?: error::class.java.simpleName)
+                }
+            }
+            _uiState.update { it.copy(retryingScriptEntryId = null) }
+            refresh()
         }
     }
 

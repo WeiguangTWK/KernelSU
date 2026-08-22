@@ -12,6 +12,7 @@ import androidx.lifecycle.compose.dropUnlessResumed
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.res.stringResource
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.AuditKeyProtection
 import me.weishu.kernelsu.ui.LocalUiMode
 import me.weishu.kernelsu.ui.UiMode
@@ -30,6 +31,9 @@ data class SecurityAuditActions(
     val onPrune: () -> Unit,
     val onRecover: () -> Unit,
     val onRequestSecureRemoval: (String) -> Unit,
+    val onCloseIncident: (String, String) -> Unit,
+    val onDeleteQuarantinedScript: (String) -> Unit,
+    val onRetryScriptContainment: (String) -> Unit,
     val onOpenCategory: (AuditCategory) -> Unit,
     val onOpenModule: (String) -> Unit,
 )
@@ -61,6 +65,15 @@ fun SecurityAuditScreen() {
         state.recoverableModuleIds.joinToString("\n") { "• $it" },
     )
     val recoveryConfirm = stringResource(R.string.security_audit_recovery_confirm)
+    var pendingScriptDeletion by remember { mutableStateOf<String?>(null) }
+    val scriptDeleteDialog = rememberConfirmDialog(
+        onConfirm = {
+            pendingScriptDeletion?.let(viewModel::deleteQuarantinedScript)
+            pendingScriptDeletion = null
+        }
+    )
+    val scriptDeleteTitle = stringResource(R.string.security_audit_script_delete_title)
+    val scriptDeleteConfirm = stringResource(R.string.security_audit_script_delete_confirm)
 
     val actions = SecurityAuditActions(
         onBack = dropUnlessResumed { navigator.pop() },
@@ -81,6 +94,26 @@ fun SecurityAuditScreen() {
             )
         },
         onRequestSecureRemoval = {},
+        onCloseIncident = viewModel::closeIncident,
+        onDeleteQuarantinedScript = { entryId ->
+            val entry = state.emergencyStatus
+                ?.scriptQuarantines
+                ?.asSequence()
+                ?.flatMap { it.entries.asSequence() }
+                ?.firstOrNull { it.entryId == entryId }
+            if (entry != null) {
+                pendingScriptDeletion = entryId
+                scriptDeleteDialog.showConfirm(
+                    title = scriptDeleteTitle,
+                    content = ksuApp.getString(
+                        R.string.security_audit_script_delete_message,
+                        entry.quarantinePath,
+                    ),
+                    confirm = scriptDeleteConfirm,
+                )
+            }
+        },
+        onRetryScriptContainment = viewModel::retryScriptContainment,
         onOpenCategory = { navigator.push(Route.SecurityAuditCategory(it.key)) },
         onOpenModule = { navigator.push(Route.SecurityAuditModule(it)) },
     )
@@ -104,6 +137,9 @@ fun SecurityAuditCategoryScreen(categoryKey: String) {
         onPrune = {},
         onRecover = viewModel::recoverCheckpointAfterChainRebuild,
         onRequestSecureRemoval = {},
+        onCloseIncident = viewModel::closeIncident,
+        onDeleteQuarantinedScript = viewModel::deleteQuarantinedScript,
+        onRetryScriptContainment = viewModel::retryScriptContainment,
         onOpenCategory = {},
         onOpenModule = { navigator.push(Route.SecurityAuditModule(it, category.key)) },
     )
@@ -185,6 +221,9 @@ fun SecurityAuditModuleScreen(
                 confirm = secureRemovalConfirm,
             )
         },
+        onCloseIncident = viewModel::closeIncident,
+        onDeleteQuarantinedScript = viewModel::deleteQuarantinedScript,
+        onRetryScriptContainment = viewModel::retryScriptContainment,
         onOpenCategory = {},
         onOpenModule = {},
     )

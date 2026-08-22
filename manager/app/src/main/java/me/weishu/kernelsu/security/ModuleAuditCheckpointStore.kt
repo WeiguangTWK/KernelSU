@@ -470,6 +470,9 @@ class ModuleAuditCheckpointStore(
                     "prune",
                     "secure-remove",
                     "recover-sealed",
+                    "close-incident",
+                    "delete-quarantined-script",
+                    "retry-script-containment",
                 ) ||
                 operation.targets != operation.targets.sorted().distinct() ||
                 operation.completedTargets != operation.completedTargets.sorted().distinct() ||

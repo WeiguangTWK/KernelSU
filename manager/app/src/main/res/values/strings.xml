@@ -412,5 +412,17 @@
     <string name="security_audit_global_store_missing">Module audit store is missing</string>
     <string name="security_audit_global_state_unavailable">Module audit state is unavailable. Fail-closed isolation was applied.</string>
     <string name="security_audit_global_verification_failed">Module audit verification or fail-closed isolation failed.</string>
+    <string name="security_audit_incidents">Integrity incidents</string>
+    <string name="security_audit_incident_summary">Cause: %1$s · State: %2$s</string>
+    <string name="security_audit_recovery_route">Recovery: %1$s (%2$s)</string>
+    <string name="security_audit_incident_close_action">Close resolved incident</string>
+    <string name="security_audit_incident_close_working">Closing incident…</string>
+    <string name="security_audit_script_delete_action">Permanently delete quarantined script</string>
+    <string name="security_audit_script_delete_working">Deleting quarantined script…</string>
+    <string name="security_audit_script_delete_title">Delete quarantined script?</string>
+    <string name="security_audit_script_delete_message">This permanently deletes the quarantined file and cannot restore it to its startup path:\n%1$s</string>
+    <string name="security_audit_script_delete_confirm">Delete permanently</string>
+    <string name="security_audit_script_retry_action">Retry script containment</string>
+    <string name="security_audit_script_retry_working">Retrying containment…</string>
     <string name="security_audit_global_watch_overflow">Audit event queue overflowed. Some changes may not have been observed.</string>
 </resources>

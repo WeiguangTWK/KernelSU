@@ -319,22 +319,37 @@ suspend fun registerModuleAuditAuthorizationKey(
     )
 }
 
-suspend fun getModuleAuditAuthorizationChallenge(action: String, moduleId: String? = null): String =
+suspend fun getModuleAuditAuthorizationChallenge(
+    action: String,
+    moduleId: String? = null,
+    incidentId: String? = null,
+): String =
     withContext(Dispatchers.IO) {
         check(
             action == "rescan" || action == "prune" || action == "secure-remove" ||
-                action == "recover-sealed"
+                action == "recover-sealed" || action == "close-incident" ||
+                action == "delete-quarantined-script" || action == "retry-script-containment"
         ) {
             "Unsupported audit authorization action"
         }
         check(moduleId == null || moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) {
             "Invalid module id"
         }
-        check((action == "secure-remove" || action == "recover-sealed") == (moduleId != null)) {
+        check(incidentId == null || incidentId.length == 64 && incidentId.all { it.isLowerHexDigit() }) {
+            "Invalid audit incident id"
+        }
+        val needsModule = action == "secure-remove" || action == "recover-sealed" ||
+            action == "close-incident"
+        val needsIncident = action == "close-incident" || action == "delete-quarantined-script" ||
+            action == "retry-script-containment"
+        check(needsModule == (moduleId != null)) {
             "Module-specific audit authorization must target exactly one module"
         }
+        check(needsIncident == (incidentId != null)) { "Audit incident target mismatch" }
         runModuleAuditCommand(
-            "audit-auth challenge $action" + (moduleId?.let { " --id $it" } ?: ""),
+            "audit-auth challenge $action" +
+                (moduleId?.let { " --id $it" } ?: "") +
+                (incidentId?.let { " --incident $it" } ?: ""),
             "Unable to obtain Manager audit authorization challenge",
         )
     }
@@ -460,6 +475,56 @@ suspend fun getModuleAuditResponseStatus(): String = withContext(Dispatchers.IO)
     runModuleAuditCommand(
         "audit-response-status",
         "Unable to read module audit response prerequisites",
+    )
+}
+
+suspend fun closeModuleAuditIncident(
+    moduleId: String,
+    incidentId: String,
+    authorization: String,
+): String = withContext(Dispatchers.IO) {
+    check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
+    check(incidentId.length == 64 && incidentId.all { it.isLowerHexDigit() }) {
+        "Invalid audit incident id"
+    }
+    check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization token"
+    }
+    runModuleAuditCommand(
+        "audit-close-incident $moduleId --incident $incidentId --authorization $authorization",
+        "Unable to close module audit incident",
+    )
+}
+
+suspend fun deleteQuarantinedAuditScript(
+    entryId: String,
+    authorization: String,
+): String = withContext(Dispatchers.IO) {
+    check(entryId.length == 64 && entryId.all { it.isLowerHexDigit() }) {
+        "Invalid quarantined script entry id"
+    }
+    check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization token"
+    }
+    runModuleAuditCommand(
+        "audit-delete-quarantined-script $entryId --authorization $authorization",
+        "Unable to delete quarantined startup script",
+    )
+}
+
+suspend fun retryQuarantinedAuditScriptContainment(
+    entryId: String,
+    authorization: String,
+): String = withContext(Dispatchers.IO) {
+    check(entryId.length == 64 && entryId.all { it.isLowerHexDigit() }) {
+        "Invalid quarantined script entry id"
+    }
+    check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization token"
+    }
+    runModuleAuditCommand(
+        "audit-retry-script-containment $entryId --authorization $authorization",
+        "Unable to retry startup script containment",
     )
 }
 

@@ -90,8 +90,13 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
         if (state.isRefreshing) {
             item { AuditVerificationProgressMiuix(state) }
         }
-        state.emergencyStatus?.takeIf { it.active }?.let { emergency ->
-            item { AuditEmergencyMiuix(emergency) }
+        state.emergencyStatus?.takeIf { emergency ->
+            emergency.active || emergency.containmentFailures.isNotEmpty() ||
+                emergency.scriptQuarantines.any { quarantine ->
+                quarantine.entries.any { it.state != "deleted" }
+            }
+        }?.let { emergency ->
+            item { AuditEmergencyMiuix(emergency, state, actions) }
         }
         item { AuditOverviewMiuix(state, actions.onOpenCategory) }
         if (state.interruptedInstalls > 0) {
@@ -122,7 +127,11 @@ fun SecurityAuditScreenMiuix(state: SecurityAuditUiState, actions: SecurityAudit
 }
 
 @Composable
-private fun AuditEmergencyMiuix(status: AuditEmergencyStatus) {
+private fun AuditEmergencyMiuix(
+    status: AuditEmergencyStatus,
+    state: SecurityAuditUiState,
+    actions: SecurityAuditActions,
+) {
     Card(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp),
         insideMargin = PaddingValues(16.dp),
@@ -189,6 +198,14 @@ private fun AuditEmergencyMiuix(status: AuditEmergencyStatus) {
                         color = colorScheme.onErrorContainer,
                         fontFamily = FontFamily.Monospace,
                     )
+                    Text(
+                        stringResource(
+                            R.string.security_audit_incident_summary,
+                            entry.cause,
+                            entry.state,
+                        ),
+                        color = colorScheme.onErrorContainer,
+                    )
                     entry.error?.let { error ->
                         Text(
                             stringResource(
@@ -196,6 +213,38 @@ private fun AuditEmergencyMiuix(status: AuditEmergencyStatus) {
                                 error,
                             ),
                             color = colorScheme.onErrorContainer,
+                        )
+                    }
+                    val deleteRoute = entry.recoveryRoutes.firstOrNull {
+                        it.action == "delete_quarantined_script"
+                    }
+                    if (deleteRoute != null) {
+                        TextButton(
+                            text = if (state.deletingScriptEntryId == entry.entryId) {
+                                stringResource(R.string.security_audit_script_delete_working)
+                            } else {
+                                stringResource(R.string.security_audit_script_delete_action)
+                            },
+                            onClick = { actions.onDeleteQuarantinedScript(entry.entryId) },
+                            enabled = deleteRoute.available &&
+                                state.deletingScriptEntryId == null &&
+                                !state.auditMutationBlocked,
+                        )
+                    }
+                    val retryRoute = entry.recoveryRoutes.firstOrNull {
+                        it.action == "retry_script_containment"
+                    }
+                    if (retryRoute != null) {
+                        TextButton(
+                            text = if (state.retryingScriptEntryId == entry.entryId) {
+                                stringResource(R.string.security_audit_script_retry_working)
+                            } else {
+                                stringResource(R.string.security_audit_script_retry_action)
+                            },
+                            onClick = { actions.onRetryScriptContainment(entry.entryId) },
+                            enabled = retryRoute.available &&
+                                state.retryingScriptEntryId == null &&
+                                !state.auditMutationBlocked,
                         )
                     }
                 }
@@ -392,6 +441,9 @@ fun SecurityAuditModuleMiuix(
             history == null && !state.isLoading -> item { AuditEmptyMiuix(stringResource(R.string.security_audit_empty_result)) }
             history != null -> {
                 item { AuditIntegrityMiuix(history) }
+                if (history.status.incidents.isNotEmpty()) {
+                    item { AuditIncidentsMiuix(history, state, actions) }
+                }
                 if (history.status.unresolvedRisk) {
                     item {
                         AuditMessageCardMiuix(
@@ -426,6 +478,67 @@ fun SecurityAuditModuleMiuix(
                         AuditCategoryDetailsMiuix(
                             group = group,
                             initiallyExpanded = focusCategory == null || group.category == focusedFindingCategory,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuditIncidentsMiuix(
+    history: AuditHistory,
+    state: SecurityAuditUiState,
+    actions: SecurityAuditActions,
+) {
+    Card(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(stringResource(R.string.security_audit_incidents), fontWeight = FontWeight.Bold)
+            history.status.incidents.forEach { incident ->
+                Text(
+                    stringResource(
+                        R.string.security_audit_incident_summary,
+                        incident.cause,
+                        incident.state,
+                    ),
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(incident.detail, fontSize = 12.sp)
+                if (incident.quarantinePath.isNotBlank()) {
+                    Text(
+                        incident.quarantinePath,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+                incident.recoveryRoutes.forEach { route ->
+                    Text(
+                        stringResource(
+                            R.string.security_audit_recovery_route,
+                            route.action,
+                            route.conditions.joinToString { "${it.kind}:${it.state}" },
+                        ),
+                        fontSize = 12.sp,
+                    )
+                    if (route.action == "close_incident") {
+                        TextButton(
+                            text = if (state.closingIncidentId == incident.incidentId) {
+                                stringResource(R.string.security_audit_incident_close_working)
+                            } else {
+                                stringResource(R.string.security_audit_incident_close_action)
+                            },
+                            onClick = {
+                                actions.onCloseIncident(
+                                    history.status.moduleId,
+                                    incident.incidentId,
+                                )
+                            },
+                            enabled = route.available && state.closingIncidentId == null &&
+                                !state.auditMutationBlocked,
                         )
                     }
                 }
