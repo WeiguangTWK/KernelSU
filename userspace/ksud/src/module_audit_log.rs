@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::module_audit_action::{AuditAction, AuditOperationRecovery};
+
 const SCHEMA_VERSION: u32 = 1;
 const EVENT_SCHEMA_VERSION: u32 = 2;
 const CHECKPOINT_SCHEMA_VERSION: u32 = 6;
@@ -346,7 +348,7 @@ pub enum AuditOperationState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CheckpointOperation {
     pub operation_id: String,
-    pub action: String,
+    pub action: AuditAction,
     pub base_inventory_hash: String,
     pub arguments_hash: String,
     pub authorization_hex: String,
@@ -382,7 +384,7 @@ pub struct ManagerAuditAuthStatus {
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub struct ManagerAuditAuthChallenge {
     pub schema_version: u32,
-    pub action: String,
+    pub action: AuditAction,
     pub inventory_hash: String,
     pub arguments_hash: String,
     pub key_id: String,
@@ -401,7 +403,7 @@ struct ManagerAuditAuthRegistry {
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 struct SignedAuditAuthorization {
     schema_version: u32,
-    action: String,
+    action: AuditAction,
     inventory_hash: String,
     arguments_hash: String,
     key_id: String,
@@ -413,7 +415,7 @@ struct SignedAuditAuthorization {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct AuditAuthorizationChallenge {
     schema_version: u32,
-    action: String,
+    action: AuditAction,
     inventory_hash: String,
     arguments_hash: String,
     key_id: String,
@@ -425,7 +427,7 @@ struct AuditAuthorizationChallenge {
 struct AuditOperationRecord {
     schema_version: u32,
     operation_id: String,
-    action: String,
+    action: AuditAction,
     base_inventory_hash: String,
     arguments_hash: String,
     authorization_hex: String,
@@ -441,7 +443,7 @@ impl AuditOperationRecord {
     fn checkpoint(&self) -> CheckpointOperation {
         CheckpointOperation {
             operation_id: self.operation_id.clone(),
-            action: self.action.clone(),
+            action: self.action,
             base_inventory_hash: self.base_inventory_hash.clone(),
             arguments_hash: self.arguments_hash.clone(),
             authorization_hex: self.authorization_hex.clone(),
@@ -716,7 +718,7 @@ pub fn record_installed_rescan(
     let mut operation = read_operation(root, operation_id, &key)?
         .context("rescan audit operation is unavailable")?;
     ensure!(
-        operation.action == "rescan" && operation.state == AuditOperationState::Applying,
+        operation.action == AuditAction::Rescan && operation.state == AuditOperationState::Applying,
         "rescan audit operation is not active"
     );
     ensure!(
@@ -792,7 +794,7 @@ pub fn finish_manager_audit_operation(root: &Path, operation_id: &str) -> Result
 pub fn complete_manager_audit_operation_target(
     root: &Path,
     operation_id: &str,
-    expected_action: &str,
+    expected_action: AuditAction,
     target: &str,
 ) -> Result<()> {
     validate_sha256_hex(operation_id, "operation id")?;
@@ -836,12 +838,12 @@ fn incident_cause_from_legacy_reason(reason: &str) -> AuditIncidentCause {
 }
 
 fn recovery_route(
-    action: &str,
+    action: AuditAction,
     destructive: bool,
     conditions: &[(&str, AuditRecoveryRequirementState)],
 ) -> AuditRecoveryRoute {
     AuditRecoveryRoute {
-        action: action.to_owned(),
+        action: action.route_name().to_owned(),
         available: !conditions
             .iter()
             .any(|(_, state)| *state == AuditRecoveryRequirementState::Unsatisfied),
@@ -894,7 +896,7 @@ fn incident_statuses(events: &[AuthenticatedEvent]) -> Vec<AuditIncidentStatus> 
             };
             let recovery_routes = match state {
                 AuditIncidentState::Detected => vec![recovery_route(
-                    "secure_remove_module",
+                    AuditAction::SecureRemove,
                     true,
                     &[
                         ("kernel_safe_mode", AuditRecoveryRequirementState::Required),
@@ -909,7 +911,7 @@ fn incident_statuses(events: &[AuthenticatedEvent]) -> Vec<AuditIncidentStatus> 
                     ],
                 )],
                 AuditIncidentState::Resolved => vec![recovery_route(
-                    "close_incident",
+                    AuditAction::CloseIncident,
                     false,
                     &[
                         (
@@ -967,7 +969,7 @@ fn sealed_failure_incident(
         detail: failure.reason.clone(),
         quarantine_path: failure.unexpected_paths.join(", "),
         recovery_routes: vec![recovery_route(
-            "recover_sealed_history",
+            AuditAction::RecoverSealed,
             false,
             &[
                 ("kernel_safe_mode", AuditRecoveryRequirementState::Required),
@@ -1440,7 +1442,7 @@ pub fn prune_stale_histories(
     let mut operation = read_operation(root, operation_id, &key)?
         .context("cleanup audit operation is unavailable")?;
     ensure!(
-        operation.action == "prune" && operation.state == AuditOperationState::Applying,
+        operation.action == AuditAction::Prune && operation.state == AuditOperationState::Applying,
         "cleanup audit operation is not active"
     );
 
@@ -1556,7 +1558,7 @@ pub fn quarantine_module_for_secure_removal(
     let operation = read_operation(root, operation_id, &key)?
         .context("secure removal audit operation is unavailable")?;
     ensure!(
-        operation.action == "secure-remove"
+        operation.action == AuditAction::SecureRemove
             && operation.state == AuditOperationState::Applying
             && operation.targets == [module_id],
         "secure removal audit operation is not active"
@@ -1627,7 +1629,7 @@ pub fn complete_secure_module_removal(
     let mut operation = read_operation(root, operation_id, &key)?
         .context("secure removal audit operation is unavailable")?;
     ensure!(
-        operation.action == "secure-remove"
+        operation.action == AuditAction::SecureRemove
             && operation.state == AuditOperationState::Applying
             && operation.targets == [module_id],
         "secure removal audit operation is not active"
@@ -1725,7 +1727,6 @@ fn validate_operation_record(operation: &AuditOperationRecord) -> Result<()> {
                 .all(|byte| byte.is_ascii_hexdigit()),
         "invalid audit operation authorization"
     );
-    validate_authorization_field(&operation.action, "action")?;
     ensure!(
         operation
             .completed_targets
@@ -1924,33 +1925,34 @@ fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
             if operation.completed_targets.contains(target) {
                 continue;
             }
-            let completed = match operation.action.as_str() {
-                "rescan" => {
+            let completed = match operation.action.descriptor().recovery {
+                AuditOperationRecovery::RescanEvent => {
                     operation_rescan_event_exists(root, target, &operation.operation_id, key)?
                 }
-                "prune" => {
+                AuditOperationRecovery::PruneArtifacts => {
                     operation_trash_path(root, &operation.operation_id, target).exists()
                         && operation_tombstone_path(root, target, &operation.operation_id).exists()
                 }
-                "secure-remove" => operation_secure_removal_event_exists(
-                    root,
-                    target,
-                    &operation.operation_id,
-                    key,
-                )?,
-                "recover-sealed" => {
-                    operation_sealed_recovery_exists(root, target, &operation.operation_id, key)?
-                }
-                "close-incident" => {
-                    operation_incident_close_exists(root, target, &operation.operation_id, key)?
-                }
-                "delete-quarantined-script" | "retry-script-containment" => {
-                    crate::module_response::quarantined_script_action_completed(
+                AuditOperationRecovery::SecureRemovalEvent => {
+                    operation_secure_removal_event_exists(
+                        root,
                         target,
-                        &operation.action,
+                        &operation.operation_id,
+                        key,
                     )?
                 }
-                _ => false,
+                AuditOperationRecovery::SealedRecoveryRecord => {
+                    operation_sealed_recovery_exists(root, target, &operation.operation_id, key)?
+                }
+                AuditOperationRecovery::IncidentCloseEvent => {
+                    operation_incident_close_exists(root, target, &operation.operation_id, key)?
+                }
+                AuditOperationRecovery::QuarantinedScriptState => {
+                    crate::module_response::quarantined_script_action_completed(
+                        target,
+                        operation.action,
+                    )?
+                }
             };
             if completed {
                 operation.completed_targets.push(target.clone());
@@ -2061,7 +2063,7 @@ fn operation_incident_close_exists(
 #[allow(dead_code)]
 pub fn active_manager_audit_operation_targets(
     root: &Path,
-    action: &str,
+    action: AuditAction,
 ) -> Result<Option<Vec<String>>> {
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
@@ -2259,7 +2261,9 @@ pub fn commit_manager_audit_seal(
 
 fn finalize_sealed_recovery_records(root: &Path, payload: &CheckpointPayload) -> Result<()> {
     for operation in &payload.operations {
-        if operation.action != "recover-sealed" || operation.state != AuditOperationState::Applied {
+        if operation.action != AuditAction::RecoverSealed
+            || operation.state != AuditOperationState::Applied
+        {
             continue;
         }
         for module_id in &operation.completed_targets {
@@ -2275,7 +2279,7 @@ fn finalize_sealed_recovery_records(root: &Path, payload: &CheckpointPayload) ->
 
 fn finalize_sealed_operation_trash(root: &Path, payload: &CheckpointPayload) -> Result<()> {
     for operation in &payload.operations {
-        if !matches!(operation.action.as_str(), "prune" | "secure-remove")
+        if !operation.action.descriptor().finalizes_operation_trash
             || operation.state == AuditOperationState::Applying
         {
             continue;
@@ -2391,7 +2395,7 @@ fn verify_sealed_recovery_record(
     let operation = read_operation(root, &recovery.operation_id, key)?
         .context("sealed recovery authorization operation is unavailable")?;
     ensure!(
-        operation.action == "recover-sealed"
+        operation.action == AuditAction::RecoverSealed
             && operation.base_inventory_hash == seal.payload.inventory_hash
             && operation.targets == [recovery.module_id.as_str()],
         "sealed recovery operation identity mismatch"
@@ -3055,7 +3059,7 @@ fn verify_checkpoint_operation_authorization(
     verifying_key
         .verify(
             audit_authorization_message(
-                &token.action,
+                token.action,
                 &token.inventory_hash,
                 &token.arguments_hash,
                 &token.key_id,
@@ -3120,7 +3124,7 @@ fn ensure_checkpoint_extends(
                     .find(|operation| operation.operation_id == recovery.operation_id)
                     .context("sealed recovery operation is missing from the checkpoint")?;
                 ensure!(
-                    operation.action == "recover-sealed"
+                    operation.action == AuditAction::RecoverSealed
                         && operation.targets == [old_module.module_id.as_str()]
                         && operation.completed_targets == operation.targets
                         && operation.state == AuditOperationState::Applied,
@@ -3222,19 +3226,6 @@ fn validate_checkpoint_operation(operation: &CheckpointOperation) -> Result<()> 
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit()),
         "invalid checkpoint audit operation authorization"
-    );
-    ensure!(
-        matches!(
-            operation.action.as_str(),
-            "rescan"
-                | "prune"
-                | "secure-remove"
-                | "recover-sealed"
-                | "close-incident"
-                | "delete-quarantined-script"
-                | "retry-script-containment"
-        ),
-        "unsupported checkpoint audit operation"
     );
     ensure!(
         operation.targets.windows(2).all(|pair| pair[0] < pair[1])
@@ -3392,10 +3383,9 @@ pub fn register_manager_audit_auth_key(
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn manager_audit_auth_challenge(
     root: &Path,
-    action: &str,
+    action: AuditAction,
     arguments_hash: &str,
 ) -> Result<ManagerAuditAuthChallenge> {
-    validate_authorization_field(action, "action")?;
     validate_sha256_hex(arguments_hash, "arguments hash")?;
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
@@ -3414,7 +3404,7 @@ pub fn manager_audit_auth_challenge(
 
 fn manager_audit_auth_challenge_unlocked(
     root: &Path,
-    action: &str,
+    action: AuditAction,
     arguments_hash: &str,
     inventory_hash: &str,
     registry: &ManagerAuditAuthRegistry,
@@ -3424,7 +3414,7 @@ fn manager_audit_auth_challenge_unlocked(
     let challenge_id = hex(&random_hmac_key()?);
     let challenge = AuditAuthorizationChallenge {
         schema_version: MANAGER_AUTH_SCHEMA_VERSION,
-        action: action.to_owned(),
+        action,
         inventory_hash: inventory_hash.to_owned(),
         arguments_hash: arguments_hash.to_owned(),
         key_id: registry.key_id.clone(),
@@ -3453,7 +3443,7 @@ fn sealed_recovery_arguments_hash(
     failure: &SealedIntegrityFailure,
 ) -> Result<String> {
     let bytes = serde_json::to_vec(&(
-        "recover-sealed",
+        AuditAction::RecoverSealed,
         seal_hash,
         inventory_hash,
         &failure.module_id,
@@ -3484,7 +3474,7 @@ pub fn manager_sealed_recovery_challenge(
         sealed_recovery_arguments_hash(&status.seal_hash, &status.inventory_hash, failure)?;
     manager_audit_auth_challenge_unlocked(
         root,
-        "recover-sealed",
+        AuditAction::RecoverSealed,
         &arguments_hash,
         &status.inventory_hash,
         &registry,
@@ -3512,7 +3502,7 @@ pub fn recover_manager_sealed_module(
     let operation = begin_manager_audit_operation_at_inventory(
         root,
         encoded_authorization,
-        "recover-sealed",
+        AuditAction::RecoverSealed,
         &arguments_hash,
         &targets,
         Some(&status.inventory_hash),
@@ -3624,7 +3614,7 @@ pub fn recover_manager_sealed_module(
 pub fn begin_manager_audit_operation(
     root: &Path,
     encoded_authorization: &str,
-    expected_action: &str,
+    expected_action: AuditAction,
     expected_arguments_hash: &str,
     expected_targets: &[String],
 ) -> Result<AuthorizedAuditOperation> {
@@ -3642,7 +3632,7 @@ pub fn begin_manager_audit_operation(
 /// mutation. Keeping this encoding in the authenticated store avoids response
 /// and module-management code implementing subtly different contracts.
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-pub fn manager_operation_arguments_hash(action: &str, targets: &[String]) -> Result<String> {
+pub fn manager_operation_arguments_hash(action: AuditAction, targets: &[String]) -> Result<String> {
     let bytes = serde_json::to_vec(&(action, targets))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -3668,7 +3658,7 @@ pub fn incident_close_arguments_hash(
         ),
         "audit incident is still active and cannot be closed"
     );
-    let bytes = serde_json::to_vec(&("close-incident", module_id, incident_id))?;
+    let bytes = serde_json::to_vec(&(AuditAction::CloseIncident, module_id, incident_id))?;
     Ok(hex(&Sha256::digest(bytes)))
 }
 
@@ -3678,7 +3668,7 @@ pub fn close_incident_challenge(
     incident_id: &str,
 ) -> Result<ManagerAuditAuthChallenge> {
     let arguments_hash = incident_close_arguments_hash(root, module_id, incident_id)?;
-    manager_audit_auth_challenge(root, "close-incident", &arguments_hash)
+    manager_audit_auth_challenge(root, AuditAction::CloseIncident, &arguments_hash)
 }
 
 pub fn close_incident(
@@ -3692,7 +3682,7 @@ pub fn close_incident(
     let operation = begin_manager_audit_operation(
         root,
         encoded_authorization,
-        "close-incident",
+        AuditAction::CloseIncident,
         &arguments_hash,
         &targets,
     )?;
@@ -3737,7 +3727,7 @@ pub fn close_incident(
 fn begin_manager_audit_operation_at_inventory(
     root: &Path,
     encoded_authorization: &str,
-    expected_action: &str,
+    expected_action: AuditAction,
     expected_arguments_hash: &str,
     expected_targets: &[String],
     expected_inventory_hash: Option<&str>,
@@ -3827,7 +3817,7 @@ fn begin_manager_audit_operation_at_inventory(
     let signature = Signature::from_der(&decode_hex(&token.signature_der_hex)?)
         .context("invalid Manager audit authorization signature")?;
     let message = audit_authorization_message(
-        &token.action,
+        token.action,
         &token.inventory_hash,
         &token.arguments_hash,
         &token.key_id,
@@ -3858,7 +3848,7 @@ fn begin_manager_audit_operation_at_inventory(
     let operation = AuditOperationRecord {
         schema_version: SCHEMA_VERSION,
         operation_id,
-        action: expected_action.to_owned(),
+        action: expected_action,
         base_inventory_hash: token.inventory_hash,
         arguments_hash: expected_arguments_hash.to_owned(),
         authorization_hex: encoded_authorization.to_owned(),
@@ -3882,7 +3872,7 @@ fn begin_manager_audit_operation_at_inventory(
 fn ensure_operation_matches(
     operation: &AuditOperationRecord,
     operation_id: &str,
-    action: &str,
+    action: AuditAction,
     arguments_hash: &str,
     targets: &[String],
 ) -> Result<()> {
@@ -3908,7 +3898,7 @@ fn authorized_operation(operation: &AuditOperationRecord) -> AuthorizedAuditOper
 fn find_resumable_operation(
     root: &Path,
     key: &[u8; 32],
-    action: &str,
+    action: AuditAction,
     arguments_hash: &str,
     targets: &[String],
 ) -> Result<Option<AuditOperationRecord>> {
@@ -4024,7 +4014,7 @@ fn read_manager_auth_registry_during_rotation(
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 fn audit_authorization_message(
-    action: &str,
+    action: AuditAction,
     inventory_hash: &str,
     arguments_hash: &str,
     key_id: &str,
@@ -4034,19 +4024,6 @@ fn audit_authorization_message(
     format!(
         "kernelsu-audit-authorization-v2\n{action}\n{inventory_hash}\n{arguments_hash}\n{key_id}\n{challenge_id}\n{created_at_unix_seconds}\n"
     )
-}
-
-#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-fn validate_authorization_field(value: &str, name: &str) -> Result<()> {
-    ensure!(
-        !value.is_empty()
-            && value.len() <= 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'-'),
-        "invalid audit authorization {name}"
-    );
-    Ok(())
 }
 
 fn validate_sha256_hex(value: &str, name: &str) -> Result<()> {
@@ -5121,7 +5098,7 @@ mod tests {
     fn authorization_token(
         root: &Path,
         signing_key: &SigningKey,
-        action: &str,
+        action: AuditAction,
         arguments_hash: &str,
     ) -> String {
         let challenge = manager_audit_auth_challenge(root, action, arguments_hash).unwrap();
@@ -5136,7 +5113,7 @@ mod tests {
         let signature: Signature = signing_key.sign(message.as_bytes());
         let token = SignedAuditAuthorization {
             schema_version: MANAGER_AUTH_SCHEMA_VERSION,
-            action: action.to_owned(),
+            action,
             inventory_hash: challenge.inventory_hash,
             arguments_hash: arguments_hash.to_owned(),
             key_id: challenge.key_id,
@@ -5150,7 +5127,7 @@ mod tests {
     fn sealed_recovery_token(root: &Path, signing_key: &SigningKey, module_id: &str) -> String {
         let challenge = manager_sealed_recovery_challenge(root, module_id).unwrap();
         let message = audit_authorization_message(
-            &challenge.action,
+            challenge.action,
             &challenge.inventory_hash,
             &challenge.arguments_hash,
             &challenge.key_id,
@@ -5173,7 +5150,7 @@ mod tests {
 
     fn begin_test_operation(
         root: &Path,
-        action: &str,
+        action: AuditAction,
         targets: &[&str],
     ) -> AuthorizedAuditOperation {
         let manager = signing_key(29);
@@ -5491,7 +5468,7 @@ mod tests {
         record(&audit_root, "module.beta", "ab");
         record(&audit_root, "module.alpha", "cd");
 
-        let operation = begin_test_operation(&audit_root, "prune", &["module.beta"]);
+        let operation = begin_test_operation(&audit_root, AuditAction::Prune, &["module.beta"]);
         prune_stale_histories(
             &audit_root,
             &installed_root,
@@ -5542,37 +5519,54 @@ mod tests {
         );
 
         let arguments_hash = "ab".repeat(32);
-        let token = authorization_token(temp.path(), &key, "rescan", &arguments_hash);
+        let token = authorization_token(temp.path(), &key, AuditAction::Rescan, &arguments_hash);
         let targets = vec!["test.module".to_owned()];
-        let operation =
-            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
-                .unwrap();
+        let operation = begin_manager_audit_operation(
+            temp.path(),
+            &token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
         assert!(
-            begin_manager_audit_operation(temp.path(), &token, "prune", &arguments_hash, &targets,)
-                .is_err()
+            begin_manager_audit_operation(
+                temp.path(),
+                &token,
+                AuditAction::Prune,
+                &arguments_hash,
+                &targets,
+            )
+            .is_err()
         );
         assert!(
             begin_manager_audit_operation(
                 temp.path(),
                 &token,
-                "rescan",
+                AuditAction::Rescan,
                 &"cd".repeat(32),
                 &targets,
             )
             .is_err()
         );
 
-        let replay =
-            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
-                .unwrap();
+        let replay = begin_manager_audit_operation(
+            temp.path(),
+            &token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
         assert_eq!(replay.operation_id, operation.operation_id);
 
-        let stale_token = authorization_token(temp.path(), &key, "rescan", &arguments_hash);
+        let stale_token =
+            authorization_token(temp.path(), &key, AuditAction::Rescan, &arguments_hash);
         record(temp.path(), "test.module", "cd");
         let error = begin_manager_audit_operation(
             temp.path(),
             &stale_token,
-            "rescan",
+            AuditAction::Rescan,
             &arguments_hash,
             &targets,
         )
@@ -5588,15 +5582,26 @@ mod tests {
         register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
         let targets = vec!["test.module".to_owned()];
         let arguments_hash = "ab".repeat(32);
-        let token = authorization_token(temp.path(), &manager, "rescan", &arguments_hash);
-        let operation =
-            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
-                .unwrap();
+        let token =
+            authorization_token(temp.path(), &manager, AuditAction::Rescan, &arguments_hash);
+        let operation = begin_manager_audit_operation(
+            temp.path(),
+            &token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
         std::fs::remove_file(operation_path(temp.path(), &operation.operation_id)).unwrap();
 
-        let error =
-            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
-                .unwrap_err();
+        let error = begin_manager_audit_operation(
+            temp.path(),
+            &token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("already consumed"));
     }
 
@@ -5608,28 +5613,36 @@ mod tests {
         register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
         let targets = vec!["test.module".to_owned()];
         let arguments_hash = "ab".repeat(32);
-        let stale = authorization_token(temp.path(), &manager, "rescan", &arguments_hash);
-        let current = authorization_token(temp.path(), &manager, "rescan", &arguments_hash);
+        let stale =
+            authorization_token(temp.path(), &manager, AuditAction::Rescan, &arguments_hash);
+        let current =
+            authorization_token(temp.path(), &manager, AuditAction::Rescan, &arguments_hash);
 
         assert!(
             begin_manager_audit_operation(
                 temp.path(),
                 &stale,
-                "rescan",
+                AuditAction::Rescan,
                 &arguments_hash,
                 &targets,
             )
             .is_err()
         );
-        begin_manager_audit_operation(temp.path(), &current, "rescan", &arguments_hash, &targets)
-            .unwrap();
+        begin_manager_audit_operation(
+            temp.path(),
+            &current,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
     }
 
     #[test]
     fn rescan_operation_recovers_event_written_before_progress() {
         let temp = TempDir::new().unwrap();
         record(temp.path(), "test.module", "ab");
-        let operation = begin_test_operation(temp.path(), "rescan", &["test.module"]);
+        let operation = begin_test_operation(temp.path(), AuditAction::Rescan, &["test.module"]);
         append_event(
             temp.path(),
             "test.module",
@@ -5859,7 +5872,7 @@ mod tests {
         assert_eq!(alpha.sequence, 2);
         assert!(alpha.high_risk);
         assert!(payload.operations.iter().any(|operation| {
-            operation.action == "recover-sealed"
+            operation.action == AuditAction::RecoverSealed
                 && operation.targets == ["module.alpha"]
                 && operation.state == AuditOperationState::Applied
         }));
@@ -5893,7 +5906,7 @@ mod tests {
         let operation = begin_manager_audit_operation_at_inventory(
             root,
             &token_hex,
-            "recover-sealed",
+            AuditAction::RecoverSealed,
             &token.arguments_hash,
             &targets,
             Some(&status.inventory_hash),
@@ -5958,10 +5971,16 @@ mod tests {
         register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
         let targets = vec!["test.module".to_owned()];
         let arguments_hash = "ab".repeat(32);
-        let token = authorization_token(temp.path(), &manager, "rescan", &arguments_hash);
-        let operation =
-            begin_manager_audit_operation(temp.path(), &token, "rescan", &arguments_hash, &targets)
-                .unwrap();
+        let token =
+            authorization_token(temp.path(), &manager, AuditAction::Rescan, &arguments_hash);
+        let operation = begin_manager_audit_operation(
+            temp.path(),
+            &token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
         record_installed_rescan(
             temp.path(),
             &operation.operation_id,
@@ -6048,23 +6067,28 @@ mod tests {
 
         let arguments_hash = "ef".repeat(32);
         let targets = vec!["test.module".to_owned()];
-        let stale_token = authorization_token(temp.path(), &first, "rescan", &arguments_hash);
+        let stale_token =
+            authorization_token(temp.path(), &first, AuditAction::Rescan, &arguments_hash);
         assert!(
             begin_manager_audit_operation(
                 temp.path(),
                 &stale_token,
-                "rescan",
+                AuditAction::Rescan,
                 &arguments_hash,
                 &targets,
             )
             .is_err()
         );
-        let replacement_token =
-            authorization_token(temp.path(), &replacement, "rescan", &arguments_hash);
+        let replacement_token = authorization_token(
+            temp.path(),
+            &replacement,
+            AuditAction::Rescan,
+            &arguments_hash,
+        );
         begin_manager_audit_operation(
             temp.path(),
             &replacement_token,
-            "rescan",
+            AuditAction::Rescan,
             &arguments_hash,
             &targets,
         )
@@ -6098,7 +6122,7 @@ mod tests {
     #[test]
     fn installed_rescans_are_appended_to_the_authenticated_history() {
         let temp = TempDir::new().unwrap();
-        let first = begin_test_operation(temp.path(), "rescan", &["test.module"]);
+        let first = begin_test_operation(temp.path(), AuditAction::Rescan, &["test.module"]);
         let status = record_installed_rescan(
             temp.path(),
             &first.operation_id,
@@ -6109,7 +6133,7 @@ mod tests {
         assert_eq!(status.event_count, 1);
         finish_manager_audit_operation(temp.path(), &first.operation_id).unwrap();
 
-        let second = begin_test_operation(temp.path(), "rescan", &["test.module"]);
+        let second = begin_test_operation(temp.path(), AuditAction::Rescan, &["test.module"]);
         let status = record_installed_rescan(
             temp.path(),
             &second.operation_id,
@@ -6189,7 +6213,7 @@ mod tests {
         assert_eq!(stale[0].module_id, "stale.module");
         assert_eq!(stale[0].event_count, 2);
 
-        let operation = begin_test_operation(&audit_root, "prune", &["stale.module"]);
+        let operation = begin_test_operation(&audit_root, AuditAction::Prune, &["stale.module"]);
         let pruned = prune_stale_histories(
             &audit_root,
             &installed_root,
@@ -6233,7 +6257,7 @@ mod tests {
         let pending_root = temp.path().join("modules_update");
         std::fs::create_dir(&installed_root).unwrap();
         record(&audit_root, "stale.module", "ab");
-        let operation = begin_test_operation(&audit_root, "prune", &["stale.module"]);
+        let operation = begin_test_operation(&audit_root, AuditAction::Prune, &["stale.module"]);
         prune_stale_histories(
             &audit_root,
             &installed_root,
@@ -6295,7 +6319,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let operation = begin_test_operation(&audit_root, "prune", &["active.module"]);
+        let operation = begin_test_operation(&audit_root, AuditAction::Prune, &["active.module"]);
         let error = prune_stale_histories(
             &audit_root,
             &installed_root,
@@ -6320,7 +6344,8 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let operation = begin_test_operation(&pending_audit_root, "prune", &["pending.module"]);
+        let operation =
+            begin_test_operation(&pending_audit_root, AuditAction::Prune, &["pending.module"]);
         let error = prune_stale_histories(
             &pending_audit_root,
             &installed_root,
@@ -6342,7 +6367,7 @@ mod tests {
         record(&audit_root, "risky.module", "ab");
         std::fs::write(event_path(&audit_root, "risky.module", 1), b"corrupt").unwrap();
 
-        let operation = begin_test_operation(&audit_root, "prune", &["risky.module"]);
+        let operation = begin_test_operation(&audit_root, AuditAction::Prune, &["risky.module"]);
         let pruned = prune_stale_histories(
             &audit_root,
             &installed_root,
@@ -6406,7 +6431,7 @@ mod tests {
         verify_module(&audit_root, "risky.module", true).unwrap();
         assert!(module_requires_secure_removal(&audit_root, "risky.module").unwrap());
 
-        let rescan = begin_test_operation(&audit_root, "rescan", &["risky.module"]);
+        let rescan = begin_test_operation(&audit_root, AuditAction::Rescan, &["risky.module"]);
         record_installed_rescan(
             &audit_root,
             &rescan.operation_id,
@@ -6420,7 +6445,8 @@ mod tests {
             "a later clean scan must not silently dismiss an integrity incident"
         );
 
-        let operation = begin_test_operation(&audit_root, "secure-remove", &["risky.module"]);
+        let operation =
+            begin_test_operation(&audit_root, AuditAction::SecureRemove, &["risky.module"]);
         let removed_paths = quarantine_module_for_secure_removal(
             &audit_root,
             &installed_root,
@@ -6565,10 +6591,10 @@ mod tests {
     fn manager_operation_hash_uses_the_authorization_contract() {
         let targets = vec!["first.module".to_owned(), "second.module".to_owned()];
         let expected = hex(&Sha256::digest(
-            serde_json::to_vec(&("secure-remove", &targets)).unwrap(),
+            serde_json::to_vec(&(AuditAction::SecureRemove, &targets)).unwrap(),
         ));
         assert_eq!(
-            manager_operation_arguments_hash("secure-remove", &targets).unwrap(),
+            manager_operation_arguments_hash(AuditAction::SecureRemove, &targets).unwrap(),
             expected
         );
     }

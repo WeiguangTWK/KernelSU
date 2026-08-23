@@ -1,4 +1,6 @@
-use crate::{defs, ksucalls, metamodule, module, module_audit_log};
+use crate::{
+    defs, ksucalls, metamodule, module, module_audit_action::AuditAction, module_audit_log,
+};
 use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -96,7 +98,7 @@ fn script_delete_route(quarantine: &Path) -> module_audit_log::AuditRecoveryRout
     let regular_file =
         std::fs::symlink_metadata(quarantine).is_ok_and(|metadata| metadata.file_type().is_file());
     module_audit_log::AuditRecoveryRoute {
-        action: "delete_quarantined_script".to_owned(),
+        action: AuditAction::DeleteQuarantinedScript.route_name().to_owned(),
         available: regular_file,
         destructive: true,
         conditions: vec![
@@ -124,7 +126,7 @@ fn script_retry_route(source: &Path) -> module_audit_log::AuditRecoveryRoute {
     let regular_file =
         std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_file());
     module_audit_log::AuditRecoveryRoute {
-        action: "retry_script_containment".to_owned(),
+        action: AuditAction::RetryScriptContainment.route_name().to_owned(),
         available: regular_file,
         destructive: false,
         conditions: vec![
@@ -244,7 +246,7 @@ pub fn quarantined_script_delete_arguments_hash(entry_id: &str) -> Result<String
         "quarantined script entry is not ready for deletion"
     );
     let bytes = serde_json::to_vec(&(
-        "delete-quarantined-script",
+        AuditAction::DeleteQuarantinedScript,
         entry_id,
         &manifest.session_path,
         &entry.source_path,
@@ -260,7 +262,7 @@ pub fn delete_quarantined_script(entry_id: &str, authorization: &str) -> Result<
     let operation = module_audit_log::begin_manager_audit_operation(
         audit_root,
         authorization,
-        "delete-quarantined-script",
+        AuditAction::DeleteQuarantinedScript,
         &arguments_hash,
         &targets,
     )?;
@@ -335,7 +337,7 @@ pub fn delete_quarantined_script(entry_id: &str, authorization: &str) -> Result<
     module_audit_log::complete_manager_audit_operation_target(
         audit_root,
         &operation.operation_id,
-        "delete-quarantined-script",
+        AuditAction::DeleteQuarantinedScript,
         entry_id,
     )?;
     module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
@@ -368,7 +370,7 @@ pub fn quarantined_script_retry_arguments_hash(entry_id: &str) -> Result<String>
         "quarantined script entry cannot be retried"
     );
     let bytes = serde_json::to_vec(&(
-        "retry-script-containment",
+        AuditAction::RetryScriptContainment,
         entry_id,
         &manifest.session_path,
         &entry.source_path,
@@ -384,7 +386,7 @@ pub fn retry_quarantined_script_containment(entry_id: &str, authorization: &str)
     let operation = module_audit_log::begin_manager_audit_operation(
         audit_root,
         authorization,
-        "retry-script-containment",
+        AuditAction::RetryScriptContainment,
         &arguments_hash,
         &targets,
     )?;
@@ -463,13 +465,16 @@ pub fn retry_quarantined_script_containment(entry_id: &str, authorization: &str)
     module_audit_log::complete_manager_audit_operation_target(
         audit_root,
         &operation.operation_id,
-        "retry-script-containment",
+        AuditAction::RetryScriptContainment,
         entry_id,
     )?;
     module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
 }
 
-pub(crate) fn quarantined_script_action_completed(entry_id: &str, action: &str) -> Result<bool> {
+pub(crate) fn quarantined_script_action_completed(
+    entry_id: &str,
+    action: AuditAction,
+) -> Result<bool> {
     let collection = read_script_quarantine_manifests(Path::new(defs::AUDIT_EMERGENCY_DIR))?;
     ensure!(
         collection.failures.is_empty(),
@@ -500,7 +505,7 @@ pub(crate) fn quarantined_script_action_completed(entry_id: &str, action: &str) 
     let source = PathBuf::from(&manifest.entries[entry_index].source_path);
     let quarantine = PathBuf::from(&manifest.entries[entry_index].quarantine_path);
     match action {
-        "delete-quarantined-script" => {
+        AuditAction::DeleteQuarantinedScript => {
             if manifest.entries[entry_index].state == AuditEmergencyScriptQuarantineState::Deleted {
                 return Ok(true);
             }
@@ -533,7 +538,7 @@ pub(crate) fn quarantined_script_action_completed(entry_id: &str, action: &str) 
             manifest.entries[entry_index].error = None;
             manifest.entries[entry_index].recovery_routes.clear();
         }
-        "retry-script-containment" => {
+        AuditAction::RetryScriptContainment => {
             if manifest.entries[entry_index].state == AuditEmergencyScriptQuarantineState::Moved {
                 return Ok(true);
             }
@@ -565,7 +570,7 @@ pub(crate) fn quarantined_script_action_completed(entry_id: &str, action: &str) 
             manifest.entries[entry_index].error = None;
             manifest.entries[entry_index].recovery_routes = vec![script_delete_route(&quarantine)];
         }
-        _ => return Ok(false),
+        _ => bail!("audit action does not operate on quarantined scripts"),
     }
     manifest.updated_at_unix_seconds = unix_time_seconds();
     write_script_quarantine_manifest(&session, &manifest)?;
@@ -1762,14 +1767,15 @@ fn collect_unattributed_persistent_scripts(
 pub fn secure_remove_arguments_hash(module_id: &str) -> Result<String> {
     module::validate_module_id(module_id)?;
     let targets = secure_remove_targets(module_id)?;
-    module_audit_log::manager_operation_arguments_hash("secure-remove", &targets)
+    module_audit_log::manager_operation_arguments_hash(AuditAction::SecureRemove, &targets)
 }
 
 fn secure_remove_targets(module_id: &str) -> Result<Vec<String>> {
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    if let Some(targets) =
-        module_audit_log::active_manager_audit_operation_targets(audit_root, "secure-remove")?
-    {
+    if let Some(targets) = module_audit_log::active_manager_audit_operation_targets(
+        audit_root,
+        AuditAction::SecureRemove,
+    )? {
         ensure!(
             targets == [module_id],
             "requested module does not match the active secure removal operation"
@@ -1792,12 +1798,12 @@ pub fn secure_remove(module_id: &str, authorization: &str) -> Result<()> {
     );
     let targets = secure_remove_targets(module_id)?;
     let arguments_hash =
-        module_audit_log::manager_operation_arguments_hash("secure-remove", &targets)?;
+        module_audit_log::manager_operation_arguments_hash(AuditAction::SecureRemove, &targets)?;
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
     let operation = module_audit_log::begin_manager_audit_operation(
         audit_root,
         authorization,
-        "secure-remove",
+        AuditAction::SecureRemove,
         &arguments_hash,
         &targets,
     )?;

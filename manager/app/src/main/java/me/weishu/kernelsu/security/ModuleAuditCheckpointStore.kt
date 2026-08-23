@@ -465,15 +465,8 @@ class ModuleAuditCheckpointStore(
         val previousOperationIds = previous.operations.mapTo(mutableSetOf()) { it.operationId }
         for (operation in current.operations) {
             if (
-                operation.action !in setOf(
-                    "rescan",
-                    "prune",
-                    "secure-remove",
-                    "recover-sealed",
-                    "close-incident",
-                    "delete-quarantined-script",
-                    "retry-script-containment",
-                ) ||
+                operation.action.isEmpty() || operation.action.length > 64 ||
+                operation.action.any { it !in 'a'..'z' && it != '-' } ||
                 operation.targets != operation.targets.sorted().distinct() ||
                 operation.completedTargets != operation.completedTargets.sorted().distinct() ||
                 !operation.targets.containsAll(operation.completedTargets) ||

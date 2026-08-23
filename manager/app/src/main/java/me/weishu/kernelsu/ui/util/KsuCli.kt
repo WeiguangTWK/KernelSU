@@ -333,26 +333,15 @@ suspend fun getModuleAuditAuthorizationChallenge(
 ): String =
     withContext(Dispatchers.IO) {
         check(
-            action == "rescan" || action == "prune" || action == "secure-remove" ||
-                action == "recover-sealed" || action == "close-incident" ||
-                action == "delete-quarantined-script" || action == "retry-script-containment"
-        ) {
-            "Unsupported audit authorization action"
-        }
+            action.isNotEmpty() && action.length <= 64 &&
+                action.all { it in 'a'..'z' || it == '-' }
+        ) { "Invalid audit authorization action" }
         check(moduleId == null || moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) {
             "Invalid module id"
         }
         check(incidentId == null || incidentId.length == 64 && incidentId.all { it.isLowerHexDigit() }) {
             "Invalid audit incident id"
         }
-        val needsModule = action == "secure-remove" || action == "recover-sealed" ||
-            action == "close-incident"
-        val needsIncident = action == "close-incident" || action == "delete-quarantined-script" ||
-            action == "retry-script-containment"
-        check(needsModule == (moduleId != null)) {
-            "Module-specific audit authorization must target exactly one module"
-        }
-        check(needsIncident == (incidentId != null)) { "Audit incident target mismatch" }
         runModuleAuditCommand(
             "audit-auth challenge $action" +
                 (moduleId?.let { " --id $it" } ?: "") +

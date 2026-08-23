@@ -10,8 +10,9 @@ use crate::boot_patch::{BootPatchArgs, BootRestoreArgs};
 use crate::lkm_image::BootPatchV2Args;
 use crate::module::regenerate_preinit_rc;
 use crate::{
-    apk_sign, assets, auditd, debug, defs, init_event, ksu_uapi, ksucalls, module, module_config,
-    sulog, utils,
+    apk_sign, assets, auditd, debug, defs, init_event, ksu_uapi, ksucalls, module,
+    module_audit_action::{self, AuditAction},
+    module_config, sulog, utils,
 };
 
 /// KernelSU userspace cli
@@ -544,8 +545,8 @@ enum AuditAuth {
     },
     /// Create a state-bound challenge for one audit mutation
     Challenge {
-        /// supported action: rescan or prune
-        action: String,
+        /// audit mutation action
+        action: AuditAction,
         /// optional stale module id for a targeted prune
         #[arg(long)]
         id: Option<String>,
@@ -1115,75 +1116,11 @@ pub fn run() -> Result<()> {
                         } => {
                             let _coordinator =
                                 crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
-                            let arguments_hash = match action.as_str() {
-                                "rescan" => {
-                                    anyhow::ensure!(id.is_none(), "rescan does not accept --id");
-                                    module::audit_rescan_arguments_hash()?
-                                }
-                                "prune" => module::audit_prune_arguments_hash(id.as_deref())?,
-                                "secure-remove" => {
-                                    let id = id
-                                        .as_deref()
-                                        .context("secure-remove authorization requires --id")?;
-                                    crate::module_response::secure_remove_arguments_hash(id)?
-                                }
-                                "recover-sealed" => {
-                                    let id = id
-                                        .as_deref()
-                                        .context("recover-sealed authorization requires --id")?;
-                                    return crate::module_audit_log::manager_sealed_recovery_challenge(
-                                        root, id,
-                                    )
-                                    .and_then(|challenge| {
-                                        println!("{}", serde_json::to_string_pretty(&challenge)?);
-                                        Ok(())
-                                    });
-                                }
-                                "close-incident" => {
-                                    let id = id
-                                        .as_deref()
-                                        .context("close-incident authorization requires --id")?;
-                                    let incident = incident.as_deref().context(
-                                        "close-incident authorization requires --incident",
-                                    )?;
-                                    return crate::module_audit_log::close_incident_challenge(
-                                        root, id, incident,
-                                    )
-                                    .and_then(|challenge| {
-                                        println!("{}", serde_json::to_string_pretty(&challenge)?);
-                                        Ok(())
-                                    });
-                                }
-                                "delete-quarantined-script" => {
-                                    anyhow::ensure!(
-                                        id.is_none(),
-                                        "delete-quarantined-script does not accept --id"
-                                    );
-                                    let incident = incident.as_deref().context(
-                                        "delete-quarantined-script authorization requires --incident",
-                                    )?;
-                                    crate::module_response::quarantined_script_delete_arguments_hash(
-                                        incident,
-                                    )?
-                                }
-                                "retry-script-containment" => {
-                                    anyhow::ensure!(
-                                        id.is_none(),
-                                        "retry-script-containment does not accept --id"
-                                    );
-                                    let incident = incident.as_deref().context(
-                                        "retry-script-containment authorization requires --incident",
-                                    )?;
-                                    crate::module_response::quarantined_script_retry_arguments_hash(
-                                        incident,
-                                    )?
-                                }
-                                _ => anyhow::bail!("unsupported audit authorization action"),
-                            };
-                            let challenge = crate::module_audit_log::manager_audit_auth_challenge(
+                            let challenge = module_audit_action::manager_authorization_challenge(
                                 root,
-                                &action,
-                                &arguments_hash,
+                                action,
+                                id.as_deref(),
+                                incident.as_deref(),
                             )?;
                             println!("{}", serde_json::to_string_pretty(&challenge)?);
                             Ok(())

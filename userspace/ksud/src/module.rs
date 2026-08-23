@@ -1,7 +1,9 @@
 #[allow(clippy::wildcard_imports)]
 use crate::utils::*;
 use crate::{
-    assets, defs, ksucalls, metamodule, module_audit, module_audit_log,
+    assets, defs, ksucalls, metamodule, module_audit,
+    module_audit_action::AuditAction,
+    module_audit_log,
     restorecon::{restore_syscon, setsyscon},
     sepolicy,
 };
@@ -1067,11 +1069,12 @@ struct InstalledAuditScanResult {
 
 pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
     let targets = audit_rescan_targets()?;
-    let arguments_hash = module_audit_log::manager_operation_arguments_hash("rescan", &targets)?;
+    let arguments_hash =
+        module_audit_log::manager_operation_arguments_hash(AuditAction::Rescan, &targets)?;
     let operation = module_audit_log::begin_manager_audit_operation(
         Path::new(defs::MODULE_AUDIT_DIR),
         authorization,
-        "rescan",
+        AuditAction::Rescan,
         &arguments_hash,
         &targets,
     )?;
@@ -1167,11 +1170,12 @@ pub fn prune_module_audit_histories(
         }
     } else {
         let targets = audit_prune_targets(module_id)?;
-        let arguments_hash = module_audit_log::manager_operation_arguments_hash("prune", &targets)?;
+        let arguments_hash =
+            module_audit_log::manager_operation_arguments_hash(AuditAction::Prune, &targets)?;
         let operation = module_audit_log::begin_manager_audit_operation(
             audit_root,
             authorization.context("Manager authorization is required for audit cleanup")?,
-            "prune",
+            AuditAction::Prune,
             &arguments_hash,
             &targets,
         )?;
@@ -1196,13 +1200,16 @@ pub fn prune_module_audit_histories(
 }
 
 pub fn audit_rescan_arguments_hash() -> Result<String> {
-    module_audit_log::manager_operation_arguments_hash("rescan", &audit_rescan_targets()?)
+    module_audit_log::manager_operation_arguments_hash(
+        AuditAction::Rescan,
+        &audit_rescan_targets()?,
+    )
 }
 
 fn audit_rescan_targets() -> Result<Vec<String>> {
     if let Some(targets) = module_audit_log::active_manager_audit_operation_targets(
         Path::new(defs::MODULE_AUDIT_DIR),
-        "rescan",
+        AuditAction::Rescan,
     )? {
         return Ok(targets);
     }
@@ -1210,13 +1217,16 @@ fn audit_rescan_targets() -> Result<Vec<String>> {
 }
 
 pub fn audit_prune_arguments_hash(module_id: Option<&str>) -> Result<String> {
-    module_audit_log::manager_operation_arguments_hash("prune", &audit_prune_targets(module_id)?)
+    module_audit_log::manager_operation_arguments_hash(
+        AuditAction::Prune,
+        &audit_prune_targets(module_id)?,
+    )
 }
 
 fn audit_prune_targets(module_id: Option<&str>) -> Result<Vec<String>> {
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
     if let Some(targets) =
-        module_audit_log::active_manager_audit_operation_targets(audit_root, "prune")?
+        module_audit_log::active_manager_audit_operation_targets(audit_root, AuditAction::Prune)?
     {
         if let Some(module_id) = module_id {
             ensure!(
