@@ -853,7 +853,9 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
     // so keeping it after the revision read makes the dashboard nondeterministic
     // while recovering an unsealed store.
     let seal_status = crate::module_audit_log::manager_audit_seal_status(root)?;
-    let checkpoint = crate::module_audit_log::checkpoint_payload(root)?;
+    let checkpoint_snapshot = crate::module_audit_log::dashboard_checkpoint_snapshot(root)?;
+    let checkpoint = checkpoint_snapshot.checkpoint;
+    let integrity_failures = checkpoint_snapshot.integrity_failures;
     let checkpoint_revision = crate::module_audit_log::dashboard_store_revision(root)?;
     let checkpoint_heads = checkpoint
         .modules
@@ -895,6 +897,8 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
     emit_audit_dashboard_line(&serde_json::json!({
         "type": "complete",
         "checkpoint": checkpoint,
+        "checkpoint_degraded": !integrity_failures.is_empty(),
+        "integrity_failures": integrity_failures,
         "stale_histories": stale,
         "seal_status": seal_status,
         "authorization_status": authorization_status,

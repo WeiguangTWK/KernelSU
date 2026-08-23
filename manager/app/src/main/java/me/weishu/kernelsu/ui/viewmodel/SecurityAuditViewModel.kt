@@ -238,6 +238,23 @@ class SecurityAuditViewModel : ViewModel() {
                     stream.rawHistories,
                     sealedEnvelopeHash,
                 )
+                if (
+                    completion.optBoolean("checkpoint_degraded", false) &&
+                    checkpoint.trust != AuditCheckpointTrust.Compromised
+                ) {
+                    val recoverableModules = completion
+                        .getJSONArray("integrity_failures")
+                        .moduleIds()
+                    check(recoverableModules.isNotEmpty()) {
+                        "Degraded audit checkpoint has no integrity failures"
+                    }
+                    checkpoint = checkpoint.copy(
+                        trust = AuditCheckpointTrust.Compromised,
+                        detail = "Manager-sealed audit histories require recovery: " +
+                            recoverableModules.joinToString(),
+                        recoverableModules = recoverableModules,
+                    )
+                }
                 val sealedRecoveryModuleIds = checkpoint.recoverableModules
                 val histories = sortedHistories(
                     parseAuditHistories(stream.rawHistories).map { history ->

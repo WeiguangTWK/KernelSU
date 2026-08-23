@@ -490,6 +490,12 @@ pub struct SealedIntegrityStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DashboardCheckpointSnapshot {
+    pub checkpoint: CheckpointPayload,
+    pub integrity_failures: Vec<SealedIntegrityFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub struct PersistentScriptContainmentPlan {
     pub module_id: String,
@@ -1654,6 +1660,7 @@ pub fn complete_secure_module_removal(
             },
         )?;
     }
+    clear_completed_containment_state(root, module_id, &key)?;
     operation.completed_targets = vec![module_id.to_owned()];
     operation.updated_at_unix_seconds = now();
     write_record(&operation_path(root, operation_id), operation, &key)?;
@@ -1934,12 +1941,7 @@ fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
                         && operation_tombstone_path(root, target, &operation.operation_id).exists()
                 }
                 AuditOperationRecovery::SecureRemovalEvent => {
-                    operation_secure_removal_event_exists(
-                        root,
-                        target,
-                        &operation.operation_id,
-                        key,
-                    )?
+                    recover_secure_removal_completion(root, target, &operation.operation_id, key)?
                 }
                 AuditOperationRecovery::SealedRecoveryRecord => {
                     operation_sealed_recovery_exists(root, target, &operation.operation_id, key)?
@@ -2016,6 +2018,19 @@ fn operation_secure_removal_event_exists(
                     if recorded == operation_id
             )
         }))
+}
+
+fn recover_secure_removal_completion(
+    root: &Path,
+    module_id: &str,
+    operation_id: &str,
+    key: &[u8; 32],
+) -> Result<bool> {
+    let completed = operation_secure_removal_event_exists(root, module_id, operation_id, key)?;
+    if completed {
+        clear_completed_containment_state(root, module_id, key)?;
+    }
+    Ok(completed)
 }
 
 fn operation_sealed_recovery_exists(
@@ -2464,6 +2479,39 @@ pub fn containment_inventory_snapshot(
     Ok((sealed, statuses))
 }
 
+/// Return a dashboard checkpoint without hiding Manager-sealed damage.
+///
+/// A damaged sealed history cannot produce a current checkpoint. In that case
+/// the verified Manager-sealed payload remains the only trusted inventory base
+/// and is returned solely to support fail-closed incident recovery.
+pub fn dashboard_checkpoint_snapshot(root: &Path) -> Result<DashboardCheckpointSnapshot> {
+    let _lock = AuditLock::acquire(root, false)?;
+    let key = load_key(root, false)?;
+    let registry = read_manager_auth_registry(root, &key)?;
+    let verified_seal = match &registry {
+        Some(registry) => load_verified_manager_seal(root, registry)?,
+        None => None,
+    };
+    if verified_seal.is_none() {
+        return Ok(DashboardCheckpointSnapshot {
+            checkpoint: checkpoint_payload_unlocked(root)?,
+            integrity_failures: Vec::new(),
+        });
+    }
+    let integrity = sealed_integrity_status_unlocked(root, &key)?;
+    let checkpoint = if integrity.failures.is_empty() {
+        checkpoint_payload_unlocked(root)?
+    } else {
+        verified_seal
+            .context("Manager audit seal disappeared during dashboard verification")?
+            .payload
+    };
+    Ok(DashboardCheckpointSnapshot {
+        checkpoint,
+        integrity_failures: integrity.failures,
+    })
+}
+
 fn sealed_integrity_status_unlocked(root: &Path, key: &[u8; 32]) -> Result<SealedIntegrityStatus> {
     let registry = read_manager_auth_registry(root, key)?
         .context("Manager audit authorization key is not configured")?;
@@ -2774,6 +2822,54 @@ fn read_containment_state(
     Ok(Some(authenticated.record.state))
 }
 
+/// Clear execution state only after secure removal has durably ended the old
+/// module instance. Audit events and persistent-script evidence remain intact.
+fn clear_completed_containment_state(root: &Path, module_id: &str, key: &[u8; 32]) -> Result<()> {
+    let Some(state) = read_containment_state(root, module_id, key)? else {
+        return Ok(());
+    };
+    if state != ContainmentState::Contained
+        || !secure_removal_ended_current_instance(root, module_id, key)?
+    {
+        return Ok(());
+    }
+    remove_containment_state(root, module_id)
+}
+
+fn secure_removal_ended_current_instance(
+    root: &Path,
+    module_id: &str,
+    key: &[u8; 32],
+) -> Result<bool> {
+    let chain = verify_chain(root, module_id, key, true)?;
+    let last_install = chain
+        .events
+        .iter()
+        .filter_map(|entry| match entry.event.kind {
+            AuditEventKind::InstallAccepted { .. } => Some(entry.event.sequence),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let last_secure_removal = chain
+        .events
+        .iter()
+        .filter_map(|entry| match entry.event.kind {
+            AuditEventKind::SecureRemovalCompleted { .. } => Some(entry.event.sequence),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    Ok(last_secure_removal > last_install)
+}
+
+fn remove_containment_state(root: &Path, module_id: &str) -> Result<()> {
+    let path = module_containment_record_path(root, module_id);
+    std::fs::remove_file(&path)
+        .with_context(|| format!("clear completed containment state for {module_id}"))?;
+    sync_dir(path.parent().context("containment state has no parent")?)
+}
+
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn set_containment_state(root: &Path, module_id: &str, state: ContainmentState) -> Result<()> {
     validate_module_id(module_id)?;
@@ -2789,6 +2885,12 @@ pub fn set_containment_state(root: &Path, module_id: &str, state: ContainmentSta
         }
         (_, requested) => requested,
     };
+    let completed_removal_can_release = existing.is_some()
+        && state == ContainmentState::Contained
+        && secure_removal_ended_current_instance(root, module_id, &key).unwrap_or(false);
+    if completed_removal_can_release {
+        return remove_containment_state(root, module_id);
+    }
     if existing == Some(state) {
         return Ok(());
     }
@@ -5808,6 +5910,51 @@ mod tests {
     }
 
     #[test]
+    fn sealed_damage_dashboard_snapshot_allows_containment_progress() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        record(root, "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(root, &public_key_hex(&manager), false).unwrap();
+        let expected_checkpoint = checkpoint_payload(root).unwrap();
+        let unsealed_snapshot = dashboard_checkpoint_snapshot(root).unwrap();
+        assert!(unsealed_snapshot.integrity_failures.is_empty());
+        assert_eq!(
+            unsealed_snapshot.checkpoint.inventory_hash,
+            expected_checkpoint.inventory_hash
+        );
+        commit_manager_audit_seal(root, &checkpoint_envelope(root, &manager, 1)).unwrap();
+
+        let damaged = event_path(root, "test.module", 2);
+        std::fs::write(&damaged, b"corrupt").unwrap();
+        std::fs::write(
+            damaged.with_extension("json.bak"),
+            b"sealed evidence backup",
+        )
+        .unwrap();
+        set_containment_state(root, "test.module", ContainmentState::PendingReboot).unwrap();
+        set_containment_state(root, "test.module", ContainmentState::Contained).unwrap();
+
+        let key = load_key(root, false).unwrap();
+        assert_eq!(
+            read_containment_state(root, "test.module", &key).unwrap(),
+            Some(ContainmentState::Contained)
+        );
+        let snapshot = dashboard_checkpoint_snapshot(root).unwrap();
+        assert_eq!(snapshot.integrity_failures.len(), 1);
+        assert_eq!(snapshot.integrity_failures[0].module_id, "test.module");
+        assert_eq!(
+            snapshot.integrity_failures[0].cause,
+            AuditIncidentCause::AuditEventInvalid
+        );
+        assert_eq!(
+            snapshot.checkpoint.inventory_hash,
+            expected_checkpoint.inventory_hash
+        );
+        assert_eq!(snapshot.checkpoint.modules, expected_checkpoint.modules);
+    }
+
+    #[test]
     fn manager_authorized_recovery_rebuilds_a_damaged_sealed_module_only() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -6444,6 +6591,7 @@ mod tests {
             module_requires_secure_removal(&audit_root, "risky.module").unwrap(),
             "a later clean scan must not silently dismiss an integrity incident"
         );
+        set_containment_state(&audit_root, "risky.module", ContainmentState::Contained).unwrap();
 
         let operation =
             begin_test_operation(&audit_root, AuditAction::SecureRemove, &["risky.module"]);
@@ -6480,6 +6628,8 @@ mod tests {
         )
         .unwrap();
         assert!(!status.unresolved_risk);
+        assert_eq!(status.containment_state, None);
+        assert!(!module_requires_containment(&audit_root, "risky.module").unwrap());
         finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
 
         let manager = signing_key(29);
@@ -6490,6 +6640,49 @@ mod tests {
                 .join(OPERATION_TRASH_DIR)
                 .join(operation.operation_id)
                 .exists()
+        );
+
+        std::fs::create_dir_all(&module_root).unwrap();
+        std::fs::write(module_root.join("module.prop"), b"id=risky.module\n").unwrap();
+        let receipt = begin_install(&audit_root, report("risky.module", "ef")).unwrap();
+        let status = finish_install(&audit_root, receipt, InstallOutcome::Installed, None).unwrap();
+        assert!(!status.unresolved_risk);
+        assert_eq!(status.containment_state, None);
+        assert!(!module_requires_containment(&audit_root, "risky.module").unwrap());
+    }
+
+    #[test]
+    fn operation_recovery_clears_completed_secure_removal_containment() {
+        let temp = TempDir::new().unwrap();
+        let audit_root = temp.path().join("audit");
+        record(&audit_root, "risky.module", "ab");
+        set_containment_state(&audit_root, "risky.module", ContainmentState::Contained).unwrap();
+        let operation =
+            begin_test_operation(&audit_root, AuditAction::SecureRemove, &["risky.module"]);
+
+        append_event(
+            &audit_root,
+            "risky.module",
+            AuditEventKind::SecureRemovalCompleted {
+                operation_id: operation.operation_id.clone(),
+                removed_paths: vec!["/data/adb/modules/risky.module".to_owned()],
+            },
+        )
+        .unwrap();
+
+        let checkpoint = checkpoint_payload(&audit_root).unwrap();
+        let recovered = checkpoint
+            .operations
+            .iter()
+            .find(|candidate| candidate.operation_id == operation.operation_id)
+            .unwrap();
+        assert_eq!(recovered.state, AuditOperationState::Applied);
+        assert_eq!(recovered.completed_targets, ["risky.module"]);
+        assert_eq!(
+            verify_module(&audit_root, "risky.module", false)
+                .unwrap()
+                .containment_state,
+            None
         );
     }
 
