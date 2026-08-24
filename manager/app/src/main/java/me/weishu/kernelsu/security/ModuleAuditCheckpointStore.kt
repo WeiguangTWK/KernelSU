@@ -31,6 +31,19 @@ enum class AuditCheckpointTrust(val wireName: String) {
     Compromised("keystore_compromised"),
 }
 
+enum class AuditInventoryRelation(val wireName: String) {
+    Unsealed("unsealed"),
+    SealedCurrent("sealed_current"),
+    AuthorizedTransition("authorized_transition"),
+    SealedDamage("sealed_damage");
+
+    companion object {
+        fun fromWireName(value: String): AuditInventoryRelation =
+            entries.firstOrNull { it.wireName == value }
+                ?: error("Unsupported audit inventory relation: $value")
+    }
+}
+
 enum class AuditKeyProtection(val wireName: String) {
     Hardware("hardware"),
     Degraded("degraded"),

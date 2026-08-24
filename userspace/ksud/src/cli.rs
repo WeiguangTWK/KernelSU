@@ -791,11 +791,6 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
             crate::auditd::install_session_active(id)?,
             "audit installation session is not active"
         );
-        if crate::module_audit_log::dashboard_store_uninitialized(root)? {
-            crate::module_audit_log::initialize_empty_store(root)?;
-        }
-    } else {
-        crate::module_response::enforce_containment(false)?;
     }
     if crate::module_audit_log::dashboard_store_uninitialized(root)? {
         emit_audit_dashboard_line(&serde_json::json!({
@@ -809,100 +804,45 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
         }));
     }
 
-    let module_ids = crate::module_audit_log::dashboard_module_ids(root)?;
+    let snapshot = crate::module_audit_log::verified_audit_snapshot(root)?;
+    let total_modules = snapshot.histories.len();
     emit_audit_dashboard_line(&serde_json::json!({
         "type": "start",
-        "total_modules": module_ids.len(),
+        "total_modules": total_modules,
     }))?;
 
-    let mut histories = Vec::with_capacity(module_ids.len());
-    for (index, module_id) in module_ids.iter().enumerate() {
-        match crate::module_audit_log::read_module_history_resilient(root, module_id, true) {
-            std::result::Result::Ok(history) => {
-                emit_audit_dashboard_line(&serde_json::json!({
-                    "type": "module",
-                    "module_id": module_id,
-                    "completed": index + 1,
-                    "total_modules": module_ids.len(),
-                    "history": history,
-                }))?;
-                histories.push(history);
-            }
-            std::result::Result::Err(error) => {
-                emit_audit_dashboard_line(&serde_json::json!({
-                    "type": "error",
-                    "phase": "verifying",
-                    "module_id": module_id,
-                    "completed": index,
-                    "total_modules": module_ids.len(),
-                    "error": format!("{error:#}"),
-                }))?;
-                return Err(error);
-            }
-        }
+    for (index, history) in snapshot.histories.iter().enumerate() {
+        emit_audit_dashboard_line(&serde_json::json!({
+            "type": "module",
+            "module_id": history.status.module_id.as_str(),
+            "completed": index + 1,
+            "total_modules": total_modules,
+            "history": history,
+        }))?;
     }
 
     emit_audit_dashboard_line(&serde_json::json!({
         "type": "progress",
         "phase": "checkpoint",
-        "completed": module_ids.len(),
-        "total_modules": module_ids.len(),
+        "completed": total_modules,
+        "total_modules": total_modules,
     }))?;
-    // Query and finalize the Manager seal before snapshotting the checkpoint
-    // revision. manager_audit_seal_status may remove sealed operation trash,
-    // so keeping it after the revision read makes the dashboard nondeterministic
-    // while recovering an unsealed store.
-    let seal_status = crate::module_audit_log::manager_audit_seal_status(root)?;
-    let checkpoint_snapshot = crate::module_audit_log::dashboard_checkpoint_snapshot(root)?;
-    let checkpoint = checkpoint_snapshot.checkpoint;
-    let integrity_failures = checkpoint_snapshot.integrity_failures;
-    let checkpoint_revision = crate::module_audit_log::dashboard_store_revision(root)?;
-    let checkpoint_heads = checkpoint
-        .modules
-        .iter()
-        .map(|module| {
-            (
-                module.module_id.as_str(),
-                (module.sequence, module.head_hash.as_str()),
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    anyhow::ensure!(
-        histories.len() == checkpoint_heads.len()
-            && histories.iter().all(|history| {
-                checkpoint_heads
-                    .get(history.status.module_id.as_str())
-                    .is_some_and(|(sequence, head_hash)| {
-                        *sequence == u64::try_from(history.status.event_count).unwrap_or(u64::MAX)
-                            && *head_hash == history.status.head_hash
-                    })
-            }),
-        "audit inventory changed while the dashboard was being verified"
-    );
 
     let stale = crate::module_audit_log::stale_histories_from_verified(
-        &histories,
+        &snapshot.histories,
         std::path::Path::new(defs::MODULE_DIR),
         std::path::Path::new(defs::MODULE_UPDATE_DIR),
     );
-    let authorization_status = crate::module_audit_log::manager_audit_auth_status_for_inventory(
-        root,
-        &checkpoint.inventory_hash,
-    )?;
-    let store_revision = crate::module_audit_log::dashboard_store_revision(root)?;
-    anyhow::ensure!(
-        checkpoint_revision == store_revision,
-        "audit store changed while the dashboard snapshot was being finalized"
-    );
     emit_audit_dashboard_line(&serde_json::json!({
         "type": "complete",
-        "checkpoint": checkpoint,
-        "checkpoint_degraded": !integrity_failures.is_empty(),
-        "integrity_failures": integrity_failures,
+        "checkpoint": snapshot.checkpoint,
+        "checkpoint_degraded": !snapshot.integrity_failures.is_empty(),
+        "integrity_failures": snapshot.integrity_failures,
+        "inventory_relation": snapshot.inventory_relation,
         "stale_histories": stale,
-        "seal_status": seal_status,
-        "authorization_status": authorization_status,
-        "store_revision": store_revision,
+        "seal_status": snapshot.seal_status,
+        "authorization_status": snapshot.authorization_status,
+        "store_revision": snapshot.store_revision,
     }))
 }
 
@@ -984,13 +924,18 @@ pub fn run() -> Result<()> {
                 Module::Audit { zip, json } => crate::module_audit::print_zip_report(&zip, json),
                 Module::AuditHistory { id, json } => {
                     let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
+                    let snapshot = crate::module_audit_log::verified_audit_snapshot(root)?;
                     let histories = if let Some(id) = id {
                         crate::module::validate_module_id(&id)?;
-                        vec![crate::module_audit_log::read_module_history_resilient(
-                            root, &id, true,
-                        )?]
+                        vec![
+                            snapshot
+                                .histories
+                                .into_iter()
+                                .find(|history| history.status.module_id == id)
+                                .context("module audit history is unavailable")?,
+                        ]
                     } else {
-                        crate::module_audit_log::list_histories_resilient(root, true)?
+                        snapshot.histories
                     };
                     if json {
                         println!("{}", serde_json::to_string_pretty(&histories)?);
@@ -1011,8 +956,11 @@ pub fn run() -> Result<()> {
                 }
                 Module::AuditStatus { json } => {
                     let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
-                    crate::module_response::enforce_containment(false)?;
-                    let statuses = crate::module_audit_log::list_modules_resilient(root, true)?;
+                    let statuses = crate::module_audit_log::verified_audit_snapshot(root)?
+                        .histories
+                        .into_iter()
+                        .map(|history| history.status)
+                        .collect::<Vec<_>>();
                     if json {
                         println!("{}", serde_json::to_string_pretty(&statuses)?);
                     } else {
@@ -1027,6 +975,9 @@ pub fn run() -> Result<()> {
                 }
                 Module::AuditReconcileResponse => {
                     let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    crate::module_audit_log::repair_audit_store(std::path::Path::new(
+                        crate::defs::MODULE_AUDIT_DIR,
+                    ))?;
                     let outcome = crate::module_response::enforce_containment(false)?;
                     anyhow::ensure!(
                         outcome.audit_state

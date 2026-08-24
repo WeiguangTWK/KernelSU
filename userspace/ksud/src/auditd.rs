@@ -635,6 +635,11 @@ fn run_install_session(session_dir: &Path, timeout: Duration) -> Result<()> {
         );
         thread::sleep(INSTALL_SESSION_POLL_INTERVAL);
     };
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    if crate::module_audit_log::dashboard_store_uninitialized(audit_root)? {
+        crate::module_audit_log::initialize_empty_store(audit_root)?;
+    }
+    crate::module_audit_log::repair_audit_store(audit_root)?;
     drop(coordinator);
 
     utils::ensure_file_exists(session_dir.join("ready"))?;

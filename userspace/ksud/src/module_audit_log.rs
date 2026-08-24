@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::module_audit_action::{AuditAction, AuditOperationRecovery};
 
@@ -26,9 +26,22 @@ const CHALLENGES_DIR: &str = "challenges";
 const OPERATION_TRASH_DIR: &str = "operation-trash";
 const SEALED_RECOVERY_DIR: &str = "sealed-recovery";
 const CONTAINMENT_DIR: &str = "containment";
+const VERIFIED_SNAPSHOT_ATTEMPTS: usize = 4;
+const VERIFIED_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const AUTH_CHALLENGE_TTL_SECONDS: u64 = 5 * 60;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct AuditSnapshotChanged;
+
+impl std::fmt::Display for AuditSnapshotChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("audit store changed during verified snapshot")
+    }
+}
+
+impl std::error::Error for AuditSnapshotChanged {}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -489,6 +502,26 @@ pub struct SealedIntegrityStatus {
     pub failures: Vec<SealedIntegrityFailure>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditInventoryRelation {
+    Unsealed,
+    SealedCurrent,
+    AuthorizedTransition,
+    SealedDamage,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerifiedAuditSnapshot {
+    pub store_revision: String,
+    pub inventory_relation: AuditInventoryRelation,
+    pub histories: Vec<ModuleAuditHistory>,
+    pub checkpoint: CheckpointPayload,
+    pub integrity_failures: Vec<SealedIntegrityFailure>,
+    pub seal_status: ManagerAuditSealStatus,
+    pub authorization_status: ManagerAuditAuthStatus,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DashboardCheckpointSnapshot {
     pub checkpoint: CheckpointPayload,
@@ -583,7 +616,11 @@ impl AuditLock {
         }
         let path = root.join(".lock");
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options
+            .read(true)
+            .write(true)
+            .create(create_root)
+            .truncate(false);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -994,14 +1031,15 @@ fn sealed_failure_incident(
 
 fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<ModuleAuditStatus> {
     validate_module_id(module_id)?;
-    let key = load_key(root, false)?;
+    let key = if repair {
+        load_key(root, false)?
+    } else {
+        read_key(root)?
+    };
     let identity_failure = verify_identity(root, module_id, &key).err();
-    if let Some(error) = &identity_failure {
-        ensure!(repair, "audit identity integrity failure: {error:#}");
-    }
     let sealed = verified_sealed_event_hashes(root, module_id, &key)?;
     let mut chain = verify_chain(root, module_id, &key, repair)?;
-    if let Some(error) = identity_failure {
+    if repair && let Some(error) = identity_failure {
         let identity_path = module_path(root, module_id).join("identity.json");
         let quarantine = quarantine_auxiliary(root, module_id, &identity_path, "identity")?;
         ensure_identity(root, module_id, &key)?;
@@ -1028,25 +1066,28 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         }
         Ok(None) => None,
         Err(error) => {
-            ensure!(repair, "audit risk registry integrity failure: {error:#}");
-            let risk_path = risk_path(root, module_id);
-            let quarantine = quarantine_auxiliary(root, module_id, &risk_path, "risk")?;
-            append_incident(
-                root,
-                module_id,
-                &key,
-                &mut chain.events,
-                0,
-                AuditIncidentCause::RiskRecordInvalid,
-                format!("audit risk registry integrity failure: {error:#}"),
-                &quarantine,
-            )?;
-            chain.state = VerificationState::Recovered;
-            high_risk = true;
-            None
+            if !repair {
+                None
+            } else {
+                let risk_path = risk_path(root, module_id);
+                let quarantine = quarantine_auxiliary(root, module_id, &risk_path, "risk")?;
+                append_incident(
+                    root,
+                    module_id,
+                    &key,
+                    &mut chain.events,
+                    0,
+                    AuditIncidentCause::RiskRecordInvalid,
+                    format!("audit risk registry integrity failure: {error:#}"),
+                    &quarantine,
+                )?;
+                chain.state = VerificationState::Recovered;
+                high_risk = true;
+                None
+            }
         }
     };
-    if high_risk && risk_record_high_risk != Some(true) {
+    if repair && high_risk && risk_record_high_risk != Some(true) {
         write_risk(root, module_id, &key, "audit history integrity failure")?;
     }
     let last_secure_removal = chain
@@ -1108,8 +1149,11 @@ pub fn module_requires_secure_removal(root: &Path, module_id: &str) -> Result<bo
     if !module_path(root, module_id).exists() {
         return Ok(false);
     }
-    let _lock = AuditLock::acquire(root, false)?;
-    Ok(verify_module_unlocked(root, module_id, true)?.unresolved_risk)
+    Ok(verified_audit_snapshot(root)?
+        .histories
+        .into_iter()
+        .find(|history| history.status.module_id == module_id)
+        .is_some_and(|history| history.status.unresolved_risk))
 }
 
 /// Returns whether a module must be excluded from every execution path.
@@ -1120,30 +1164,15 @@ pub fn module_requires_secure_removal(root: &Path, module_id: &str) -> Result<bo
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn module_requires_containment(root: &Path, module_id: &str) -> Result<bool> {
     validate_module_id(module_id)?;
-    if root.exists() {
-        let contained = {
-            let _lock = AuditLock::acquire(root, false)?;
-            let key = load_key(root, false)?;
-            read_containment_state(root, module_id, &key)?.is_some()
-        };
-        if contained {
-            return Ok(true);
-        }
-    }
-    if let Ok(status) = sealed_integrity_status(root)
-        && status
-            .failures
-            .iter()
-            .any(|failure| failure.module_id == module_id)
-    {
-        return Ok(true);
-    }
-    if !module_path(root, module_id).exists() {
-        return Ok(false);
-    }
-    Ok(read_module_history_resilient(root, module_id, false)?
-        .status
-        .unresolved_risk)
+    let snapshot = verified_audit_snapshot(root)?;
+    Ok(snapshot
+        .integrity_failures
+        .iter()
+        .any(|failure| failure.module_id == module_id)
+        || snapshot.histories.into_iter().any(|history| {
+            history.status.module_id == module_id
+                && (history.status.unresolved_risk || history.status.containment_state.is_some())
+        }))
 }
 
 #[cfg(any(not(target_os = "android"), test))]
@@ -1151,7 +1180,11 @@ pub fn list_modules(root: &Path, repair: bool) -> Result<Vec<ModuleAuditStatus>>
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let key = load_key(root, false)?;
+    let key = if repair {
+        load_key(root, false)?
+    } else {
+        read_key(root)?
+    };
     verify_tombstones(root, &key)?;
     let modules_dir = root.join("modules");
     if !modules_dir.exists() {
@@ -1262,10 +1295,23 @@ pub fn read_module_history(
     repair: bool,
 ) -> Result<ModuleAuditHistory> {
     let _lock = AuditLock::acquire(root, false)?;
-    verify_tombstones(root, &load_key(root, false)?)?;
+    let key = if repair {
+        load_key(root, false)?
+    } else {
+        read_key(root)?
+    };
+    verify_tombstones(root, &key)?;
+    read_module_history_unlocked(root, module_id, repair, &key)
+}
+
+fn read_module_history_unlocked(
+    root: &Path,
+    module_id: &str,
+    repair: bool,
+    key: &[u8; 32],
+) -> Result<ModuleAuditHistory> {
     let status = verify_module_unlocked(root, module_id, repair)?;
-    let key = load_key(root, false)?;
-    let events = verify_chain(root, module_id, &key, false)?
+    let events = verify_chain(root, module_id, key, false)?
         .events
         .into_iter()
         .map(|entry| entry.event)
@@ -1297,12 +1343,27 @@ pub fn read_module_history_resilient(
     }
 }
 
+fn read_module_history_resilient_unlocked(
+    root: &Path,
+    module_id: &str,
+    key: &[u8; 32],
+) -> Result<ModuleAuditHistory> {
+    match read_module_history_unlocked(root, module_id, false, key) {
+        Ok(history) => Ok(history),
+        Err(error) => compromised_sealed_history_unlocked(root, module_id, &error, key),
+    }
+}
+
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn list_histories_resilient(root: &Path, repair: bool) -> Result<Vec<ModuleAuditHistory>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let key = load_key(root, false)?;
+    let key = if repair {
+        load_key(root, false)?
+    } else {
+        read_key(root)?
+    };
     verify_tombstones(root, &key)?;
     let modules_dir = root.join("modules");
     if !modules_dir.exists() {
@@ -1328,7 +1389,7 @@ fn compromised_sealed_history(
     source: &anyhow::Error,
 ) -> Result<ModuleAuditHistory> {
     let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
+    let key = read_key(root)?;
     compromised_sealed_history_unlocked(root, module_id, source, &key)
 }
 
@@ -1394,21 +1455,11 @@ pub fn list_stale_histories(
     if !root.exists() || !root.join("modules").exists() {
         return Ok(Vec::new());
     }
-    let _lock = AuditLock::acquire(root, false)?;
-    verify_tombstones(root, &load_key(root, false)?)?;
-    let mut stale = Vec::new();
-    for module_id in audit_module_ids(&root.join("modules"))? {
-        if installed_module_exists(installed_modules_root, pending_modules_root, &module_id) {
-            continue;
-        }
-        let status = verify_module_unlocked(root, &module_id, true)?;
-        stale.push(StaleAuditHistory {
-            module_id,
-            event_count: status.event_count,
-            high_risk: status.high_risk,
-        });
-    }
-    Ok(stale)
+    Ok(stale_histories_from_verified(
+        &verified_audit_snapshot(root)?.histories,
+        installed_modules_root,
+        pending_modules_root,
+    ))
 }
 
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -1827,8 +1878,7 @@ fn verified_tombstones(root: &Path, key: &[u8; 32]) -> Result<Vec<PrunedHistoryT
 }
 
 pub fn checkpoint_payload(root: &Path) -> Result<CheckpointPayload> {
-    let _lock = AuditLock::acquire(root, false)?;
-    checkpoint_payload_unlocked(root)
+    Ok(verified_audit_snapshot(root)?.checkpoint)
 }
 
 /// Create the authentication material for a genuinely empty audit store.
@@ -1848,10 +1898,33 @@ pub fn initialize_empty_store(root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
+/// Resume crash-safe store maintenance from an explicit mutation boundary.
+/// Verification and policy callers must use `verified_audit_snapshot` instead.
+pub fn repair_audit_store(root: &Path) -> Result<()> {
+    if dashboard_store_uninitialized(root)? {
+        return Ok(());
+    }
+    let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
     recover_operation_progress(root, &key)?;
-    let tombstones = verified_tombstones(root, &key)?
+    let registry = read_manager_auth_registry(root, &key)?;
+    if let Some(seal) = match &registry {
+        Some(registry) => load_verified_manager_seal(root, registry)?,
+        None => None,
+    } {
+        finalize_sealed_recovery_records(root, &seal.payload)?;
+        finalize_sealed_operation_trash(root, &seal.payload)?;
+    }
+    Ok(())
+}
+
+fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
+    let key = read_key(root)?;
+    checkpoint_payload_readonly_unlocked(root, &key)
+}
+
+fn checkpoint_payload_readonly_unlocked(root: &Path, key: &[u8; 32]) -> Result<CheckpointPayload> {
+    let tombstones = verified_tombstones(root, key)?
         .into_iter()
         .map(|tombstone| CheckpointTombstone {
             module_id: tombstone.module_id,
@@ -1866,11 +1939,11 @@ fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
     let modules = if modules_dir.exists() {
         audit_module_ids(&modules_dir)?
             .into_iter()
-            .map(|module_id| verify_module_unlocked(root, &module_id, true))
+            .map(|module_id| verify_module_unlocked(root, &module_id, false))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .map(|status| {
-                let event_hashes = verify_chain(root, &status.module_id, &key, false)?
+                let event_hashes = verify_chain(root, &status.module_id, key, false)?
                     .events
                     .into_iter()
                     .map(|event| event.event_hash)
@@ -1887,10 +1960,10 @@ fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
     } else {
         Vec::new()
     };
-    let operations = verified_operations(root, &key)?;
+    let operations = verified_operations(root, key)?;
     let hmac_key_id = hex(&Sha256::digest(key));
     let next_hmac_key_id =
-        next_hmac_key_id_for_checkpoint(root, &key, &modules, &tombstones, &operations)?;
+        next_hmac_key_id_for_checkpoint(root, key, &modules, &tombstones, &operations)?;
     let inventory_hash = checkpoint_inventory_hash(
         &hmac_key_id,
         &next_hmac_key_id,
@@ -2118,7 +2191,12 @@ fn next_hmac_key_id_for_checkpoint(
         },
     );
     if has_unsealed_state {
-        pending_hmac_key(root, key, true)?.next_key_id()
+        let pending_path = root.join(NEXT_KEY_FILE);
+        if pending_path.exists() {
+            pending_hmac_key(root, key, false)?.next_key_id()
+        } else {
+            Ok(current_key_id)
+        }
     } else {
         Ok(current_key_id)
     }
@@ -2152,6 +2230,7 @@ fn checkpoint_inventory_hash(
     Ok(hex(&Sha256::digest(bytes)))
 }
 
+#[derive(Clone)]
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 struct VerifiedManagerSeal {
     envelope: ManagerCheckpointEnvelope,
@@ -2170,17 +2249,14 @@ pub fn manager_audit_seal_status(root: &Path) -> Result<ManagerAuditSealStatus> 
             key_id: None,
         });
     }
-    let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
-    let registry = read_manager_auth_registry(root, &key)?;
-    let seal = match &registry {
-        Some(registry) => load_verified_manager_seal(root, registry)?,
-        None => None,
-    };
-    if let Some(seal) = &seal {
-        finalize_sealed_operation_trash(root, &seal.payload)?;
-    }
-    Ok(match seal {
+    Ok(verified_audit_snapshot(root)?.seal_status)
+}
+
+fn manager_audit_seal_status_from(
+    registry: Option<ManagerAuditAuthRegistry>,
+    seal: Option<VerifiedManagerSeal>,
+) -> ManagerAuditSealStatus {
+    match seal {
         Some(seal) => ManagerAuditSealStatus {
             configured: true,
             generation: Some(seal.envelope.generation),
@@ -2195,7 +2271,7 @@ pub fn manager_audit_seal_status(root: &Path) -> Result<ManagerAuditSealStatus> 
             inventory_hash: None,
             key_id: registry.map(|registry| registry.key_id),
         },
-    })
+    }
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
@@ -2211,10 +2287,11 @@ pub fn commit_manager_audit_seal(
 
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
+    recover_operation_progress(root, &key)?;
     let registry = read_manager_auth_registry(root, &key)?
         .context("Manager audit authorization key is not configured")?;
     let payload = verify_manager_checkpoint_envelope(&envelope, &registry)?;
-    let current = checkpoint_payload_unlocked(root)?;
+    let current = checkpoint_payload_readonly_unlocked(root, &key)?;
     ensure!(
         payload.inventory_hash == current.inventory_hash
             && payload.hmac_key_id == current.hmac_key_id
@@ -2435,48 +2512,203 @@ fn verify_sealed_recovery_record(
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn sealed_integrity_status(root: &Path) -> Result<SealedIntegrityStatus> {
-    let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
-    sealed_integrity_status_unlocked(root, &key)
+    let snapshot = verified_audit_snapshot(root)?;
+    Ok(SealedIntegrityStatus {
+        seal_hash: snapshot
+            .seal_status
+            .seal_hash
+            .context("Manager audit seal is not configured")?,
+        inventory_hash: snapshot
+            .seal_status
+            .inventory_hash
+            .context("Manager audit seal inventory is unavailable")?,
+        failures: snapshot.integrity_failures,
+    })
 }
 
-/// Verify the Manager seal and every module history against one locked audit
-/// store snapshot. The revision guard still detects direct filesystem changes
-/// from writers that do not participate in the audit lock protocol.
-pub fn containment_inventory_snapshot(
-    root: &Path,
-) -> Result<(SealedIntegrityStatus, Vec<ModuleAuditStatus>)> {
+pub fn verified_audit_snapshot(root: &Path) -> Result<VerifiedAuditSnapshot> {
     let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
-    verify_tombstones(root, &key)?;
+    let key = read_key(root)?;
+    retry_verified_snapshot(
+        || verified_audit_snapshot_once(root, &key),
+        || std::thread::sleep(VERIFIED_SNAPSHOT_RETRY_DELAY),
+    )
+}
 
-    let revision_before = dashboard_store_revision(root)
-        .context("read module audit revision before containment verification")?;
-    let sealed = sealed_integrity_status_unlocked(root, &key)
-        .context("verify Manager-sealed module audit inventory")?;
-    let statuses = if root.join("modules").exists() {
+fn verified_audit_snapshot_once(root: &Path, key: &[u8; 32]) -> Result<VerifiedAuditSnapshot> {
+    let revision_before =
+        dashboard_store_revision(root).context("read audit revision before verified snapshot")?;
+    verify_tombstones(root, key)?;
+
+    let registry = read_manager_auth_registry(root, key)?;
+    let seal = match &registry {
+        Some(registry) => load_verified_manager_seal(root, registry)?,
+        None => None,
+    };
+    let module_ids = if root.join("modules").exists() {
         audit_module_ids(&root.join("modules"))?
-            .into_iter()
-            .map(
-                |module_id| match verify_module_unlocked(root, &module_id, false) {
-                    Ok(status) => Ok(status),
-                    Err(error) => {
-                        compromised_sealed_history_unlocked(root, &module_id, &error, &key)
-                            .map(|history| history.status)
-                    }
-                },
-            )
-            .collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
     };
-    let revision_after = dashboard_store_revision(root)
-        .context("read module audit revision after containment verification")?;
-    ensure!(
-        revision_before == revision_after,
-        "module audit store changed during containment verification"
-    );
-    Ok((sealed, statuses))
+    let histories = module_ids
+        .iter()
+        .map(|module_id| read_module_history_resilient_unlocked(root, module_id, key))
+        .collect::<Result<Vec<_>>>()?;
+    let current_checkpoint = checkpoint_payload_readonly_unlocked(root, key);
+
+    let (inventory_relation, checkpoint, integrity_failures) = match &seal {
+        None => (
+            AuditInventoryRelation::Unsealed,
+            current_checkpoint?,
+            Vec::new(),
+        ),
+        Some(seal) => {
+            let integrity = sealed_integrity_status_unlocked(root, key)?;
+            match current_checkpoint {
+                Ok(current)
+                    if histories
+                        .iter()
+                        .all(|history| history.integrity_error.is_none()) =>
+                {
+                    if checkpoint_inventory_matches(&current, &seal.payload) {
+                        ensure!(
+                            integrity.failures.is_empty(),
+                            "Manager-sealed inventory matches despite integrity failures"
+                        );
+                        (AuditInventoryRelation::SealedCurrent, current, Vec::new())
+                    } else {
+                        match registry.as_ref() {
+                            Some(registry)
+                                if ensure_checkpoint_extends(
+                                    root,
+                                    key,
+                                    &seal.seal_hash,
+                                    &seal.payload,
+                                    &current,
+                                    registry,
+                                )
+                                .is_ok() =>
+                            {
+                                (
+                                    AuditInventoryRelation::AuthorizedTransition,
+                                    current,
+                                    Vec::new(),
+                                )
+                            }
+                            _ if !integrity.failures.is_empty() => (
+                                AuditInventoryRelation::SealedDamage,
+                                seal.payload.clone(),
+                                integrity.failures,
+                            ),
+                            Some(registry) => {
+                                ensure_checkpoint_extends(
+                                    root,
+                                    key,
+                                    &seal.seal_hash,
+                                    &seal.payload,
+                                    &current,
+                                    registry,
+                                )
+                                .context(
+                                    "current audit inventory is not an authorized transition",
+                                )?;
+                                unreachable!()
+                            }
+                            None => unreachable!("verified seal requires a Manager registry"),
+                        }
+                    }
+                }
+                Ok(_) | Err(_) if !integrity.failures.is_empty() => (
+                    AuditInventoryRelation::SealedDamage,
+                    seal.payload.clone(),
+                    integrity.failures,
+                ),
+                Ok(_) => unreachable!("clean current checkpoint was handled above"),
+                Err(error) => return Err(error).context("read current verified audit inventory"),
+            }
+        }
+    };
+    let seal_status = manager_audit_seal_status_from(registry.clone(), seal.clone());
+    let authorization_status = ManagerAuditAuthStatus {
+        configured: registry.is_some(),
+        key_id: registry.map(|registry| registry.key_id),
+        inventory_hash: checkpoint.inventory_hash.clone(),
+    };
+    let revision_after =
+        dashboard_store_revision(root).context("read audit revision after verified snapshot")?;
+    if revision_before != revision_after {
+        return Err(AuditSnapshotChanged.into());
+    }
+    Ok(VerifiedAuditSnapshot {
+        store_revision: revision_after,
+        inventory_relation,
+        histories,
+        checkpoint,
+        integrity_failures,
+        seal_status,
+        authorization_status,
+    })
+}
+
+fn checkpoint_inventory_matches(left: &CheckpointPayload, right: &CheckpointPayload) -> bool {
+    left.inventory_hash == right.inventory_hash
+        && left.hmac_key_id == right.hmac_key_id
+        && left.next_hmac_key_id == right.next_hmac_key_id
+        && left.modules == right.modules
+        && left.tombstones == right.tombstones
+        && left.operations == right.operations
+}
+
+/// Verify the Manager seal and every module history against one locked audit
+/// store snapshot. The revision guard retries transient direct filesystem
+/// changes from writers that do not participate in the audit lock protocol.
+pub fn containment_inventory_snapshot(
+    root: &Path,
+) -> Result<(SealedIntegrityStatus, Vec<ModuleAuditStatus>)> {
+    let snapshot = verified_audit_snapshot(root)?;
+    let seal_hash = snapshot
+        .seal_status
+        .seal_hash
+        .context("Manager audit seal is not configured")?;
+    let inventory_hash = snapshot
+        .seal_status
+        .inventory_hash
+        .context("Manager audit seal inventory is unavailable")?;
+    Ok((
+        SealedIntegrityStatus {
+            seal_hash,
+            inventory_hash,
+            failures: snapshot.integrity_failures,
+        },
+        snapshot
+            .histories
+            .into_iter()
+            .map(|history| history.status)
+            .collect(),
+    ))
+}
+
+fn retry_verified_snapshot<T>(
+    mut capture: impl FnMut() -> Result<T>,
+    mut wait: impl FnMut(),
+) -> Result<T> {
+    for attempt in 1..=VERIFIED_SNAPSHOT_ATTEMPTS {
+        match capture() {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(error) if error.is::<AuditSnapshotChanged>() => {
+                if attempt == VERIFIED_SNAPSHOT_ATTEMPTS {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "cannot obtain a stable module audit snapshot after {VERIFIED_SNAPSHOT_ATTEMPTS} attempts"
+                        )
+                    });
+                }
+                wait();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("containment snapshot attempts must be nonzero")
 }
 
 /// Return a dashboard checkpoint without hiding Manager-sealed damage.
@@ -2485,30 +2717,10 @@ pub fn containment_inventory_snapshot(
 /// the verified Manager-sealed payload remains the only trusted inventory base
 /// and is returned solely to support fail-closed incident recovery.
 pub fn dashboard_checkpoint_snapshot(root: &Path) -> Result<DashboardCheckpointSnapshot> {
-    let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
-    let registry = read_manager_auth_registry(root, &key)?;
-    let verified_seal = match &registry {
-        Some(registry) => load_verified_manager_seal(root, registry)?,
-        None => None,
-    };
-    if verified_seal.is_none() {
-        return Ok(DashboardCheckpointSnapshot {
-            checkpoint: checkpoint_payload_unlocked(root)?,
-            integrity_failures: Vec::new(),
-        });
-    }
-    let integrity = sealed_integrity_status_unlocked(root, &key)?;
-    let checkpoint = if integrity.failures.is_empty() {
-        checkpoint_payload_unlocked(root)?
-    } else {
-        verified_seal
-            .context("Manager audit seal disappeared during dashboard verification")?
-            .payload
-    };
+    let snapshot = verified_audit_snapshot(root)?;
     Ok(DashboardCheckpointSnapshot {
-        checkpoint,
-        integrity_failures: integrity.failures,
+        checkpoint: snapshot.checkpoint,
+        integrity_failures: snapshot.integrity_failures,
     })
 }
 
@@ -2523,7 +2735,7 @@ fn sealed_integrity_status_unlocked(root: &Path, key: &[u8; 32]) -> Result<Seale
             && recovery.seal_hash == seal.seal_hash
         {
             verify_sealed_recovery_record(&recovery, &seal, &registry, root, key)?;
-            match verify_chain(root, &module.module_id, key, true) {
+            match verify_chain(root, &module.module_id, key, false) {
                 Ok(_) => continue,
                 Err(error) => {
                     if let Some(failure) = diagnose_sealed_module(root, module)? {
@@ -2660,7 +2872,7 @@ pub fn persistent_script_containment_plans(
     root: &Path,
 ) -> Result<Vec<PersistentScriptContainmentPlan>> {
     let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
+    let key = read_key(root)?;
     let registry = read_manager_auth_registry(root, &key)?
         .context("Manager audit authorization key is not configured")?;
     let seal = load_verified_manager_seal(root, &registry)?
@@ -2684,7 +2896,7 @@ pub fn persistent_script_containment_plans(
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn trusted_persistent_script_paths(root: &Path) -> Result<Vec<String>> {
     let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
+    let key = read_key(root)?;
     let registry = read_manager_auth_registry(root, &key)?
         .context("Manager audit authorization key is not configured")?;
     let seal = load_verified_manager_seal(root, &registry)?
@@ -3263,6 +3475,23 @@ fn ensure_checkpoint_extends(
             "Manager audit history disappeared without a matching tombstone: {}",
             old_module.module_id
         );
+        let authenticated_tombstones = verified_tombstones(root, key)?;
+        let authorized_prune = current.operations.iter().any(|operation| {
+            operation.action == AuditAction::Prune
+                && operation.base_inventory_hash == previous.inventory_hash
+                && operation.state == AuditOperationState::Applied
+                && operation.targets.contains(&old_module.module_id)
+                && operation.completed_targets.contains(&old_module.module_id)
+                && authenticated_tombstones.iter().any(|tombstone| {
+                    tombstone.module_id == old_module.module_id
+                        && tombstone.reason == format!("user_cleanup:{}", operation.operation_id)
+                })
+        });
+        ensure!(
+            authorized_prune,
+            "Manager audit history disappeared without an authorized cleanup: {}",
+            old_module.module_id
+        );
     }
     for new_module in &current.modules {
         if previous
@@ -3395,25 +3624,7 @@ fn ensure_operation_extends(
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 pub fn manager_audit_auth_status(root: &Path) -> Result<ManagerAuditAuthStatus> {
-    let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
-    let registry = read_manager_auth_registry(root, &key)?;
-    let inventory_hash = if let Ok(checkpoint) = checkpoint_payload_unlocked(root) {
-        checkpoint.inventory_hash
-    } else {
-        let registry = registry
-            .as_ref()
-            .context("Manager audit authorization key is not configured")?;
-        load_verified_manager_seal(root, registry)?
-            .context("audit inventory is unavailable")?
-            .payload
-            .inventory_hash
-    };
-    Ok(ManagerAuditAuthStatus {
-        configured: registry.is_some(),
-        key_id: registry.map(|registry| registry.key_id),
-        inventory_hash,
-    })
+    Ok(verified_audit_snapshot(root)?.authorization_status)
 }
 
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -3423,7 +3634,7 @@ pub fn manager_audit_auth_status_for_inventory(
 ) -> Result<ManagerAuditAuthStatus> {
     validate_sha256_hex(inventory_hash, "inventory hash")?;
     let _lock = AuditLock::acquire(root, false)?;
-    let key = load_key(root, false)?;
+    let key = read_key(root)?;
     let registry = read_manager_auth_registry(root, &key)?;
     Ok(ManagerAuditAuthStatus {
         configured: registry.is_some(),
@@ -3491,9 +3702,10 @@ pub fn manager_audit_auth_challenge(
     validate_sha256_hex(arguments_hash, "arguments hash")?;
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
+    recover_operation_progress(root, &key)?;
     let registry = read_manager_auth_registry(root, &key)?
         .context("Manager audit authorization key is not configured")?;
-    let checkpoint = checkpoint_payload_unlocked(root)?;
+    let checkpoint = checkpoint_payload_readonly_unlocked(root, &key)?;
     manager_audit_auth_challenge_unlocked(
         root,
         action,
@@ -3860,6 +4072,7 @@ fn begin_manager_audit_operation_at_inventory(
     let operation_id = hex(&Sha256::digest(&token_bytes));
     let _lock = AuditLock::acquire(root, false)?;
     let hmac_key = load_key(root, false)?;
+    recover_operation_progress(root, &hmac_key)?;
     let registry = read_manager_auth_registry(root, &hmac_key)?
         .context("Manager audit authorization key is not configured")?;
     ensure!(
@@ -3967,6 +4180,7 @@ fn begin_manager_audit_operation_at_inventory(
         operation.clone(),
         &hmac_key,
     )?;
+    pending_hmac_key(root, &hmac_key, true)?;
     remove_challenge_if_present(root, &token.challenge_id)?;
     Ok(authorized_operation(&operation))
 }
@@ -4280,7 +4494,9 @@ fn append_event(root: &Path, module_id: &str, kind: AuditEventKind) -> Result<()
         previous_hash,
         kind,
     };
-    write_event(root, module_id, &key, event)
+    write_event(root, module_id, &key, event)?;
+    pending_hmac_key(root, &key, true)?;
+    Ok(())
 }
 
 pub fn append_global_event(root: &Path, module_id: &str, kind: AuditEventKind) -> Result<()> {
@@ -4359,14 +4575,15 @@ fn verify_chain(
         if !valid.is_empty() {
             match verify_head(root, module_id, key, &valid) {
                 Ok(HeadState::Current) => {}
-                Ok(HeadState::StaleButValid) => write_head(
+                Ok(HeadState::StaleButValid) if repair => write_head(
                     root,
                     module_id,
                     key,
                     valid.last().context("non-empty audit chain has no head")?,
                 )?,
+                Ok(HeadState::StaleButValid) => {}
+                Err(_) if !repair => {}
                 Err(error) => {
-                    ensure!(repair, "audit head integrity failure: {error:#}");
                     let head_path = head_path(root, module_id);
                     let quarantine = quarantine_auxiliary(root, module_id, &head_path, "head")?;
                     append_incident(
@@ -4757,16 +4974,7 @@ fn quarantine_auxiliary(root: &Path, module_id: &str, path: &Path, label: &str) 
 fn load_key(root: &Path, create: bool) -> Result<[u8; 32]> {
     let path = root.join(KEY_FILE);
     if path.exists() {
-        let mut key = [0_u8; 32];
-        let mut file = File::open(&path).context("open module audit authentication key")?;
-        file.read_exact(&mut key)
-            .context("read module audit authentication key")?;
-        let mut extra = [0_u8; 1];
-        ensure!(
-            file.read(&mut extra)? == 0,
-            "invalid module audit authentication key length"
-        );
-        return recover_pending_hmac_rotation(root, key);
+        return recover_pending_hmac_rotation(root, read_key(root)?);
     }
     ensure!(create, "module audit authentication key is unavailable");
     ensure!(
@@ -4780,6 +4988,20 @@ fn load_key(root: &Path, create: bool) -> Result<[u8; 32]> {
         .read_exact(&mut key)
         .context("generate module audit authentication key")?;
     atomic_write(&path, &key)?;
+    Ok(key)
+}
+
+fn read_key(root: &Path) -> Result<[u8; 32]> {
+    let path = root.join(KEY_FILE);
+    let mut key = [0_u8; 32];
+    let mut file = File::open(&path).context("open module audit authentication key")?;
+    file.read_exact(&mut key)
+        .context("read module audit authentication key")?;
+    let mut extra = [0_u8; 1];
+    ensure!(
+        file.read(&mut extra)? == 0,
+        "invalid module audit authentication key length"
+    );
     Ok(key)
 }
 
@@ -5756,6 +5978,16 @@ mod tests {
         .unwrap();
 
         let payload = checkpoint_payload(temp.path()).unwrap();
+        let interrupted = payload
+            .operations
+            .iter()
+            .find(|candidate| candidate.operation_id == operation.operation_id)
+            .unwrap();
+        assert_eq!(interrupted.state, AuditOperationState::Applying);
+        assert!(interrupted.completed_targets.is_empty());
+
+        repair_audit_store(temp.path()).unwrap();
+        let payload = checkpoint_payload(temp.path()).unwrap();
         let recovered = payload
             .operations
             .iter()
@@ -5955,6 +6187,163 @@ mod tests {
     }
 
     #[test]
+    fn containment_snapshot_scopes_stable_sealed_damage_to_its_module() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        record(root, "module.alpha", "ab");
+        record(root, "module.beta", "cd");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(root, &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(root, &checkpoint_envelope(root, &manager, 1)).unwrap();
+
+        std::fs::write(event_path(root, "module.alpha", 2), b"corrupt").unwrap();
+
+        let (integrity, statuses) = containment_inventory_snapshot(root).unwrap();
+        assert_eq!(integrity.failures.len(), 1);
+        assert_eq!(integrity.failures[0].module_id, "module.alpha");
+        assert_eq!(statuses.len(), 2);
+        assert!(
+            statuses
+                .iter()
+                .find(|status| status.module_id == "module.alpha")
+                .unwrap()
+                .unresolved_risk
+        );
+        assert!(
+            !statuses
+                .iter()
+                .find(|status| status.module_id == "module.beta")
+                .unwrap()
+                .unresolved_risk
+        );
+    }
+
+    #[test]
+    fn verified_snapshot_accepts_manager_authorized_prune_transition() {
+        let temp = TempDir::new().unwrap();
+        let audit_root = temp.path().join("audit");
+        let installed_root = temp.path().join("modules");
+        let pending_root = temp.path().join("modules_update");
+        std::fs::create_dir(&installed_root).unwrap();
+        record(&audit_root, "stale.module", "ab");
+        let manager = signing_key(29);
+        register_manager_audit_auth_key(&audit_root, &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(&audit_root, &checkpoint_envelope(&audit_root, &manager, 1))
+            .unwrap();
+
+        let operation = begin_test_operation(&audit_root, AuditAction::Prune, &["stale.module"]);
+        prune_stale_histories(
+            &audit_root,
+            &installed_root,
+            &pending_root,
+            &operation.operation_id,
+        )
+        .unwrap();
+        finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
+
+        let snapshot = verified_audit_snapshot(&audit_root).unwrap();
+        assert_eq!(
+            snapshot.inventory_relation,
+            AuditInventoryRelation::AuthorizedTransition
+        );
+        assert!(snapshot.integrity_failures.is_empty());
+        assert!(snapshot.histories.is_empty());
+        assert!(snapshot.checkpoint.modules.is_empty());
+        assert_eq!(snapshot.checkpoint.tombstones.len(), 1);
+    }
+
+    #[test]
+    fn verified_snapshot_does_not_repair_a_stale_head() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        record(root, "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(root, &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(root, &checkpoint_envelope(root, &manager, 1)).unwrap();
+        let key = read_key(root).unwrap();
+        let first: AuthenticatedEvent = read_json(&event_path(root, "test.module", 1)).unwrap();
+        write_head(root, "test.module", &key, &first).unwrap();
+        let revision = dashboard_store_revision(root).unwrap();
+
+        let snapshot = verified_audit_snapshot(root).unwrap();
+
+        assert_eq!(
+            snapshot.inventory_relation,
+            AuditInventoryRelation::SealedCurrent
+        );
+        assert_eq!(dashboard_store_revision(root).unwrap(), revision);
+        assert!(matches!(
+            verify_head(
+                root,
+                "test.module",
+                &key,
+                &verify_chain(root, "test.module", &key, false)
+                    .unwrap()
+                    .events
+            )
+            .unwrap(),
+            HeadState::StaleButValid
+        ));
+    }
+
+    #[test]
+    fn containment_snapshot_retries_transient_verification_failures() {
+        let mut attempts = 0;
+        let mut waits = 0;
+        let snapshot = retry_verified_snapshot(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    return Err(AuditSnapshotChanged.into());
+                }
+                Ok("stable")
+            },
+            || waits += 1,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot, "stable");
+        assert_eq!(attempts, 3);
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn containment_snapshot_exhausts_continuous_store_changes() {
+        let mut attempts = 0;
+        let mut waits = 0;
+        let error = retry_verified_snapshot::<()>(
+            || {
+                attempts += 1;
+                Err(AuditSnapshotChanged.into())
+            },
+            || waits += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, VERIFIED_SNAPSHOT_ATTEMPTS);
+        assert_eq!(waits, VERIFIED_SNAPSHOT_ATTEMPTS - 1);
+        assert!(format!("{error:#}").contains("cannot obtain a stable module audit snapshot"));
+    }
+
+    #[test]
+    fn containment_snapshot_does_not_retry_persistent_verification_failure() {
+        let mut attempts = 0;
+        let mut waits = 0;
+        let error = retry_verified_snapshot::<()>(
+            || {
+                attempts += 1;
+                bail!("Manager audit seal is invalid")
+            },
+            || waits += 1,
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, 1);
+        assert_eq!(waits, 0);
+        assert!(format!("{error:#}").contains("Manager audit seal is invalid"));
+    }
+
+    #[test]
     fn manager_authorized_recovery_rebuilds_a_damaged_sealed_module_only() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -6077,6 +6466,7 @@ mod tests {
         )
         .unwrap();
 
+        repair_audit_store(root).unwrap();
         let checkpoint = checkpoint_payload(root).unwrap();
         let operation = checkpoint
             .operations
@@ -6140,9 +6530,8 @@ mod tests {
         commit_manager_audit_seal(temp.path(), &first).unwrap();
 
         std::fs::remove_file(operation_path(temp.path(), &operation.operation_id)).unwrap();
-        let replay = checkpoint_envelope(temp.path(), &manager, 2);
-        let error = commit_manager_audit_seal(temp.path(), &replay).unwrap_err();
-        assert!(error.to_string().contains("operation disappeared"));
+        let error = verified_audit_snapshot(temp.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("operation disappeared"));
     }
 
     #[test]
@@ -6428,6 +6817,16 @@ mod tests {
         .unwrap();
 
         let payload = checkpoint_payload(&audit_root).unwrap();
+        let interrupted = payload
+            .operations
+            .iter()
+            .find(|candidate| candidate.operation_id == operation.operation_id)
+            .unwrap();
+        assert_eq!(interrupted.state, AuditOperationState::Applying);
+        assert!(interrupted.completed_targets.is_empty());
+
+        repair_audit_store(&audit_root).unwrap();
+        let payload = checkpoint_payload(&audit_root).unwrap();
         let recovered = payload
             .operations
             .iter()
@@ -6447,6 +6846,8 @@ mod tests {
         std::fs::create_dir_all(&trash).unwrap();
         std::fs::write(trash.join("leftover"), b"test").unwrap();
         manager_audit_seal_status(&audit_root).unwrap();
+        assert!(trash.exists());
+        repair_audit_store(&audit_root).unwrap();
         assert!(!trash.exists());
     }
 
@@ -6670,6 +7071,21 @@ mod tests {
         )
         .unwrap();
 
+        let checkpoint = checkpoint_payload(&audit_root).unwrap();
+        let interrupted = checkpoint
+            .operations
+            .iter()
+            .find(|candidate| candidate.operation_id == operation.operation_id)
+            .unwrap();
+        assert_eq!(interrupted.state, AuditOperationState::Applying);
+        assert_eq!(
+            verify_module(&audit_root, "risky.module", false)
+                .unwrap()
+                .containment_state,
+            Some(ContainmentState::Contained)
+        );
+
+        repair_audit_store(&audit_root).unwrap();
         let checkpoint = checkpoint_payload(&audit_root).unwrap();
         let recovered = checkpoint
             .operations

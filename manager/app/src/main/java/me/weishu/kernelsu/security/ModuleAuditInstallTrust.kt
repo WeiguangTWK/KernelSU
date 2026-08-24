@@ -27,6 +27,12 @@ suspend fun sealModuleAuditSession(installSession: String): ModuleAuditInstallTr
     check(!completed.optBoolean("uninitialized", false)) {
         "Module audit store remained uninitialized after installation"
     }
+    val inventoryRelation = AuditInventoryRelation.fromWireName(
+        completed.getString("inventory_relation")
+    )
+    check(inventoryRelation != AuditInventoryRelation.SealedDamage) {
+        "Module audit installation session produced sealed inventory damage"
+    }
     val store = ModuleAuditCheckpointStore(ksuApp)
     val sealStatus = completed.getJSONObject("seal_status")
     val checkpoint = store.reconcile(

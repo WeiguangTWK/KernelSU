@@ -17,6 +17,7 @@ import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.AuditCheckpointTrust
 import me.weishu.kernelsu.security.AuditCheckpointVerification
 import me.weishu.kernelsu.security.AuditDashboardCache
+import me.weishu.kernelsu.security.AuditInventoryRelation
 import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
 import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.security.parseModuleAuditResponseStatus
@@ -228,6 +229,13 @@ class SecurityAuditViewModel : ViewModel() {
                         error = null,
                     )
                 }
+                val inventoryRelation = AuditInventoryRelation.fromWireName(
+                    completion.getString("inventory_relation")
+                )
+                val checkpointDegraded = completion.optBoolean("checkpoint_degraded", false)
+                check(checkpointDegraded == (inventoryRelation == AuditInventoryRelation.SealedDamage)) {
+                    "Audit snapshot relation does not match its integrity state"
+                }
                 val rawCheckpoint = completion.getJSONObject("checkpoint").toString()
                 val sealStatus = completion.getJSONObject("seal_status")
                 val authorizationStatus = completion.getJSONObject("authorization_status")
@@ -239,7 +247,7 @@ class SecurityAuditViewModel : ViewModel() {
                     sealedEnvelopeHash,
                 )
                 if (
-                    completion.optBoolean("checkpoint_degraded", false) &&
+                    checkpointDegraded &&
                     checkpoint.trust != AuditCheckpointTrust.Compromised
                 ) {
                     val recoverableModules = completion

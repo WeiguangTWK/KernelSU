@@ -5,7 +5,7 @@ use crate::{
     defs,
     module_audit_log::{
         AuditEventKind, CheckpointPayload, ManagerAuditAuthStatus, ManagerAuditSealStatus,
-        ModuleAuditHistory, ModuleAuditStatus, SealedIntegrityStatus,
+        ModuleAuditHistory, ModuleAuditStatus, SealedIntegrityStatus, VerifiedAuditSnapshot,
     },
 };
 
@@ -15,21 +15,28 @@ fn root() -> &'static Path {
     Path::new(defs::GLOBAL_AUDIT_DIR)
 }
 
+fn snapshot() -> Result<VerifiedAuditSnapshot> {
+    crate::module_audit_log::verified_audit_snapshot(root())
+}
+
 pub fn record_event(kind: AuditEventKind) -> Result<()> {
     crate::module_audit_log::append_global_event(root(), GLOBAL_AUDIT_MODULE_ID, kind)
 }
 
 pub fn status() -> Result<ModuleAuditStatus> {
-    crate::module_audit_log::read_module_history_resilient(root(), GLOBAL_AUDIT_MODULE_ID, true)
-        .map(|history| history.status)
+    history().map(|history| history.status)
 }
 
 pub fn history() -> Result<ModuleAuditHistory> {
-    crate::module_audit_log::read_module_history_resilient(root(), GLOBAL_AUDIT_MODULE_ID, true)
+    snapshot()?
+        .histories
+        .into_iter()
+        .find(|history| history.status.module_id == GLOBAL_AUDIT_MODULE_ID)
+        .ok_or_else(|| anyhow::anyhow!("global audit history is unavailable"))
 }
 
 pub fn checkpoint() -> Result<CheckpointPayload> {
-    crate::module_audit_log::checkpoint_payload(root())
+    Ok(snapshot()?.checkpoint)
 }
 
 pub fn store_revision() -> Result<String> {
@@ -37,11 +44,22 @@ pub fn store_revision() -> Result<String> {
 }
 
 pub fn recovery_status() -> Result<SealedIntegrityStatus> {
-    crate::module_audit_log::sealed_integrity_status(root())
+    let snapshot = snapshot()?;
+    Ok(SealedIntegrityStatus {
+        seal_hash: snapshot
+            .seal_status
+            .seal_hash
+            .ok_or_else(|| anyhow::anyhow!("Manager audit seal is not configured"))?,
+        inventory_hash: snapshot
+            .seal_status
+            .inventory_hash
+            .ok_or_else(|| anyhow::anyhow!("Manager audit seal inventory is unavailable"))?,
+        failures: snapshot.integrity_failures,
+    })
 }
 
 pub fn auth_status() -> Result<ManagerAuditAuthStatus> {
-    crate::module_audit_log::manager_audit_auth_status(root())
+    Ok(snapshot()?.authorization_status)
 }
 
 pub fn register_auth_key(public_key: &str, recover: bool) -> Result<ManagerAuditAuthStatus> {
@@ -49,7 +67,7 @@ pub fn register_auth_key(public_key: &str, recover: bool) -> Result<ManagerAudit
 }
 
 pub fn seal_status() -> Result<ManagerAuditSealStatus> {
-    crate::module_audit_log::manager_audit_seal_status(root())
+    Ok(snapshot()?.seal_status)
 }
 
 pub fn commit_seal(envelope: &str) -> Result<ManagerAuditSealStatus> {
