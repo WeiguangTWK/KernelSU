@@ -29,19 +29,7 @@ data class AuditEmergencyScriptQuarantineEntry(
     val quarantinePath: String,
     val state: String,
     val error: String?,
-    val recoveryRoutes: List<AuditEmergencyRecoveryRoute>,
-)
-
-data class AuditEmergencyRecoveryRoute(
-    val action: String,
-    val available: Boolean,
-    val destructive: Boolean,
-    val conditions: List<AuditEmergencyRecoveryCondition>,
-)
-
-data class AuditEmergencyRecoveryCondition(
-    val kind: String,
-    val state: String,
+    val recoveryRoutes: List<AuditRecoveryRoute>,
 )
 
 data class ModuleAuditResponseStatus(
@@ -76,19 +64,9 @@ fun parseModuleAuditResponseStatus(raw: String): ModuleAuditResponseStatus {
                             quarantinePath = entry.getString("quarantine_path"),
                             state = entry.getString("state"),
                             error = entry.nullableString("error"),
-                            recoveryRoutes = entry.optJSONArray("recovery_routes")?.objects()?.map { route ->
-                                AuditEmergencyRecoveryRoute(
-                                    action = route.getString("action"),
-                                    available = route.getBoolean("available"),
-                                    destructive = route.getBoolean("destructive"),
-                                    conditions = route.optJSONArray("conditions")?.objects()?.map { condition ->
-                                        AuditEmergencyRecoveryCondition(
-                                            kind = condition.getString("kind"),
-                                            state = condition.getString("state"),
-                                        )
-                                    }.orEmpty(),
-                                )
-                            }.orEmpty(),
+                            recoveryRoutes = parseAuditRecoveryRoutes(
+                                entry.optJSONArray("recovery_routes")
+                            ),
                         )
                     },
                 )

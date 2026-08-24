@@ -226,7 +226,7 @@ private fun AuditEmergencyMiuix(
                                 stringResource(R.string.security_audit_script_delete_action)
                             },
                             onClick = { actions.onDeleteQuarantinedScript(entry.entryId) },
-                            enabled = deleteRoute.available &&
+                            enabled = deleteRoute.ready &&
                                 state.deletingScriptEntryId == null &&
                                 !state.auditMutationBlocked,
                         )
@@ -242,7 +242,7 @@ private fun AuditEmergencyMiuix(
                                 stringResource(R.string.security_audit_script_retry_action)
                             },
                             onClick = { actions.onRetryScriptContainment(entry.entryId) },
-                            enabled = retryRoute.available &&
+                            enabled = retryRoute.ready &&
                                 state.retryingScriptEntryId == null &&
                                 !state.auditMutationBlocked,
                         )
@@ -542,7 +542,7 @@ private fun AuditIncidentsMiuix(
                                     incident.incidentId,
                                 )
                             },
-                            enabled = route.available && state.closingIncidentId == null &&
+                            enabled = route.ready && state.closingIncidentId == null &&
                                 !state.auditMutationBlocked,
                         )
                     }

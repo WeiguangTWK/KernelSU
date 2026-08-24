@@ -214,7 +214,7 @@ private fun AuditEmergencyMaterial(
                     if (deleteRoute != null) {
                         Button(
                             onClick = { actions.onDeleteQuarantinedScript(entry.entryId) },
-                            enabled = deleteRoute.available &&
+                            enabled = deleteRoute.ready &&
                                 state.deletingScriptEntryId == null &&
                                 !state.auditMutationBlocked,
                             modifier = Modifier.fillMaxWidth(),
@@ -234,7 +234,7 @@ private fun AuditEmergencyMaterial(
                     if (retryRoute != null) {
                         Button(
                             onClick = { actions.onRetryScriptContainment(entry.entryId) },
-                            enabled = retryRoute.available &&
+                            enabled = retryRoute.ready &&
                                 state.retryingScriptEntryId == null &&
                                 !state.auditMutationBlocked,
                             modifier = Modifier.fillMaxWidth(),
@@ -539,7 +539,7 @@ private fun AuditIncidentsMaterial(
                                     incident.incidentId,
                                 )
                             },
-                            enabled = route.available && state.closingIncidentId == null &&
+                            enabled = route.ready && state.closingIncidentId == null &&
                                 !state.auditMutationBlocked,
                             modifier = Modifier.fillMaxWidth(),
                         ) {

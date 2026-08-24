@@ -2,6 +2,9 @@ package me.weishu.kernelsu.ui.screen.securityaudit
 
 import me.weishu.kernelsu.security.AuditKeyProtection
 import me.weishu.kernelsu.security.AuditEmergencyStatus
+import me.weishu.kernelsu.security.AuditAssessment
+import me.weishu.kernelsu.security.AuditRecoveryRoute
+import me.weishu.kernelsu.security.parseAuditRecoveryRoutes
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -37,18 +40,6 @@ data class AuditIncident(
     val detail: String,
     val quarantinePath: String,
     val recoveryRoutes: List<AuditRecoveryRoute>,
-)
-
-data class AuditRecoveryRoute(
-    val action: String,
-    val available: Boolean,
-    val destructive: Boolean,
-    val conditions: List<AuditRecoveryCondition>,
-)
-
-data class AuditRecoveryCondition(
-    val kind: String,
-    val state: String,
 )
 
 enum class SecureRemovalPhase {
@@ -125,6 +116,7 @@ data class SecurityAuditUiState(
     val auditInitialized: Boolean = true,
     val keyProtection: AuditKeyProtection = AuditKeyProtection.Unavailable,
     val auditAuthorizationReady: Boolean = false,
+    val assessment: AuditAssessment? = null,
     val emergencyStatus: AuditEmergencyStatus? = null,
     val errorMessage: String? = null,
 ) {
@@ -137,17 +129,11 @@ data class SecurityAuditUiState(
     val secureRemovalInProgress: Boolean
         get() = secureRemovalPhase != null && secureRemovalPhase != SecureRemovalPhase.Completed
 
-    fun canSecurelyRemove(moduleId: String): Boolean {
-        val history = histories.firstOrNull { it.status.moduleId == moduleId }
-        val canRecoverSealedDamage =
-            checkpointCompromised && moduleId in sealedRecoveryModuleIds
-        return secureRemovalModuleId == null && !isLoading && !isRefreshing &&
+    fun canSecurelyRemove(moduleId: String): Boolean =
+        secureRemovalModuleId == null && !isLoading && !isRefreshing &&
             !isRecovering && closingIncidentId == null && deletingScriptEntryId == null &&
-            retryingScriptEntryId == null && recoverySafeMode &&
-            history?.status?.unresolvedRisk == true && moduleId !in staleModuleIds &&
-            (!checkpointCompromised || canRecoverSealedDamage) &&
-            (auditAuthorizationReady || canRecoverSealedDamage)
-    }
+            retryingScriptEntryId == null &&
+            assessment?.module(moduleId)?.secureRemovalRoute?.available == true
 
     val highRiskModules: Int
         get() = histories.count { it.isHighRisk() }
@@ -302,19 +288,9 @@ fun parseAuditHistories(raw: String): List<AuditHistory> = JSONArray(raw).mapObj
                     corruptedFromSequence = incident.getLong("corrupted_from_sequence"),
                     detail = incident.getString("detail"),
                     quarantinePath = incident.getString("quarantine_path"),
-                    recoveryRoutes = incident.optJSONArray("recovery_routes")?.mapObjects { route ->
-                        AuditRecoveryRoute(
-                            action = route.getString("action"),
-                            available = route.getBoolean("available"),
-                            destructive = route.getBoolean("destructive"),
-                            conditions = route.optJSONArray("conditions")?.mapObjects { condition ->
-                                AuditRecoveryCondition(
-                                    kind = condition.getString("kind"),
-                                    state = condition.getString("state"),
-                                )
-                            }.orEmpty(),
-                        )
-                    }.orEmpty(),
+                    recoveryRoutes = parseAuditRecoveryRoutes(
+                        incident.optJSONArray("recovery_routes")
+                    ),
                 )
             }.orEmpty(),
         ),

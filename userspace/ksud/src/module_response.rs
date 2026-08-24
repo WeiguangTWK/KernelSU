@@ -1,5 +1,8 @@
 use crate::{
-    defs, ksucalls, metamodule, module, module_audit_action::AuditAction, module_audit_log,
+    defs, ksucalls, metamodule, module,
+    module_audit_action::AuditAction,
+    module_audit_assessment::{self, AssessedAuditSnapshot, AuditAssessmentContext},
+    module_audit_log,
 };
 use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
@@ -94,62 +97,6 @@ fn script_quarantine_entry_id(session: &Path, source: &Path, quarantine: &Path) 
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn script_delete_route(quarantine: &Path) -> module_audit_log::AuditRecoveryRoute {
-    let regular_file =
-        std::fs::symlink_metadata(quarantine).is_ok_and(|metadata| metadata.file_type().is_file());
-    module_audit_log::AuditRecoveryRoute {
-        action: AuditAction::DeleteQuarantinedScript.route_name().to_owned(),
-        available: regular_file,
-        destructive: true,
-        conditions: vec![
-            module_audit_log::AuditRecoveryCondition {
-                kind: "audit_state_verified".to_owned(),
-                state: module_audit_log::AuditRecoveryRequirementState::Required,
-            },
-            module_audit_log::AuditRecoveryCondition {
-                kind: "manager_authorization".to_owned(),
-                state: module_audit_log::AuditRecoveryRequirementState::Required,
-            },
-            module_audit_log::AuditRecoveryCondition {
-                kind: "quarantine_regular_file".to_owned(),
-                state: if regular_file {
-                    module_audit_log::AuditRecoveryRequirementState::Satisfied
-                } else {
-                    module_audit_log::AuditRecoveryRequirementState::Unsatisfied
-                },
-            },
-        ],
-    }
-}
-
-fn script_retry_route(source: &Path) -> module_audit_log::AuditRecoveryRoute {
-    let regular_file =
-        std::fs::symlink_metadata(source).is_ok_and(|metadata| metadata.file_type().is_file());
-    module_audit_log::AuditRecoveryRoute {
-        action: AuditAction::RetryScriptContainment.route_name().to_owned(),
-        available: regular_file,
-        destructive: false,
-        conditions: vec![
-            module_audit_log::AuditRecoveryCondition {
-                kind: "audit_state_verified".to_owned(),
-                state: module_audit_log::AuditRecoveryRequirementState::Required,
-            },
-            module_audit_log::AuditRecoveryCondition {
-                kind: "manager_authorization".to_owned(),
-                state: module_audit_log::AuditRecoveryRequirementState::Required,
-            },
-            module_audit_log::AuditRecoveryCondition {
-                kind: "source_regular_file".to_owned(),
-                state: if regular_file {
-                    module_audit_log::AuditRecoveryRequirementState::Satisfied
-                } else {
-                    module_audit_log::AuditRecoveryRequirementState::Unsatisfied
-                },
-            },
-        ],
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuditEmergencyScriptQuarantineManifest {
     pub schema_version: u32,
@@ -203,8 +150,20 @@ pub fn audit_emergency_status() -> Result<Option<AuditEmergencyStatus>> {
         return Ok(None);
     };
     let quarantine_root = Path::new(&status.script_quarantine_root);
+    let assessment = current_audit_assessment().ok();
+    let audit_state_verified = assessment
+        .as_ref()
+        .is_some_and(|value| value.assessment.ensure_complete_inventory().is_ok());
+    let authorization_configured = assessment
+        .as_ref()
+        .is_some_and(|value| value.assessment.authorization_configured);
     match read_script_quarantine_manifests(quarantine_root) {
-        Ok(collection) => {
+        Ok(mut collection) => {
+            apply_script_quarantine_routes(
+                &mut collection.manifests,
+                audit_state_verified,
+                authorization_configured,
+            );
             status.script_quarantines = collection.manifests;
             status.containment_failures.extend(collection.failures);
         }
@@ -245,6 +204,7 @@ pub fn quarantined_script_delete_arguments_hash(entry_id: &str) -> Result<String
         ),
         "quarantined script entry is not ready for deletion"
     );
+    ensure_quarantined_script_route_ready(entry_id, AuditAction::DeleteQuarantinedScript)?;
     let bytes = serde_json::to_vec(&(
         AuditAction::DeleteQuarantinedScript,
         entry_id,
@@ -369,6 +329,7 @@ pub fn quarantined_script_retry_arguments_hash(entry_id: &str) -> Result<String>
         ),
         "quarantined script entry cannot be retried"
     );
+    ensure_quarantined_script_route_ready(entry_id, AuditAction::RetryScriptContainment)?;
     let bytes = serde_json::to_vec(&(
         AuditAction::RetryScriptContainment,
         entry_id,
@@ -377,6 +338,27 @@ pub fn quarantined_script_retry_arguments_hash(entry_id: &str) -> Result<String>
         &entry.quarantine_path,
     ))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn ensure_quarantined_script_route_ready(entry_id: &str, action: AuditAction) -> Result<()> {
+    let status = audit_emergency_status()?.context("audit emergency status is unavailable")?;
+    let route = status
+        .script_quarantines
+        .iter()
+        .flat_map(|manifest| manifest.entries.iter())
+        .find(|entry| entry.entry_id == entry_id)
+        .and_then(|entry| {
+            entry
+                .recovery_routes
+                .iter()
+                .find(|route| route.action == action.route_name())
+        })
+        .context("quarantined script recovery route is unavailable")?;
+    ensure!(
+        route.ready,
+        "quarantined script recovery conditions are not satisfied"
+    );
+    Ok(())
 }
 
 pub fn retry_quarantined_script_containment(entry_id: &str, authorization: &str) -> Result<()> {
@@ -459,7 +441,7 @@ pub fn retry_quarantined_script_containment(entry_id: &str, authorization: &str)
     }
     manifest.schema_version = SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION;
     manifest.entries[entry_index].error = None;
-    manifest.entries[entry_index].recovery_routes = vec![script_delete_route(&quarantine)];
+    manifest.entries[entry_index].recovery_routes.clear();
     manifest.updated_at_unix_seconds = unix_time_seconds();
     write_script_quarantine_manifest(&session, &manifest)?;
     module_audit_log::complete_manager_audit_operation_target(
@@ -568,7 +550,7 @@ pub(crate) fn quarantined_script_action_completed(
             manifest.schema_version = SCRIPT_QUARANTINE_MANIFEST_SCHEMA_VERSION;
             manifest.entries[entry_index].state = AuditEmergencyScriptQuarantineState::Moved;
             manifest.entries[entry_index].error = None;
-            manifest.entries[entry_index].recovery_routes = vec![script_delete_route(&quarantine)];
+            manifest.entries[entry_index].recovery_routes.clear();
         }
         _ => bail!("audit action does not operate on quarantined scripts"),
     }
@@ -789,8 +771,12 @@ fn mark_audit_emergency_recovered(path: &Path) -> Result<()> {
 /// incident response. The audit store remains authoritative; callers must not
 /// infer safety from mutable module marker files.
 pub fn ensure_action_allowed(id: &str, action: &str) -> Result<()> {
+    let assessed = current_audit_assessment()?;
     ensure!(
-        !module_audit_log::module_requires_secure_removal(Path::new(defs::MODULE_AUDIT_DIR), id,)?,
+        !assessed
+            .assessment
+            .module(id)
+            .is_some_and(|module| module.disposition.requires_secure_removal()),
         "Module {id} has an unresolved audit integrity incident; cannot {action}. Use Security & Audit Center"
     );
     Ok(())
@@ -839,10 +825,12 @@ pub fn intercept_unsafe_normal_uninstall(module_path: &Path) -> Result<bool> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("module path has no valid module id")?;
-    if !module_audit_log::module_requires_secure_removal(
-        Path::new(defs::MODULE_AUDIT_DIR),
-        module_id,
-    )? {
+    let assessed = current_audit_assessment()?;
+    if !assessed
+        .assessment
+        .module(module_id)
+        .is_some_and(|module| module.disposition.requires_secure_removal())
+    {
         return Ok(false);
     }
     crate::utils::ensure_file_exists(module_path.join(defs::DISABLE_FILE_NAME))?;
@@ -859,8 +847,12 @@ pub fn intercept_unsafe_normal_uninstall(module_path: &Path) -> Result<bool> {
 
 pub fn contain_for_secure_removal(id: &str) -> Result<()> {
     module::validate_module_id(id)?;
+    let assessed = current_audit_assessment()?;
     ensure!(
-        module_audit_log::module_requires_containment(Path::new(defs::MODULE_AUDIT_DIR), id)?,
+        assessed
+            .assessment
+            .module(id)
+            .is_some_and(|module| module.disposition.requires_containment()),
         "Module {id} does not require secure removal"
     );
     let mut found = false;
@@ -1054,36 +1046,42 @@ pub fn enforce_containment(boot_enforcement: bool) -> Result<ContainmentOutcome>
 }
 
 fn trusted_containment_ids(audit_root: &Path, module_roots: &[&Path]) -> Result<BTreeSet<String>> {
-    let (sealed, statuses) = module_audit_log::containment_inventory_snapshot(audit_root)
-        .context("verify current module audit histories")?;
+    let assessed = current_audit_assessment_for(audit_root, module_roots)
+        .context("assess current module audit inventory")?;
+    assessed.assessment.ensure_complete_inventory()?;
+    Ok(assessed.assessment.containment_module_ids())
+}
 
-    let mut audited = BTreeSet::new();
-    let mut contained = sealed
-        .failures
+pub(crate) fn current_audit_assessment() -> Result<AssessedAuditSnapshot> {
+    current_audit_assessment_for(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        &[
+            Path::new(defs::MODULE_DIR),
+            Path::new(defs::MODULE_UPDATE_DIR),
+        ],
+    )
+}
+
+fn current_audit_assessment_for(
+    audit_root: &Path,
+    module_roots: &[&Path],
+) -> Result<AssessedAuditSnapshot> {
+    let module_content_ids = managed_module_paths(module_roots)?
         .into_iter()
-        .map(|failure| failure.module_id)
-        .collect::<BTreeSet<_>>();
-    for status in statuses {
-        ensure!(
-            status.manager_checkpoint == module_audit_log::CheckpointState::Sealed,
-            "module {} has no Manager-sealed audit history",
-            status.module_id
-        );
-        if status.unresolved_risk || status.containment_state.is_some() {
-            contained.insert(status.module_id.clone());
-        }
-        audited.insert(status.module_id);
-    }
-
-    for (module_id, _) in managed_module_paths(module_roots)? {
-        module::validate_module_id(&module_id)
-            .with_context(|| format!("invalid installed or pending module id {module_id:?}"))?;
-        ensure!(
-            audited.contains(&module_id),
-            "installed or pending module {module_id} has no verified audit history"
-        );
-    }
-    Ok(contained)
+        .map(|(module_id, _)| {
+            module::validate_module_id(&module_id)
+                .with_context(|| format!("invalid installed or pending module id {module_id:?}"))?;
+            Ok(module_id)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let snapshot = module_audit_log::verified_audit_snapshot(audit_root)?;
+    Ok(module_audit_assessment::assess_verified_snapshot(
+        snapshot,
+        &AuditAssessmentContext {
+            kernel_safe_mode: ksucalls::try_check_kernel_safemode().unwrap_or(false),
+            module_content_ids,
+        },
+    ))
 }
 
 fn managed_module_paths(module_roots: &[&Path]) -> Result<Vec<(String, PathBuf)>> {
@@ -1528,15 +1526,40 @@ fn reconcile_script_quarantine_manifest(manifest: &mut AuditEmergencyScriptQuara
         if source_exists && !quarantine_exists && entry.error.is_some() {
             entry.cause = module_audit_log::AuditIncidentCause::PersistentScriptMoveFailed;
         }
+        entry.recovery_routes.clear();
+    }
+}
+
+fn apply_script_quarantine_routes(
+    manifests: &mut [AuditEmergencyScriptQuarantineManifest],
+    audit_state_verified: bool,
+    authorization_configured: bool,
+) {
+    for entry in manifests
+        .iter_mut()
+        .flat_map(|manifest| manifest.entries.iter_mut())
+    {
+        let source_regular_file = std::fs::symlink_metadata(&entry.source_path)
+            .is_ok_and(|metadata| metadata.file_type().is_file());
+        let quarantine_regular_file = std::fs::symlink_metadata(&entry.quarantine_path)
+            .is_ok_and(|metadata| metadata.file_type().is_file());
         entry.recovery_routes = match entry.state {
             AuditEmergencyScriptQuarantineState::Moved => {
-                vec![script_delete_route(Path::new(&entry.quarantine_path))]
+                vec![module_audit_assessment::script_delete_route(
+                    audit_state_verified,
+                    authorization_configured,
+                    quarantine_regular_file,
+                )]
             }
             AuditEmergencyScriptQuarantineState::Planned
             | AuditEmergencyScriptQuarantineState::Failed
-                if source_exists && !quarantine_exists =>
+                if source_regular_file && !quarantine_regular_file =>
             {
-                vec![script_retry_route(Path::new(&entry.source_path))]
+                vec![module_audit_assessment::script_retry_route(
+                    audit_state_verified,
+                    authorization_configured,
+                    source_regular_file,
+                )]
             }
             _ => Vec::new(),
         };
@@ -1782,8 +1805,12 @@ fn secure_remove_targets(module_id: &str) -> Result<Vec<String>> {
         );
         return Ok(targets);
     }
+    let assessed = current_audit_assessment()?;
     ensure!(
-        module_audit_log::module_requires_secure_removal(audit_root, module_id)?,
+        assessed
+            .assessment
+            .module(module_id)
+            .is_some_and(|module| module.disposition.requires_secure_removal()),
         "Module {module_id} does not have an unresolved audit integrity incident"
     );
     Ok(vec![module_id.to_owned()])

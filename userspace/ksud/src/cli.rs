@@ -804,7 +804,9 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
         }));
     }
 
-    let snapshot = crate::module_audit_log::verified_audit_snapshot(root)?;
+    let assessed = crate::module_response::current_audit_assessment()?;
+    let snapshot = assessed.snapshot;
+    let assessment = assessed.assessment;
     let total_modules = snapshot.histories.len();
     emit_audit_dashboard_line(&serde_json::json!({
         "type": "start",
@@ -828,18 +830,12 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
         "total_modules": total_modules,
     }))?;
 
-    let stale = crate::module_audit_log::stale_histories_from_verified(
-        &snapshot.histories,
-        std::path::Path::new(defs::MODULE_DIR),
-        std::path::Path::new(defs::MODULE_UPDATE_DIR),
-    );
     emit_audit_dashboard_line(&serde_json::json!({
         "type": "complete",
         "checkpoint": snapshot.checkpoint,
         "checkpoint_degraded": !snapshot.integrity_failures.is_empty(),
         "integrity_failures": snapshot.integrity_failures,
-        "inventory_relation": snapshot.inventory_relation,
-        "stale_histories": stale,
+        "assessment": assessment,
         "seal_status": snapshot.seal_status,
         "authorization_status": snapshot.authorization_status,
         "store_revision": snapshot.store_revision,
@@ -923,8 +919,7 @@ pub fn run() -> Result<()> {
                 Module::Install { zip } => module::install_module(&zip),
                 Module::Audit { zip, json } => crate::module_audit::print_zip_report(&zip, json),
                 Module::AuditHistory { id, json } => {
-                    let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
-                    let snapshot = crate::module_audit_log::verified_audit_snapshot(root)?;
+                    let snapshot = crate::module_response::current_audit_assessment()?.snapshot;
                     let histories = if let Some(id) = id {
                         crate::module::validate_module_id(&id)?;
                         vec![
@@ -955,20 +950,12 @@ pub fn run() -> Result<()> {
                     Ok(())
                 }
                 Module::AuditStatus { json } => {
-                    let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
-                    let statuses = crate::module_audit_log::verified_audit_snapshot(root)?
-                        .histories
-                        .into_iter()
-                        .map(|history| history.status)
-                        .collect::<Vec<_>>();
+                    let assessment = crate::module_response::current_audit_assessment()?.assessment;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&statuses)?);
+                        println!("{}", serde_json::to_string_pretty(&assessment)?);
                     } else {
-                        for status in statuses {
-                            println!(
-                                "{}: unresolved_risk={}, events={}",
-                                status.module_id, status.unresolved_risk, status.event_count
-                            );
+                        for module in assessment.modules {
+                            println!("{}: {:?}", module.module_id, module.disposition);
                         }
                     }
                     Ok(())

@@ -291,6 +291,8 @@ pub struct AuditRecoveryCondition {
 pub struct AuditRecoveryRoute {
     pub action: String,
     pub available: bool,
+    #[serde(default)]
+    pub ready: bool,
     pub destructive: bool,
     pub conditions: Vec<AuditRecoveryCondition>,
 }
@@ -523,6 +525,7 @@ pub struct VerifiedAuditSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg(test)]
 pub struct DashboardCheckpointSnapshot {
     pub checkpoint: CheckpointPayload,
     pub integrity_failures: Vec<SealedIntegrityFailure>,
@@ -880,27 +883,6 @@ fn incident_cause_from_legacy_reason(reason: &str) -> AuditIncidentCause {
     }
 }
 
-fn recovery_route(
-    action: AuditAction,
-    destructive: bool,
-    conditions: &[(&str, AuditRecoveryRequirementState)],
-) -> AuditRecoveryRoute {
-    AuditRecoveryRoute {
-        action: action.route_name().to_owned(),
-        available: !conditions
-            .iter()
-            .any(|(_, state)| *state == AuditRecoveryRequirementState::Unsatisfied),
-        destructive,
-        conditions: conditions
-            .iter()
-            .map(|(kind, state)| AuditRecoveryCondition {
-                kind: (*kind).to_owned(),
-                state: *state,
-            })
-            .collect(),
-    }
-}
-
 fn incident_statuses(events: &[AuthenticatedEvent]) -> Vec<AuditIncidentStatus> {
     let last_secure_removal = events
         .iter()
@@ -937,38 +919,6 @@ fn incident_statuses(events: &[AuthenticatedEvent]) -> Vec<AuditIncidentStatus> 
             } else {
                 AuditIncidentState::Detected
             };
-            let recovery_routes = match state {
-                AuditIncidentState::Detected => vec![recovery_route(
-                    AuditAction::SecureRemove,
-                    true,
-                    &[
-                        ("kernel_safe_mode", AuditRecoveryRequirementState::Required),
-                        (
-                            "manager_authorization",
-                            AuditRecoveryRequirementState::Required,
-                        ),
-                        (
-                            "module_content_present",
-                            AuditRecoveryRequirementState::Required,
-                        ),
-                    ],
-                )],
-                AuditIncidentState::Resolved => vec![recovery_route(
-                    AuditAction::CloseIncident,
-                    false,
-                    &[
-                        (
-                            "incident_resolved",
-                            AuditRecoveryRequirementState::Satisfied,
-                        ),
-                        (
-                            "manager_authorization",
-                            AuditRecoveryRequirementState::Required,
-                        ),
-                    ],
-                )],
-                AuditIncidentState::Closed => Vec::new(),
-            };
             Some(AuditIncidentStatus {
                 incident_id,
                 cause: if cause.is_unknown() {
@@ -981,7 +931,7 @@ fn incident_statuses(events: &[AuthenticatedEvent]) -> Vec<AuditIncidentStatus> 
                 corrupted_from_sequence: *corrupted_from_sequence,
                 detail: reason.clone(),
                 quarantine_path: quarantine.clone(),
-                recovery_routes,
+                recovery_routes: Vec::new(),
             })
         })
         .collect()
@@ -1011,21 +961,7 @@ fn sealed_failure_incident(
         corrupted_from_sequence: failure.corrupted_from_sequence,
         detail: failure.reason.clone(),
         quarantine_path: failure.unexpected_paths.join(", "),
-        recovery_routes: vec![recovery_route(
-            AuditAction::RecoverSealed,
-            false,
-            &[
-                ("kernel_safe_mode", AuditRecoveryRequirementState::Required),
-                (
-                    "manager_seal_verified",
-                    AuditRecoveryRequirementState::Satisfied,
-                ),
-                (
-                    "manager_authorization",
-                    AuditRecoveryRequirementState::Required,
-                ),
-            ],
-        )],
+        recovery_routes: Vec::new(),
     }
 }
 
@@ -1143,7 +1079,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
     })
 }
 
-#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+#[cfg(test)]
 pub fn module_requires_secure_removal(root: &Path, module_id: &str) -> Result<bool> {
     validate_module_id(module_id)?;
     if !module_path(root, module_id).exists() {
@@ -1161,7 +1097,7 @@ pub fn module_requires_secure_removal(root: &Path, module_id: &str) -> Result<bo
 /// Unlike `module_requires_secure_removal`, this remains usable when a Manager-sealed
 /// event itself is damaged: the signed seal is then the evidence authorizing a
 /// fail-closed containment response.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+#[cfg(test)]
 pub fn module_requires_containment(root: &Path, module_id: &str) -> Result<bool> {
     validate_module_id(module_id)?;
     let snapshot = verified_audit_snapshot(root)?;
@@ -2662,6 +2598,7 @@ fn checkpoint_inventory_matches(left: &CheckpointPayload, right: &CheckpointPayl
 /// Verify the Manager seal and every module history against one locked audit
 /// store snapshot. The revision guard retries transient direct filesystem
 /// changes from writers that do not participate in the audit lock protocol.
+#[cfg(test)]
 pub fn containment_inventory_snapshot(
     root: &Path,
 ) -> Result<(SealedIntegrityStatus, Vec<ModuleAuditStatus>)> {
@@ -2716,6 +2653,7 @@ fn retry_verified_snapshot<T>(
 /// A damaged sealed history cannot produce a current checkpoint. In that case
 /// the verified Manager-sealed payload remains the only trusted inventory base
 /// and is returned solely to support fail-closed incident recovery.
+#[cfg(test)]
 pub fn dashboard_checkpoint_snapshot(root: &Path) -> Result<DashboardCheckpointSnapshot> {
     let snapshot = verified_audit_snapshot(root)?;
     Ok(DashboardCheckpointSnapshot {

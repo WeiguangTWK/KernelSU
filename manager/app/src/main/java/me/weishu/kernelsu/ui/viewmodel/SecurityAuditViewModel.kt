@@ -17,10 +17,13 @@ import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.AuditCheckpointTrust
 import me.weishu.kernelsu.security.AuditCheckpointVerification
 import me.weishu.kernelsu.security.AuditDashboardCache
+import me.weishu.kernelsu.security.AuditAssessment
 import me.weishu.kernelsu.security.AuditInventoryRelation
+import me.weishu.kernelsu.security.AuditModuleDisposition
 import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
 import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.security.parseModuleAuditResponseStatus
+import me.weishu.kernelsu.security.parseAuditAssessment
 import me.weishu.kernelsu.security.requiresAuditSealCommit
 import me.weishu.kernelsu.security.sealModuleAuditSession
 import me.weishu.kernelsu.ui.screen.securityaudit.AuditHistory
@@ -223,20 +226,35 @@ class SecurityAuditViewModel : ViewModel() {
                         checkpoint = checkpoint,
                         initialized = false,
                         authorizationReady = false,
+                        assessment = null,
                         sealedRecoveryModuleIds = emptyList(),
                         emergencyStatus = responseStatus.emergency,
                         storeRevision = completion.getString("store_revision"),
                         error = null,
                     )
                 }
-                val inventoryRelation = AuditInventoryRelation.fromWireName(
-                    completion.getString("inventory_relation")
-                )
+                val assessment = parseAuditAssessment(completion.getJSONObject("assessment"))
+                check(assessment.snapshotRevision == completion.getString("store_revision")) {
+                    "Audit assessment revision does not match its snapshot"
+                }
+                check(assessment.unauditedModuleIds.isEmpty()) {
+                    "Installed modules are missing from the verified audit inventory: " +
+                        assessment.unauditedModuleIds.joinToString()
+                }
+                check(assessment.unsealedModuleIds.isEmpty()) {
+                    "Module audit histories are not Manager-sealed: " +
+                        assessment.unsealedModuleIds.joinToString()
+                }
+                val rawCheckpointObject = completion.getJSONObject("checkpoint")
+                check(assessment.inventoryHash == rawCheckpointObject.getString("inventory_hash")) {
+                    "Audit assessment inventory does not match its checkpoint"
+                }
+                val inventoryRelation = assessment.inventoryRelation
                 val checkpointDegraded = completion.optBoolean("checkpoint_degraded", false)
                 check(checkpointDegraded == (inventoryRelation == AuditInventoryRelation.SealedDamage)) {
                     "Audit snapshot relation does not match its integrity state"
                 }
-                val rawCheckpoint = completion.getJSONObject("checkpoint").toString()
+                val rawCheckpoint = rawCheckpointObject.toString()
                 val sealStatus = completion.getJSONObject("seal_status")
                 val authorizationStatus = completion.getJSONObject("authorization_status")
                 val sealedEnvelopeHash = sealStatus.optString("seal_hash")
@@ -263,7 +281,10 @@ class SecurityAuditViewModel : ViewModel() {
                         recoverableModules = recoverableModules,
                     )
                 }
-                val sealedRecoveryModuleIds = checkpoint.recoverableModules
+                val sealedRecoveryModuleIds = assessment.sealedRecoveryModuleIds
+                check(sealedRecoveryModuleIds.toSet() == checkpoint.recoverableModules.toSet()) {
+                    "Audit assessment recovery set does not match the verified checkpoint"
+                }
                 val histories = sortedHistories(
                     parseAuditHistories(stream.rawHistories).map { history ->
                         history.copy(
@@ -273,7 +294,7 @@ class SecurityAuditViewModel : ViewModel() {
                         )
                     }
                 )
-                val staleModuleIds = completion.getJSONArray("stale_histories").moduleIds()
+                val staleModuleIds = assessment.staleModuleIds
                 val authorizationResult = if (
                     checkpoint.trust == AuditCheckpointTrust.Initialized ||
                     checkpoint.trust == AuditCheckpointTrust.Verified
@@ -312,6 +333,7 @@ class SecurityAuditViewModel : ViewModel() {
                     staleModuleIds = staleModuleIds,
                     checkpoint = checkpoint,
                     authorizationReady = sealResult.getOrDefault(false),
+                    assessment = assessment,
                     sealedRecoveryModuleIds = sealedRecoveryModuleIds,
                     emergencyStatus = responseStatus.emergency,
                     storeRevision = completion.getString("store_revision"),
@@ -333,10 +355,11 @@ class SecurityAuditViewModel : ViewModel() {
                         ?.detail,
                     recoverableModuleIds = result.checkpoint.recoverableModules,
                     sealedRecoveryModuleIds = result.sealedRecoveryModuleIds,
-                    recoverySafeMode = recoverySafeMode,
+                    recoverySafeMode = result.assessment?.kernelSafeMode ?: recoverySafeMode,
                     auditInitialized = result.initialized,
                     keyProtection = result.checkpoint.protection,
                     auditAuthorizationReady = result.authorizationReady,
+                    assessment = result.assessment,
                     emergencyStatus = result.emergencyStatus,
                     errorMessage = result.error?.let {
                         it.message ?: it::class.java.simpleName
@@ -377,6 +400,7 @@ class SecurityAuditViewModel : ViewModel() {
         val checkpoint: AuditCheckpointVerification,
         val initialized: Boolean = true,
         val authorizationReady: Boolean,
+        val assessment: AuditAssessment?,
         val sealedRecoveryModuleIds: List<String>,
         val emergencyStatus: AuditEmergencyStatus?,
         val storeRevision: String,
@@ -580,8 +604,13 @@ class SecurityAuditViewModel : ViewModel() {
     }
 
     fun containForSecureRemoval(moduleId: String, onContained: () -> Unit) {
-        val history = _uiState.value.histories.firstOrNull { it.status.moduleId == moduleId }
-        if (history?.status?.unresolvedRisk != true || moduleId in _uiState.value.staleModuleIds) {
+        val module = _uiState.value.assessment?.module(moduleId)
+        if (
+            module?.disposition !in setOf(
+                AuditModuleDisposition.SecureRemovalRequired,
+                AuditModuleDisposition.SealedRecoveryRequired,
+            ) || module?.secureRemovalRoute?.available != true
+        ) {
             return
         }
         viewModelScope.launch {
@@ -606,8 +635,7 @@ class SecurityAuditViewModel : ViewModel() {
         var sealedRecoveryModuleIds = emptyList<String>()
         while (true) {
             val state = _uiState.value
-            val canRecoverSealedDamage =
-                state.checkpointCompromised && moduleId in state.sealedRecoveryModuleIds
+            val assessmentRecoveryIds = state.assessment?.sealedRecoveryModuleIds.orEmpty()
             if (!state.canSecurelyRemove(moduleId)) {
                 _uiState.update {
                     it.copy(
@@ -618,8 +646,10 @@ class SecurityAuditViewModel : ViewModel() {
                 }
                 return
             }
-            sealedRecoveryModuleIds = if (canRecoverSealedDamage) {
-                state.sealedRecoveryModuleIds
+            sealedRecoveryModuleIds = if (
+                moduleId in assessmentRecoveryIds
+            ) {
+                assessmentRecoveryIds
             } else {
                 emptyList()
             }
@@ -679,7 +709,7 @@ class SecurityAuditViewModel : ViewModel() {
             ?.firstOrNull { it.incidentId == incidentId }
         if (
             incident?.state != "resolved" ||
-            incident.recoveryRoutes.none { it.action == "close_incident" && it.available } ||
+            incident.recoveryRoutes.none { it.action == "close_incident" && it.ready } ||
             _uiState.value.auditMutationBlocked ||
             _uiState.value.closingIncidentId != null
         ) return
@@ -712,7 +742,7 @@ class SecurityAuditViewModel : ViewModel() {
             ?.firstOrNull { it.entryId == entryId }
         if (
             entry?.recoveryRoutes?.none {
-                it.action == "delete_quarantined_script" && it.available
+                it.action == "delete_quarantined_script" && it.ready
             } != false ||
             _uiState.value.auditMutationBlocked ||
             _uiState.value.deletingScriptEntryId != null
@@ -748,7 +778,7 @@ class SecurityAuditViewModel : ViewModel() {
             ?.firstOrNull { it.entryId == entryId }
         if (
             entry?.recoveryRoutes?.none {
-                it.action == "retry_script_containment" && it.available
+                it.action == "retry_script_containment" && it.ready
             } != false ||
             _uiState.value.auditMutationBlocked ||
             _uiState.value.retryingScriptEntryId != null

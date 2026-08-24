@@ -30,6 +30,8 @@ import me.weishu.kernelsu.data.repository.SettingsRepository
 import me.weishu.kernelsu.data.repository.SettingsRepositoryImpl
 import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.ModuleAuditResponseStatus
+import me.weishu.kernelsu.security.AuditModuleDisposition
+import me.weishu.kernelsu.security.parseAuditAssessment
 import me.weishu.kernelsu.security.parseModuleAuditResponseStatus
 import me.weishu.kernelsu.ui.component.SearchStatus
 import me.weishu.kernelsu.ui.screen.module.ModuleConfirmDialogState
@@ -38,8 +40,7 @@ import me.weishu.kernelsu.ui.screen.module.ModuleEffect
 import me.weishu.kernelsu.ui.screen.module.ModuleUiState
 import me.weishu.kernelsu.ui.util.PinyinUtil
 import me.weishu.kernelsu.ui.util.hasMagisk
-import me.weishu.kernelsu.ui.util.getModuleAuditStatuses
-import me.weishu.kernelsu.ui.util.getModuleAuditRecoveryStatus
+import me.weishu.kernelsu.ui.util.getModuleAuditAssessment
 import me.weishu.kernelsu.ui.util.getModuleAuditResponseStatus
 import me.weishu.kernelsu.ui.util.module.fetchModuleDetail
 import me.weishu.kernelsu.ui.util.module.fetchReleaseDescriptionHtml
@@ -252,33 +253,18 @@ class ModuleViewModel(
             }
             val restricted: Pair<Set<String>, Map<String, String>> =
                 runCatching<Pair<Set<String>, Map<String, String>>> {
-                    val statuses = JSONArray(getModuleAuditStatuses())
-                    val ids = mutableSetOf<String>()
-                    val states = mutableMapOf<String, String>()
-                    (0 until statuses.length()).forEach { index ->
-                        val status = statuses.getJSONObject(index)
-                        if (status.getBoolean("unresolved_risk")) {
-                            val id = status.getString("module_id")
-                            ids += id
-                            status.optString("containment_state")
-                                .takeIf(String::isNotBlank)
-                                ?.let { states[id] = it }
-                        }
+                    val assessment = parseAuditAssessment(getModuleAuditAssessment())
+                    val restrictedModules = assessment.modules.filter { module ->
+                        module.disposition == AuditModuleDisposition.SecureRemovalRequired ||
+                            module.disposition == AuditModuleDisposition.SealedRecoveryRequired
                     }
-                    ids to states
-                }.getOrElse { recoveryError ->
-                    Log.e(TAG, "load secure module dispositions: ", recoveryError)
-                    runCatching<Pair<Set<String>, Map<String, String>>> {
-                        val failures = JSONObject(getModuleAuditRecoveryStatus())
-                            .getJSONArray("failures")
-                        val ids = (0 until failures.length()).mapTo(mutableSetOf()) { index ->
-                            failures.getJSONObject(index).getString("module_id")
-                        }
-                        ids to emptyMap<String, String>()
-                    }.getOrElse { sealedRecoveryError ->
-                        Log.e(TAG, "load sealed audit recovery dispositions: ", sealedRecoveryError)
-                        emptySet<String>() to emptyMap<String, String>()
-                    }
+                    restrictedModules.mapTo(mutableSetOf()) { it.moduleId } to
+                        restrictedModules.mapNotNull { module ->
+                            module.containmentState?.let { module.moduleId to it }
+                        }.toMap()
+                }.getOrElse { assessmentError ->
+                    Log.e(TAG, "load module audit assessment: ", assessmentError)
+                    emptySet<String>() to emptyMap<String, String>()
                 }
             Triple(modules, restricted.first, restricted.second)
         }
