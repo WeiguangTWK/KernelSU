@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -30,6 +31,7 @@ import me.weishu.kernelsu.data.repository.SettingsRepository
 import me.weishu.kernelsu.data.repository.SettingsRepositoryImpl
 import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.security.ModuleAuditResponseStatus
+import me.weishu.kernelsu.security.AuditTransactionCommits
 import me.weishu.kernelsu.security.AuditModuleDisposition
 import me.weishu.kernelsu.security.parseAuditAssessment
 import me.weishu.kernelsu.security.parseModuleAuditResponseStatus
@@ -95,6 +97,12 @@ class ModuleViewModel(
 
     init {
         viewModelScope.launchSearchQueryCollector(searchQuery, ::applySearchText)
+        viewModelScope.launch {
+            AuditTransactionCommits.commits.collect {
+                isNeedRefresh = true
+                fetchModuleList(checkUpdate = false, resort = false)
+            }
+        }
     }
 
     fun markNeedRefresh() {

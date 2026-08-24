@@ -1126,11 +1126,14 @@ pub fn run() -> Result<()> {
                     authorization,
                 } => {
                     let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
-                    crate::module_response::secure_remove(&id, &authorization)?;
+                    let receipt = crate::module_response::secure_remove(&id, &authorization)?;
                     if json {
                         println!(
-                            "{{\"module_id\":{},\"removed\":true}}",
-                            serde_json::to_string(&id)?
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "transaction": receipt,
+                                "result": { "module_id": id, "removed": true },
+                            }))?
                         );
                     } else {
                         println!("- Securely removed module {id}");
@@ -1143,10 +1146,16 @@ pub fn run() -> Result<()> {
                     authorization,
                 } => {
                     let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
-                    let status =
+                    let (status, receipt) =
                         crate::module_response::recover_manager_sealed_audit(&id, &authorization)?;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&status)?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "transaction": receipt,
+                                "result": status,
+                            }))?
+                        );
                     } else {
                         println!("- Rebuilt Manager-sealed audit history for {id}");
                     }
@@ -1158,13 +1167,19 @@ pub fn run() -> Result<()> {
                     authorization,
                 } => {
                     let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
-                    let status = crate::module_audit_log::close_incident(
+                    let (status, receipt) = crate::module_audit_log::close_incident(
                         std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),
                         &id,
                         &incident,
                         &authorization,
                     )?;
-                    println!("{}", serde_json::to_string_pretty(&status)?);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "transaction": receipt,
+                            "result": status,
+                        }))?
+                    );
                     Ok(())
                 }
                 Module::AuditDeleteQuarantinedScript {
@@ -1172,10 +1187,14 @@ pub fn run() -> Result<()> {
                     authorization,
                 } => {
                     let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
-                    crate::module_response::delete_quarantined_script(&entry, &authorization)?;
+                    let receipt =
+                        crate::module_response::delete_quarantined_script(&entry, &authorization)?;
                     println!(
                         "{}",
-                        serde_json::json!({ "entry_id": entry, "deleted": true })
+                        serde_json::json!({
+                            "transaction": receipt,
+                            "result": { "entry_id": entry, "deleted": true },
+                        })
                     );
                     Ok(())
                 }
@@ -1184,13 +1203,16 @@ pub fn run() -> Result<()> {
                     authorization,
                 } => {
                     let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
-                    crate::module_response::retry_quarantined_script_containment(
+                    let receipt = crate::module_response::retry_quarantined_script_containment(
                         &entry,
                         &authorization,
                     )?;
                     println!(
                         "{}",
-                        serde_json::json!({ "entry_id": entry, "contained": true })
+                        serde_json::json!({
+                            "transaction": receipt,
+                            "result": { "entry_id": entry, "contained": true },
+                        })
                     );
                     Ok(())
                 }

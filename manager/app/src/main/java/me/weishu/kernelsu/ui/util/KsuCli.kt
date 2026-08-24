@@ -20,6 +20,8 @@ import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.BuildConfig
 import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.ksuApp
+import me.weishu.kernelsu.security.AuditTransactionReceipt
+import me.weishu.kernelsu.security.parseAuditTransactionReceipt
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -357,13 +359,16 @@ suspend fun getModuleAuditRecoveryStatus(): String = withContext(Dispatchers.IO)
     )
 }
 
-suspend fun recoverManagerSealedAudit(moduleId: String, authorization: String): String =
+suspend fun recoverManagerSealedAudit(
+    moduleId: String,
+    authorization: String,
+): AuditTransactionReceipt =
     withContext(Dispatchers.IO) {
         check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
         check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
             "Invalid Manager audit authorization token"
         }
-        runModuleAuditCommand(
+        runAuditTransactionCommand(
             "audit-recover-sealed $moduleId --json --authorization $authorization",
             "Unable to recover Manager-sealed audit history",
         )
@@ -395,23 +400,16 @@ suspend fun commitModuleAuditSeal(envelopeHex: String): String = withContext(Dis
     }
 }
 
-suspend fun rescanInstalledModules(authorization: String): String = withContext(Dispatchers.IO) {
+suspend fun rescanInstalledModules(
+    authorization: String,
+): AuditTransactionReceipt = withContext(Dispatchers.IO) {
     check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
         "Invalid Manager audit authorization token"
     }
-    val stdout = ArrayList<String>()
-    val stderr = ArrayList<String>()
-    val result = getRootShell().newJob()
-        .add(
-            "${getKsuDaemonPath()} module audit-rescan --json " +
-                "--authorization $authorization"
-        )
-        .to(stdout, stderr)
-        .exec()
-    check(result.isSuccess) {
-        stderr.joinToString("\n").ifBlank { "Unable to rescan installed modules" }
-    }
-    stdout.joinToString("\n").ifBlank { "[]" }
+    runAuditTransactionCommand(
+        "audit-rescan --json --authorization $authorization",
+        "Unable to rescan installed modules",
+    )
 }
 
 suspend fun getStaleModuleAuditHistories(): String = withContext(Dispatchers.IO) {
@@ -427,24 +425,17 @@ suspend fun getStaleModuleAuditHistories(): String = withContext(Dispatchers.IO)
     stdout.joinToString("\n").ifBlank { "[]" }
 }
 
-suspend fun pruneStaleModuleAuditHistories(authorization: String): String =
+suspend fun pruneStaleModuleAuditHistories(
+    authorization: String,
+): AuditTransactionReceipt =
     withContext(Dispatchers.IO) {
         check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
             "Invalid Manager audit authorization token"
         }
-        val stdout = ArrayList<String>()
-        val stderr = ArrayList<String>()
-        val result = getRootShell().newJob()
-            .add(
-                "${getKsuDaemonPath()} module audit-prune --json " +
-                    "--authorization $authorization"
-            )
-            .to(stdout, stderr)
-            .exec()
-        check(result.isSuccess) {
-            stderr.joinToString("\n").ifBlank { "Unable to clear stale module audit histories" }
-        }
-        stdout.joinToString("\n").ifBlank { "[]" }
+        runAuditTransactionCommand(
+            "audit-prune --json --authorization $authorization",
+            "Unable to clear stale module audit histories",
+        )
     }
 
 suspend fun containModuleForSecureRemoval(moduleId: String): String = withContext(Dispatchers.IO) {
@@ -455,13 +446,16 @@ suspend fun containModuleForSecureRemoval(moduleId: String): String = withContex
     )
 }
 
-suspend fun securelyRemoveModule(moduleId: String, authorization: String): String =
+suspend fun securelyRemoveModule(
+    moduleId: String,
+    authorization: String,
+): AuditTransactionReceipt =
     withContext(Dispatchers.IO) {
         check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
         check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
             "Invalid Manager audit authorization token"
         }
-        runModuleAuditCommand(
+        runAuditTransactionCommand(
             "audit-secure-remove $moduleId --json --authorization $authorization",
             "Unable to securely remove untrusted module",
         )
@@ -478,7 +472,7 @@ suspend fun closeModuleAuditIncident(
     moduleId: String,
     incidentId: String,
     authorization: String,
-): String = withContext(Dispatchers.IO) {
+): AuditTransactionReceipt = withContext(Dispatchers.IO) {
     check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
     check(incidentId.length == 64 && incidentId.all { it.isLowerHexDigit() }) {
         "Invalid audit incident id"
@@ -486,7 +480,7 @@ suspend fun closeModuleAuditIncident(
     check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
         "Invalid Manager audit authorization token"
     }
-    runModuleAuditCommand(
+    runAuditTransactionCommand(
         "audit-close-incident $moduleId --incident $incidentId --authorization $authorization",
         "Unable to close module audit incident",
     )
@@ -495,14 +489,14 @@ suspend fun closeModuleAuditIncident(
 suspend fun deleteQuarantinedAuditScript(
     entryId: String,
     authorization: String,
-): String = withContext(Dispatchers.IO) {
+): AuditTransactionReceipt = withContext(Dispatchers.IO) {
     check(entryId.length == 64 && entryId.all { it.isLowerHexDigit() }) {
         "Invalid quarantined script entry id"
     }
     check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
         "Invalid Manager audit authorization token"
     }
-    runModuleAuditCommand(
+    runAuditTransactionCommand(
         "audit-delete-quarantined-script $entryId --authorization $authorization",
         "Unable to delete quarantined startup script",
     )
@@ -511,14 +505,14 @@ suspend fun deleteQuarantinedAuditScript(
 suspend fun retryQuarantinedAuditScriptContainment(
     entryId: String,
     authorization: String,
-): String = withContext(Dispatchers.IO) {
+): AuditTransactionReceipt = withContext(Dispatchers.IO) {
     check(entryId.length == 64 && entryId.all { it.isLowerHexDigit() }) {
         "Invalid quarantined script entry id"
     }
     check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
         "Invalid Manager audit authorization token"
     }
-    runModuleAuditCommand(
+    runAuditTransactionCommand(
         "audit-retry-script-containment $entryId --authorization $authorization",
         "Unable to retry startup script containment",
     )
@@ -534,6 +528,12 @@ private fun runModuleAuditCommand(command: String, fallbackError: String): Strin
     check(result.isSuccess) { stderr.joinToString("\n").ifBlank { fallbackError } }
     return stdout.joinToString("\n").also { check(it.isNotBlank()) }
 }
+
+private fun runAuditTransactionCommand(
+    command: String,
+    fallbackError: String,
+): AuditTransactionReceipt =
+    parseAuditTransactionReceipt(runModuleAuditCommand(command, fallbackError))
 
 private fun Char.isLowerHexDigit(): Boolean = this in '0'..'9' || this in 'a'..'f'
 

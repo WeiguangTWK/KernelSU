@@ -4,6 +4,7 @@ use crate::{
     assets, defs, ksucalls, metamodule, module_audit,
     module_audit_action::AuditAction,
     module_audit_log,
+    module_audit_transaction::{self, AuditTransaction},
     restorecon::{restore_syscon, setsyscon},
     sepolicy,
 };
@@ -1069,25 +1070,22 @@ struct InstalledAuditScanResult {
 
 pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
     let targets = audit_rescan_targets()?;
-    let arguments_hash =
-        module_audit_log::manager_operation_arguments_hash(AuditAction::Rescan, &targets)?;
-    let operation = module_audit_log::begin_manager_audit_operation(
+    let arguments_hash = module_audit_transaction::arguments_hash(AuditAction::Rescan, &targets)?;
+    let mut transaction = AuditTransaction::begin(
         Path::new(defs::MODULE_AUDIT_DIR),
         authorization,
         AuditAction::Rescan,
         &arguments_hash,
         &targets,
     )?;
+    let pending_targets = transaction
+        .pending_targets()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let operation_id = transaction.operation_id().to_owned();
     let modules_root = Path::new(defs::MODULE_DIR);
     let mut results = Vec::new();
-    for module_id in &targets {
-        if operation
-            .completed_targets
-            .iter()
-            .any(|completed| completed == module_id)
-        {
-            continue;
-        }
+    for module_id in &pending_targets {
         if !json {
             println!("- Auditing installed module {module_id}");
         }
@@ -1108,13 +1106,17 @@ pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
         let record_error = record.as_ref().err().cloned();
         let persisted = module_audit_log::record_installed_rescan(
             Path::new(defs::MODULE_AUDIT_DIR),
-            &operation.operation_id,
+            &operation_id,
             module_id,
             record,
         );
-        let error = persisted.err().map_or(record_error, |error| {
-            Some(format!("failed to persist rescan: {error:#}"))
-        });
+        let error = match persisted {
+            Ok(_) => {
+                transaction.complete_target(module_id)?;
+                record_error
+            }
+            Err(error) => Some(format!("failed to persist rescan: {error:#}")),
+        };
         results.push(InstalledAuditScanResult {
             module_id: module_id.clone(),
             success: error.is_none(),
@@ -1122,12 +1124,15 @@ pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
             error,
         });
     }
-    module_audit_log::finish_manager_audit_operation(
-        Path::new(defs::MODULE_AUDIT_DIR),
-        &operation.operation_id,
-    )?;
+    let receipt = transaction.commit()?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&results)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "transaction": receipt,
+                "result": results,
+            }))?
+        );
     } else {
         let failed = results.iter().filter(|result| !result.success).count();
         println!(
@@ -1171,27 +1176,36 @@ pub fn prune_module_audit_histories(
     } else {
         let targets = audit_prune_targets(module_id)?;
         let arguments_hash =
-            module_audit_log::manager_operation_arguments_hash(AuditAction::Prune, &targets)?;
-        let operation = module_audit_log::begin_manager_audit_operation(
+            module_audit_transaction::arguments_hash(AuditAction::Prune, &targets)?;
+        let mut transaction = AuditTransaction::begin(
             audit_root,
             authorization.context("Manager authorization is required for audit cleanup")?,
             AuditAction::Prune,
             &arguments_hash,
             &targets,
         )?;
-        let pruned = if operation.applied {
+        let pruned = if transaction.is_committed() {
             Vec::new()
         } else {
             module_audit_log::prune_stale_histories(
                 audit_root,
                 installed_root,
                 pending_root,
-                &operation.operation_id,
+                transaction.operation_id(),
             )?
         };
-        module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)?;
+        for history in &pruned {
+            transaction.complete_target(&history.module_id)?;
+        }
+        let receipt = transaction.commit()?;
         if json {
-            println!("{}", serde_json::to_string_pretty(&pruned)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "transaction": receipt,
+                    "result": pruned,
+                }))?
+            );
         } else {
             println!("- Cleared {} stale module audit histories", pruned.len());
         }
@@ -1200,14 +1214,11 @@ pub fn prune_module_audit_histories(
 }
 
 pub fn audit_rescan_arguments_hash() -> Result<String> {
-    module_audit_log::manager_operation_arguments_hash(
-        AuditAction::Rescan,
-        &audit_rescan_targets()?,
-    )
+    module_audit_transaction::arguments_hash(AuditAction::Rescan, &audit_rescan_targets()?)
 }
 
 fn audit_rescan_targets() -> Result<Vec<String>> {
-    if let Some(targets) = module_audit_log::active_manager_audit_operation_targets(
+    if let Some(targets) = module_audit_transaction::active_targets(
         Path::new(defs::MODULE_AUDIT_DIR),
         AuditAction::Rescan,
     )? {
@@ -1217,16 +1228,12 @@ fn audit_rescan_targets() -> Result<Vec<String>> {
 }
 
 pub fn audit_prune_arguments_hash(module_id: Option<&str>) -> Result<String> {
-    module_audit_log::manager_operation_arguments_hash(
-        AuditAction::Prune,
-        &audit_prune_targets(module_id)?,
-    )
+    module_audit_transaction::arguments_hash(AuditAction::Prune, &audit_prune_targets(module_id)?)
 }
 
 fn audit_prune_targets(module_id: Option<&str>) -> Result<Vec<String>> {
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    if let Some(targets) =
-        module_audit_log::active_manager_audit_operation_targets(audit_root, AuditAction::Prune)?
+    if let Some(targets) = module_audit_transaction::active_targets(audit_root, AuditAction::Prune)?
     {
         if let Some(module_id) = module_id {
             ensure!(

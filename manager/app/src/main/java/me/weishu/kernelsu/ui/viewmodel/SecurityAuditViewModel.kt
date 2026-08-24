@@ -18,6 +18,8 @@ import me.weishu.kernelsu.security.AuditCheckpointTrust
 import me.weishu.kernelsu.security.AuditCheckpointVerification
 import me.weishu.kernelsu.security.AuditDashboardCache
 import me.weishu.kernelsu.security.AuditAssessment
+import me.weishu.kernelsu.security.AuditTransactionCommits
+import me.weishu.kernelsu.security.AuditTransactionReceipt
 import me.weishu.kernelsu.security.AuditInventoryRelation
 import me.weishu.kernelsu.security.AuditModuleDisposition
 import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
@@ -43,7 +45,6 @@ import me.weishu.kernelsu.ui.util.getModuleAuditCheckpoint
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationChallenge
 import me.weishu.kernelsu.ui.util.getModuleAuditAuthorizationStatus
 import me.weishu.kernelsu.ui.util.getModuleAuditSealStatus
-import me.weishu.kernelsu.ui.util.listModules
 import me.weishu.kernelsu.ui.util.pruneStaleModuleAuditHistories
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.recoverManagerSealedAudit
@@ -58,33 +59,84 @@ import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicLong
 
 class SecurityAuditViewModel : ViewModel() {
+    private class AuditPostCommitFailure(
+        val receipts: List<AuditTransactionReceipt>,
+        cause: Throwable,
+    ) : IllegalStateException(
+        "Audit transaction ${receipts.joinToString { it.operationId }} committed, " +
+            "but Manager synchronization failed: " +
+            (cause.message ?: cause::class.java.simpleName),
+        cause,
+    )
+
     private val _uiState = MutableStateFlow(SecurityAuditUiState())
     val uiState: StateFlow<SecurityAuditUiState> = _uiState.asStateFlow()
     private var refreshJob: Job? = null
     private val refreshGeneration = AtomicLong()
     private val checkpointStore by lazy { ModuleAuditCheckpointStore(ksuApp) }
 
-    private suspend fun <T> withAuditMutationSession(block: suspend () -> T): T {
+    private suspend fun <T> withAuditMutationSession(
+        block: suspend (String, MutableCollection<AuditTransactionReceipt>) -> T,
+    ): T {
         val session = beginAuditInstallSession(timeoutSeconds = 600)
+        val committedReceipts = mutableListOf<AuditTransactionReceipt>()
         var primaryFailure: Throwable? = null
         try {
-            val result = block()
-            sealModuleAuditSession(session)
+            val result = block(session, committedReceipts)
+            sealModuleAuditSession(session, checkpointStore)
             reconcileModuleAuditResponse()
             return result
         } catch (error: Throwable) {
-            primaryFailure = error
-            throw error
-        } finally {
-            try {
-                withContext(NonCancellable) {
-                    releaseAuditInstallSession(session)
-                }
-            } catch (releaseError: Throwable) {
-                val failure = primaryFailure
-                if (failure == null) throw releaseError
-                failure.addSuppressed(releaseError)
+            val propagated = if (
+                error is CancellationException || committedReceipts.isEmpty()
+            ) {
+                error
+            } else {
+                AuditPostCommitFailure(committedReceipts.toList(), error)
             }
+            primaryFailure = propagated
+            throw propagated
+        } finally {
+            var finalizationFailure: Throwable? = null
+            withContext(NonCancellable) {
+                runCatching {
+                    releaseAuditInstallSession(session)
+                }.onFailure { finalizationFailure = it }
+                committedReceipts
+                    .distinctBy(AuditTransactionReceipt::operationId)
+                    .forEach { receipt ->
+                        runCatching { AuditTransactionCommits.publish(receipt) }
+                            .onFailure { publishFailure ->
+                                finalizationFailure?.addSuppressed(publishFailure)
+                                    ?: run { finalizationFailure = publishFailure }
+                            }
+                    }
+            }
+            finalizationFailure?.let { error ->
+                val failure = primaryFailure
+                if (failure == null) {
+                    throw if (committedReceipts.isEmpty()) {
+                        error
+                    } else {
+                        AuditPostCommitFailure(committedReceipts.toList(), error)
+                    }
+                }
+                failure.addSuppressed(error)
+            }
+        }
+    }
+
+    private fun MutableCollection<AuditTransactionReceipt>.record(
+        receipt: AuditTransactionReceipt,
+        expectedAction: String,
+        expectedTarget: String? = null,
+    ) {
+        add(receipt)
+        check(receipt.action == expectedAction) {
+            "Audit transaction action mismatch: ${receipt.action}"
+        }
+        check(expectedTarget == null || receipt.targets == listOf(expectedTarget)) {
+            "Audit transaction target mismatch: ${receipt.targets.joinToString()}"
         }
     }
 
@@ -512,8 +564,11 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                withAuditMutationSession {
-                    recoverSealedHistories(_uiState.value.sealedRecoveryModuleIds)
+                withAuditMutationSession { _, receipts ->
+                    recoverSealedHistories(
+                        _uiState.value.sealedRecoveryModuleIds,
+                        receipts = receipts,
+                    )
                 }
             }.onFailure { error ->
                 if (error is CancellationException) throw error
@@ -547,8 +602,11 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                withAuditMutationSession {
-                    runInstalledModuleRescan(createAuthorization("rescan"))
+                withAuditMutationSession { _, receipts ->
+                    receipts.record(
+                        runInstalledModuleRescan(createAuthorization("rescan")),
+                        "rescan",
+                    )
                 }
             }.onFailure { error ->
                 if (error is CancellationException) throw error
@@ -583,8 +641,11 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             val result = runCatching {
-                withAuditMutationSession {
-                    pruneStaleModuleAuditHistories(createAuthorization("prune"))
+                withAuditMutationSession { _, receipts ->
+                    receipts.record(
+                        pruneStaleModuleAuditHistories(createAuthorization("prune")),
+                        "prune",
+                    )
                 }
             }
             result.onFailure { error ->
@@ -616,7 +677,7 @@ class SecurityAuditViewModel : ViewModel() {
         viewModelScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    withAuditMutationSession {
+                    withAuditMutationSession { _, _ ->
                         containModuleForSecureRemoval(moduleId)
                     }
                 }
@@ -671,31 +732,52 @@ class SecurityAuditViewModel : ViewModel() {
         }
         viewModelScope.launch(Dispatchers.IO) {
             val result = runCatching {
-                withAuditMutationSession {
+                withAuditMutationSession { installSession, receipts ->
                     if (sealedRecoveryModuleIds.isNotEmpty()) {
-                        recoverSealedHistories(sealedRecoveryModuleIds, trackSecureRemoval = true)
+                        recoverSealedHistories(
+                            sealedRecoveryModuleIds,
+                            trackSecureRemoval = true,
+                            receipts = receipts,
+                            nextAuthorizationSession = installSession,
+                        )
                     }
                     _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RemovingModule) }
-                    runSecureModuleRemoval(moduleId, createAuthorization("secure-remove", moduleId))
+                    receipts.record(
+                        runSecureModuleRemoval(
+                            moduleId,
+                            createAuthorization("secure-remove", moduleId),
+                        ),
+                        "secure-remove",
+                        moduleId,
+                    )
                     _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RefreshingModules) }
-                    val modules = JSONArray(listModules())
-                    check((0 until modules.length()).none { index ->
-                        modules.getJSONObject(index).optString("id") == moduleId
-                    }) {
-                        "Secure removal completed but the module is still present"
-                    }
                 }
             }
             result.onSuccess {
                 _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.Completed) }
             }.onFailure { error ->
                 if (error is CancellationException) throw error
-                _uiState.update {
-                    it.copy(
-                        secureRemovalModuleId = null,
-                        secureRemovalPhase = null,
-                        errorMessage = error.message ?: error::class.java.simpleName,
-                    )
+                val postCommitFailure = error as? AuditPostCommitFailure
+                val secureRemovalCommitted = postCommitFailure
+                    ?.receipts
+                    ?.any { receipt ->
+                        receipt.action == "secure-remove" && receipt.targets == listOf(moduleId)
+                    } == true
+                if (secureRemovalCommitted) {
+                    _uiState.update {
+                        it.copy(
+                            secureRemovalPhase = SecureRemovalPhase.Completed,
+                            errorMessage = error.message,
+                        )
+                    }
+                } else {
+                    _uiState.update {
+                        it.copy(
+                            secureRemovalModuleId = null,
+                            secureRemovalPhase = null,
+                            errorMessage = error.message ?: error::class.java.simpleName,
+                        )
+                    }
                 }
             }
         }
@@ -716,11 +798,15 @@ class SecurityAuditViewModel : ViewModel() {
         _uiState.update { it.copy(closingIncidentId = incidentId, errorMessage = null) }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                withAuditMutationSession {
-                    closeModuleAuditIncident(
+                withAuditMutationSession { _, receipts ->
+                    receipts.record(
+                        closeModuleAuditIncident(
+                            moduleId,
+                            incidentId,
+                            createAuthorization("close-incident", moduleId, incidentId),
+                        ),
+                        "close-incident",
                         moduleId,
-                        incidentId,
-                        createAuthorization("close-incident", moduleId, incidentId),
                     )
                 }
             }.onFailure { error ->
@@ -750,13 +836,17 @@ class SecurityAuditViewModel : ViewModel() {
         _uiState.update { it.copy(deletingScriptEntryId = entryId, errorMessage = null) }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                withAuditMutationSession {
-                    deleteQuarantinedAuditScript(
-                        entryId,
-                        createAuthorization(
-                            action = "delete-quarantined-script",
-                            incidentId = entryId,
+                withAuditMutationSession { _, receipts ->
+                    receipts.record(
+                        deleteQuarantinedAuditScript(
+                            entryId,
+                            createAuthorization(
+                                action = "delete-quarantined-script",
+                                incidentId = entryId,
+                            ),
                         ),
+                        "delete-quarantined-script",
+                        entryId,
                     )
                 }
             }.onFailure { error ->
@@ -786,13 +876,17 @@ class SecurityAuditViewModel : ViewModel() {
         _uiState.update { it.copy(retryingScriptEntryId = entryId, errorMessage = null) }
         viewModelScope.launch(Dispatchers.IO) {
             runCatching {
-                withAuditMutationSession {
-                    retryQuarantinedAuditScriptContainment(
-                        entryId,
-                        createAuthorization(
-                            action = "retry-script-containment",
-                            incidentId = entryId,
+                withAuditMutationSession { _, receipts ->
+                    receipts.record(
+                        retryQuarantinedAuditScriptContainment(
+                            entryId,
+                            createAuthorization(
+                                action = "retry-script-containment",
+                                incidentId = entryId,
+                            ),
                         ),
+                        "retry-script-containment",
+                        entryId,
                     )
                 }
             }.onFailure { error ->
@@ -809,6 +903,8 @@ class SecurityAuditViewModel : ViewModel() {
     private suspend fun recoverSealedHistories(
         moduleIds: List<String>,
         trackSecureRemoval: Boolean = false,
+        receipts: MutableCollection<AuditTransactionReceipt>,
+        nextAuthorizationSession: String? = null,
     ) {
         if (trackSecureRemoval) {
             _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.RecoveringAudit) }
@@ -817,7 +913,11 @@ class SecurityAuditViewModel : ViewModel() {
         for (moduleId in moduleIds) {
             val challenge = getModuleAuditAuthorizationChallenge("recover-sealed", moduleId)
             val authorization = checkpointStore.signSealedRecoveryAuthorization(challenge)
-            recoverManagerSealedAudit(moduleId, authorization)
+            receipts.record(
+                recoverManagerSealedAudit(moduleId, authorization),
+                "recover-sealed",
+                moduleId,
+            )
         }
         if (trackSecureRemoval) {
             _uiState.update { it.copy(secureRemovalPhase = SecureRemovalPhase.AnchoringAudit) }
@@ -834,6 +934,12 @@ class SecurityAuditViewModel : ViewModel() {
         }
         check(ensureAuditSeal()) {
             "Unable to anchor the recovered audit chain"
+        }
+        if (nextAuthorizationSession != null) {
+            // Committing the recovery seal consumes its pending HMAC key. A
+            // following transaction must be authorized against the resulting
+            // rotated inventory, so establish that seal before continuing.
+            sealModuleAuditSession(nextAuthorizationSession, checkpointStore)
         }
     }
 }

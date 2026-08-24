@@ -39,11 +39,20 @@ pub enum AuditOperationRecovery {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuditAuthorizationInventory {
+    /// Authorize against a fully verified current checkpoint payload.
+    CurrentCheckpoint,
+    /// Authorize recovery against the active Manager seal and its diagnosed damage.
+    ManagerSealedDamage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuditActionDescriptor {
     pub action: AuditAction,
     pub wire_name: &'static str,
     pub route_name: &'static str,
     pub challenge_target: AuditChallengeTarget,
+    pub authorization_inventory: AuditAuthorizationInventory,
     pub recovery: AuditOperationRecovery,
     pub finalizes_operation_trash: bool,
 }
@@ -54,6 +63,7 @@ const ACTION_DESCRIPTORS: [AuditActionDescriptor; 7] = [
         wire_name: "rescan",
         route_name: "rescan",
         challenge_target: AuditChallengeTarget::None,
+        authorization_inventory: AuditAuthorizationInventory::CurrentCheckpoint,
         recovery: AuditOperationRecovery::RescanEvent,
         finalizes_operation_trash: false,
     },
@@ -62,6 +72,7 @@ const ACTION_DESCRIPTORS: [AuditActionDescriptor; 7] = [
         wire_name: "prune",
         route_name: "prune",
         challenge_target: AuditChallengeTarget::OptionalModule,
+        authorization_inventory: AuditAuthorizationInventory::CurrentCheckpoint,
         recovery: AuditOperationRecovery::PruneArtifacts,
         finalizes_operation_trash: true,
     },
@@ -70,6 +81,7 @@ const ACTION_DESCRIPTORS: [AuditActionDescriptor; 7] = [
         wire_name: "secure-remove",
         route_name: "secure_remove_module",
         challenge_target: AuditChallengeTarget::Module,
+        authorization_inventory: AuditAuthorizationInventory::CurrentCheckpoint,
         recovery: AuditOperationRecovery::SecureRemovalEvent,
         finalizes_operation_trash: true,
     },
@@ -78,6 +90,7 @@ const ACTION_DESCRIPTORS: [AuditActionDescriptor; 7] = [
         wire_name: "recover-sealed",
         route_name: "recover_sealed_history",
         challenge_target: AuditChallengeTarget::Module,
+        authorization_inventory: AuditAuthorizationInventory::ManagerSealedDamage,
         recovery: AuditOperationRecovery::SealedRecoveryRecord,
         finalizes_operation_trash: false,
     },
@@ -86,6 +99,7 @@ const ACTION_DESCRIPTORS: [AuditActionDescriptor; 7] = [
         wire_name: "close-incident",
         route_name: "close_incident",
         challenge_target: AuditChallengeTarget::ModuleAndIncident,
+        authorization_inventory: AuditAuthorizationInventory::CurrentCheckpoint,
         recovery: AuditOperationRecovery::IncidentCloseEvent,
         finalizes_operation_trash: false,
     },
@@ -94,6 +108,7 @@ const ACTION_DESCRIPTORS: [AuditActionDescriptor; 7] = [
         wire_name: "delete-quarantined-script",
         route_name: "delete_quarantined_script",
         challenge_target: AuditChallengeTarget::Incident,
+        authorization_inventory: AuditAuthorizationInventory::CurrentCheckpoint,
         recovery: AuditOperationRecovery::QuarantinedScriptState,
         finalizes_operation_trash: false,
     },
@@ -102,6 +117,7 @@ const ACTION_DESCRIPTORS: [AuditActionDescriptor; 7] = [
         wire_name: "retry-script-containment",
         route_name: "retry_script_containment",
         challenge_target: AuditChallengeTarget::Incident,
+        authorization_inventory: AuditAuthorizationInventory::CurrentCheckpoint,
         recovery: AuditOperationRecovery::QuarantinedScriptState,
         finalizes_operation_trash: false,
     },
@@ -239,5 +255,16 @@ mod tests {
                 format!("\"{}\"", descriptor.wire_name)
             );
         }
+        assert_eq!(
+            AuditAction::RecoverSealed
+                .descriptor()
+                .authorization_inventory,
+            AuditAuthorizationInventory::ManagerSealedDamage
+        );
+        assert!(ACTION_DESCRIPTORS.iter().all(|descriptor| {
+            descriptor.action == AuditAction::RecoverSealed
+                || descriptor.authorization_inventory
+                    == AuditAuthorizationInventory::CurrentCheckpoint
+        }));
     }
 }

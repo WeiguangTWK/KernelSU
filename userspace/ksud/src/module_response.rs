@@ -3,6 +3,7 @@ use crate::{
     module_audit_action::AuditAction,
     module_audit_assessment::{self, AssessedAuditSnapshot, AuditAssessmentContext},
     module_audit_log,
+    module_audit_transaction::{self, AuditTransaction, AuditTransactionReceipt},
 };
 use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
@@ -215,19 +216,22 @@ pub fn quarantined_script_delete_arguments_hash(entry_id: &str) -> Result<String
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-pub fn delete_quarantined_script(entry_id: &str, authorization: &str) -> Result<()> {
+pub fn delete_quarantined_script(
+    entry_id: &str,
+    authorization: &str,
+) -> Result<AuditTransactionReceipt> {
     let arguments_hash = quarantined_script_delete_arguments_hash(entry_id)?;
     let targets = vec![entry_id.to_owned()];
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    let operation = module_audit_log::begin_manager_audit_operation(
+    let mut transaction = AuditTransaction::begin(
         audit_root,
         authorization,
         AuditAction::DeleteQuarantinedScript,
         &arguments_hash,
         &targets,
     )?;
-    if operation.applied {
-        return Ok(());
+    if transaction.is_committed() {
+        return transaction.commit();
     }
 
     let collection = read_script_quarantine_manifests(Path::new(defs::AUDIT_EMERGENCY_DIR))?;
@@ -294,13 +298,8 @@ pub fn delete_quarantined_script(entry_id: &str, authorization: &str) -> Result<
     manifest.entries[entry_index].recovery_routes.clear();
     manifest.updated_at_unix_seconds = unix_time_seconds();
     write_script_quarantine_manifest(&session, &manifest)?;
-    module_audit_log::complete_manager_audit_operation_target(
-        audit_root,
-        &operation.operation_id,
-        AuditAction::DeleteQuarantinedScript,
-        entry_id,
-    )?;
-    module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
+    transaction.complete_target(entry_id)?;
+    transaction.commit()
 }
 
 pub fn quarantined_script_retry_arguments_hash(entry_id: &str) -> Result<String> {
@@ -361,19 +360,22 @@ fn ensure_quarantined_script_route_ready(entry_id: &str, action: AuditAction) ->
     Ok(())
 }
 
-pub fn retry_quarantined_script_containment(entry_id: &str, authorization: &str) -> Result<()> {
+pub fn retry_quarantined_script_containment(
+    entry_id: &str,
+    authorization: &str,
+) -> Result<AuditTransactionReceipt> {
     let arguments_hash = quarantined_script_retry_arguments_hash(entry_id)?;
     let targets = vec![entry_id.to_owned()];
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    let operation = module_audit_log::begin_manager_audit_operation(
+    let mut transaction = AuditTransaction::begin(
         audit_root,
         authorization,
         AuditAction::RetryScriptContainment,
         &arguments_hash,
         &targets,
     )?;
-    if operation.applied {
-        return Ok(());
+    if transaction.is_committed() {
+        return transaction.commit();
     }
     let collection = read_script_quarantine_manifests(Path::new(defs::AUDIT_EMERGENCY_DIR))?;
     ensure!(
@@ -444,13 +446,8 @@ pub fn retry_quarantined_script_containment(entry_id: &str, authorization: &str)
     manifest.entries[entry_index].recovery_routes.clear();
     manifest.updated_at_unix_seconds = unix_time_seconds();
     write_script_quarantine_manifest(&session, &manifest)?;
-    module_audit_log::complete_manager_audit_operation_target(
-        audit_root,
-        &operation.operation_id,
-        AuditAction::RetryScriptContainment,
-        entry_id,
-    )?;
-    module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
+    transaction.complete_target(entry_id)?;
+    transaction.commit()
 }
 
 pub(crate) fn quarantined_script_action_completed(
@@ -1790,15 +1787,14 @@ fn collect_unattributed_persistent_scripts(
 pub fn secure_remove_arguments_hash(module_id: &str) -> Result<String> {
     module::validate_module_id(module_id)?;
     let targets = secure_remove_targets(module_id)?;
-    module_audit_log::manager_operation_arguments_hash(AuditAction::SecureRemove, &targets)
+    module_audit_transaction::arguments_hash(AuditAction::SecureRemove, &targets)
 }
 
 fn secure_remove_targets(module_id: &str) -> Result<Vec<String>> {
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    if let Some(targets) = module_audit_log::active_manager_audit_operation_targets(
-        audit_root,
-        AuditAction::SecureRemove,
-    )? {
+    if let Some(targets) =
+        module_audit_transaction::active_targets(audit_root, AuditAction::SecureRemove)?
+    {
         ensure!(
             targets == [module_id],
             "requested module does not match the active secure removal operation"
@@ -1816,7 +1812,7 @@ fn secure_remove_targets(module_id: &str) -> Result<Vec<String>> {
     Ok(vec![module_id.to_owned()])
 }
 
-pub fn secure_remove(module_id: &str, authorization: &str) -> Result<()> {
+pub fn secure_remove(module_id: &str, authorization: &str) -> Result<AuditTransactionReceipt> {
     module::validate_module_id(module_id)?;
     ensure!(
         ksucalls::try_check_kernel_safemode()
@@ -1825,17 +1821,17 @@ pub fn secure_remove(module_id: &str, authorization: &str) -> Result<()> {
     );
     let targets = secure_remove_targets(module_id)?;
     let arguments_hash =
-        module_audit_log::manager_operation_arguments_hash(AuditAction::SecureRemove, &targets)?;
+        module_audit_transaction::arguments_hash(AuditAction::SecureRemove, &targets)?;
     let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
-    let operation = module_audit_log::begin_manager_audit_operation(
+    let mut transaction = AuditTransaction::begin(
         audit_root,
         authorization,
         AuditAction::SecureRemove,
         &arguments_hash,
         &targets,
     )?;
-    if operation.applied {
-        return Ok(());
+    if transaction.is_committed() {
+        return transaction.commit();
     }
 
     let metamodule_link = Path::new(defs::METAMODULE_DIR.trim_end_matches('/'));
@@ -1847,7 +1843,7 @@ pub fn secure_remove(module_id: &str, authorization: &str) -> Result<()> {
         audit_root,
         Path::new(defs::MODULE_DIR),
         Path::new(defs::MODULE_UPDATE_DIR),
-        &operation.operation_id,
+        transaction.operation_id(),
         module_id,
     )?;
     if was_metamodule {
@@ -1858,17 +1854,18 @@ pub fn secure_remove(module_id: &str, authorization: &str) -> Result<()> {
     module::regenerate_preinit_rc()?;
     module_audit_log::complete_secure_module_removal(
         audit_root,
-        &operation.operation_id,
+        transaction.operation_id(),
         module_id,
         removed_paths,
     )?;
-    module_audit_log::finish_manager_audit_operation(audit_root, &operation.operation_id)
+    transaction.complete_target(module_id)?;
+    transaction.commit()
 }
 
 pub fn recover_manager_sealed_audit(
     module_id: &str,
     authorization: &str,
-) -> Result<module_audit_log::ModuleAuditStatus> {
+) -> Result<(module_audit_log::ModuleAuditStatus, AuditTransactionReceipt)> {
     module::validate_module_id(module_id)?;
     ensure!(
         ksucalls::try_check_kernel_safemode()

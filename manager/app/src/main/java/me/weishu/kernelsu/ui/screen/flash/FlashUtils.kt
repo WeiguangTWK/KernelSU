@@ -29,6 +29,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.ksuApp
+import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
 import me.weishu.kernelsu.security.sealModuleAuditSession
 import me.weishu.kernelsu.ui.util.FlashResult
 import me.weishu.kernelsu.ui.util.LkmSelection
@@ -103,13 +105,14 @@ suspend fun flashModulesSequentially(
     val session = runCatching { beginAuditInstallSession() }.getOrElse { error ->
         return FlashResult(1, error.message ?: "Unable to protect module installation", false)
     }
+    val checkpointStore = ModuleAuditCheckpointStore(ksuApp)
     var result = FlashResult(0, "", true)
     try {
         // Establish and seal an empty Manager-trusted baseline before the first
         // installation operation is written. Initializing after flashing would
         // correctly be rejected because an unpaired Manager must not bless
         // pre-existing operations.
-        sealModuleAuditSession(session)
+        sealModuleAuditSession(session, checkpointStore)
         val before = moduleEnabledStates()
         for (uri in uris) {
             val installed = flashModule(uri, onStdout, onStderr)
@@ -121,7 +124,7 @@ suspend fun flashModulesSequentially(
         if (result.code == 0) {
             val after = moduleEnabledStates()
             val intendedEnabled = before.filterValues { it }.keys + (after.keys - before.keys)
-            val trust = sealModuleAuditSession(session)
+            val trust = sealModuleAuditSession(session, checkpointStore)
             val restore = intendedEnabled.intersect(trust.releasableModuleIds)
             val failed = restore.filterNot { toggleModule(it, enable = true) }
             check(failed.isEmpty()) {

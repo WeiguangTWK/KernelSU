@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::module_audit_action::{AuditAction, AuditOperationRecovery};
+use crate::module_audit_action::{
+    AuditAction, AuditAuthorizationInventory, AuditOperationRecovery,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 const EVENT_SCHEMA_VERSION: u32 = 2;
@@ -471,10 +473,13 @@ impl AuditOperationRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthorizedAuditOperation {
+pub(crate) struct AuthorizedAuditOperation {
     pub operation_id: String,
+    pub targets: Vec<String>,
     pub completed_targets: Vec<String>,
+    pub base_inventory_hash: String,
     pub applied: bool,
+    pub replayed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -761,7 +766,7 @@ pub fn record_installed_rescan(
     validate_sha256_hex(operation_id, "operation id")?;
     validate_module_id(module_id)?;
     let key = load_key(root, false)?;
-    let mut operation = read_operation(root, operation_id, &key)?
+    let operation = read_operation(root, operation_id, &key)?
         .context("rescan audit operation is unavailable")?;
     ensure!(
         operation.action == AuditAction::Rescan && operation.state == AuditOperationState::Applying,
@@ -811,15 +816,11 @@ pub fn record_installed_rescan(
     if !already_recorded {
         append_event(root, module_id, kind)?;
     }
-    operation.completed_targets.push(module_id.to_owned());
-    operation.completed_targets.sort();
-    operation.updated_at_unix_seconds = now();
-    write_record(&operation_path(root, operation_id), operation, &key)?;
     verify_module_unlocked(root, module_id, true)
 }
 
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-pub fn finish_manager_audit_operation(root: &Path, operation_id: &str) -> Result<()> {
+pub(crate) fn finish_manager_audit_operation(root: &Path, operation_id: &str) -> Result<()> {
     validate_sha256_hex(operation_id, "operation id")?;
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
@@ -837,7 +838,7 @@ pub fn finish_manager_audit_operation(root: &Path, operation_id: &str) -> Result
     write_record(&operation_path(root, operation_id), operation, &key)
 }
 
-pub fn complete_manager_audit_operation_target(
+pub(crate) fn complete_manager_audit_operation_target(
     root: &Path,
     operation_id: &str,
     expected_action: AuditAction,
@@ -851,10 +852,21 @@ pub fn complete_manager_audit_operation_target(
     ensure!(
         operation.action == expected_action
             && operation.state == AuditOperationState::Applying
-            && operation.targets == [target],
+            && operation
+                .targets
+                .iter()
+                .any(|candidate| candidate == target),
         "audit operation target does not match"
     );
-    operation.completed_targets = vec![target.to_owned()];
+    if operation
+        .completed_targets
+        .iter()
+        .any(|completed| completed == target)
+    {
+        return Ok(());
+    }
+    operation.completed_targets.push(target.to_owned());
+    operation.completed_targets.sort();
     operation.updated_at_unix_seconds = now();
     write_record(&operation_path(root, operation_id), operation, &key)
 }
@@ -1523,10 +1535,6 @@ pub fn prune_stale_histories(
                 .with_context(|| format!("quarantine risk record for {module_id}"))?;
             sync_dir(risk.parent().context("risk record has no parent")?)?;
         }
-        operation.completed_targets.push(module_id.clone());
-        operation.completed_targets.sort();
-        operation.updated_at_unix_seconds = now();
-        write_record(&operation_path(root, operation_id), operation.clone(), &key)?;
         pruned.push(PrunedAuditHistory {
             module_id,
             removed_event_count: tombstone.previous_event_count,
@@ -1619,7 +1627,7 @@ pub fn complete_secure_module_removal(
     );
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
-    let mut operation = read_operation(root, operation_id, &key)?
+    let operation = read_operation(root, operation_id, &key)?
         .context("secure removal audit operation is unavailable")?;
     ensure!(
         operation.action == AuditAction::SecureRemove
@@ -1648,9 +1656,6 @@ pub fn complete_secure_module_removal(
         )?;
     }
     clear_completed_containment_state(root, module_id, &key)?;
-    operation.completed_targets = vec![module_id.to_owned()];
-    operation.updated_at_unix_seconds = now();
-    write_record(&operation_path(root, operation_id), operation, &key)?;
     verify_module_unlocked(root, module_id, true)
 }
 
@@ -1946,8 +1951,7 @@ fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
                     operation_rescan_event_exists(root, target, &operation.operation_id, key)?
                 }
                 AuditOperationRecovery::PruneArtifacts => {
-                    operation_trash_path(root, &operation.operation_id, target).exists()
-                        && operation_tombstone_path(root, target, &operation.operation_id).exists()
+                    recover_prune_completion(root, target, &operation.operation_id)?
                 }
                 AuditOperationRecovery::SecureRemovalEvent => {
                     recover_secure_removal_completion(root, target, &operation.operation_id, key)?
@@ -1981,6 +1985,32 @@ fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn recover_prune_completion(root: &Path, module_id: &str, operation_id: &str) -> Result<bool> {
+    let live = module_path(root, module_id);
+    let trash = operation_trash_path(root, operation_id, module_id);
+    let tombstone = operation_tombstone_path(root, module_id, operation_id);
+    if !trash.exists() || !tombstone.exists() {
+        return Ok(false);
+    }
+    ensure!(
+        !live.exists(),
+        "cleanup recovery found both live and quarantined audit histories"
+    );
+    let risk = risk_path(root, module_id);
+    let trash_risk = trash.join("risk.json");
+    if risk.exists() {
+        ensure!(
+            !trash_risk.exists(),
+            "cleanup recovery found duplicate risk records"
+        );
+        std::fs::rename(&risk, &trash_risk)
+            .with_context(|| format!("finish quarantining risk record for {module_id}"))?;
+        sync_dir(risk.parent().context("risk record has no parent")?)?;
+        sync_dir(&trash)?;
+    }
+    Ok(true)
 }
 
 fn operation_rescan_event_exists(
@@ -2085,13 +2115,12 @@ fn operation_incident_close_exists(
 }
 
 #[allow(dead_code)]
-pub fn active_manager_audit_operation_targets(
+pub(crate) fn active_manager_audit_operation_targets(
     root: &Path,
     action: AuditAction,
 ) -> Result<Option<Vec<String>>> {
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
-    recover_operation_progress(root, &key)?;
     let active = read_operation_records(root, &key)?
         .into_iter()
         .filter(|operation| {
@@ -3640,7 +3669,6 @@ pub fn manager_audit_auth_challenge(
     validate_sha256_hex(arguments_hash, "arguments hash")?;
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
-    recover_operation_progress(root, &key)?;
     let registry = read_manager_auth_registry(root, &key)?
         .context("Manager audit authorization key is not configured")?;
     let checkpoint = checkpoint_payload_readonly_unlocked(root, &key)?;
@@ -3739,7 +3767,10 @@ pub fn recover_manager_sealed_module(
     root: &Path,
     module_id: &str,
     encoded_authorization: &str,
-) -> Result<ModuleAuditStatus> {
+) -> Result<(
+    ModuleAuditStatus,
+    crate::module_audit_transaction::AuditTransactionReceipt,
+)> {
     validate_module_id(module_id)?;
     let status = sealed_integrity_status(root)?;
     let failure = status
@@ -3751,7 +3782,7 @@ pub fn recover_manager_sealed_module(
     let arguments_hash =
         sealed_recovery_arguments_hash(&status.seal_hash, &status.inventory_hash, &failure)?;
     let targets = vec![module_id.to_owned()];
-    let operation = begin_manager_audit_operation_at_inventory(
+    let mut transaction = crate::module_audit_transaction::AuditTransaction::begin_at_inventory(
         root,
         encoded_authorization,
         AuditAction::RecoverSealed,
@@ -3765,7 +3796,7 @@ pub fn recover_manager_sealed_module(
     let recovery = SealedRecoveryRecord {
         schema_version: SCHEMA_VERSION,
         module_id: module_id.to_owned(),
-        operation_id: operation.operation_id.clone(),
+        operation_id: transaction.operation_id().to_owned(),
         seal_hash: status.seal_hash,
         base_inventory_hash: status.inventory_hash,
         corrupted_from_sequence: failure.corrupted_from_sequence,
@@ -3848,22 +3879,14 @@ pub fn recover_manager_sealed_module(
     } else {
         verify_module_unlocked(root, module_id, true)?
     };
-    let mut operation_record = read_operation(root, &operation.operation_id, &key)?
-        .context("sealed recovery operation disappeared")?;
-    operation_record.completed_targets = targets;
-    operation_record.updated_at_unix_seconds = now();
-    write_record(
-        &operation_path(root, &operation.operation_id),
-        operation_record,
-        &key,
-    )?;
     drop(lock);
-    finish_manager_audit_operation(root, &operation.operation_id)?;
-    Ok(module_status)
+    transaction.complete_target(module_id)?;
+    let receipt = transaction.commit()?;
+    Ok((module_status, receipt))
 }
 
-#[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-pub fn begin_manager_audit_operation(
+#[cfg(test)]
+fn begin_manager_audit_operation(
     root: &Path,
     encoded_authorization: &str,
     expected_action: AuditAction,
@@ -3884,7 +3907,10 @@ pub fn begin_manager_audit_operation(
 /// mutation. Keeping this encoding in the authenticated store avoids response
 /// and module-management code implementing subtly different contracts.
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
-pub fn manager_operation_arguments_hash(action: AuditAction, targets: &[String]) -> Result<String> {
+pub(crate) fn manager_operation_arguments_hash(
+    action: AuditAction,
+    targets: &[String],
+) -> Result<String> {
     let bytes = serde_json::to_vec(&(action, targets))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -3928,18 +3954,23 @@ pub fn close_incident(
     module_id: &str,
     incident_id: &str,
     encoded_authorization: &str,
-) -> Result<ModuleAuditStatus> {
+) -> Result<(
+    ModuleAuditStatus,
+    crate::module_audit_transaction::AuditTransactionReceipt,
+)> {
     let arguments_hash = incident_close_arguments_hash(root, module_id, incident_id)?;
     let targets = vec![module_id.to_owned()];
-    let operation = begin_manager_audit_operation(
+    let mut transaction = crate::module_audit_transaction::AuditTransaction::begin(
         root,
         encoded_authorization,
         AuditAction::CloseIncident,
         &arguments_hash,
         &targets,
     )?;
-    if operation.applied {
-        return read_module_history(root, module_id, false).map(|history| history.status);
+    if transaction.is_committed() {
+        let status = read_module_history(root, module_id, false)?.status;
+        let receipt = transaction.commit()?;
+        return Ok((status, receipt));
     }
 
     let lock = AuditLock::acquire(root, false)?;
@@ -3958,25 +3989,18 @@ pub fn close_incident(
         module_id,
         AuditEventKind::IncidentClosed {
             incident_id: incident_id.to_owned(),
-            operation_id: operation.operation_id.clone(),
+            operation_id: transaction.operation_id().to_owned(),
             resolution: "secure_module_removal_verified".to_owned(),
         },
     )?;
-    let mut operation_record = read_operation(root, &operation.operation_id, &key)?
-        .context("incident close operation disappeared")?;
-    operation_record.completed_targets = targets;
-    operation_record.updated_at_unix_seconds = now();
-    write_record(
-        &operation_path(root, &operation.operation_id),
-        operation_record,
-        &key,
-    )?;
     drop(lock);
-    finish_manager_audit_operation(root, &operation.operation_id)?;
-    read_module_history(root, module_id, false).map(|history| history.status)
+    transaction.complete_target(module_id)?;
+    let receipt = transaction.commit()?;
+    let status = read_module_history(root, module_id, false)?.status;
+    Ok((status, receipt))
 }
 
-fn begin_manager_audit_operation_at_inventory(
+pub(crate) fn begin_manager_audit_operation_at_inventory(
     root: &Path,
     encoded_authorization: &str,
     expected_action: AuditAction,
@@ -4010,7 +4034,6 @@ fn begin_manager_audit_operation_at_inventory(
     let operation_id = hex(&Sha256::digest(&token_bytes));
     let _lock = AuditLock::acquire(root, false)?;
     let hmac_key = load_key(root, false)?;
-    recover_operation_progress(root, &hmac_key)?;
     let registry = read_manager_auth_registry(root, &hmac_key)?
         .context("Manager audit authorization key is not configured")?;
     ensure!(
@@ -4031,8 +4054,11 @@ fn begin_manager_audit_operation_at_inventory(
             "audit operation was interrupted: {}",
             operation.error.as_deref().unwrap_or("unknown failure")
         );
+        recover_operation_progress(root, &hmac_key)?;
+        let recovered = read_operation(root, &operation_id, &hmac_key)?
+            .context("replayed audit operation disappeared during recovery")?;
         remove_challenge_if_present(root, &token.challenge_id)?;
-        return Ok(authorized_operation(&operation));
+        return Ok(authorized_operation(&recovered, true));
     }
 
     let challenge: AuthenticatedRecord<AuditAuthorizationChallenge> =
@@ -4088,9 +4114,28 @@ fn begin_manager_audit_operation_at_inventory(
         expected_arguments_hash,
         expected_targets,
     )? {
+        let resumable_id = operation.operation_id;
+        recover_operation_progress(root, &hmac_key)?;
+        let recovered = read_operation(root, &resumable_id, &hmac_key)?
+            .context("resumable audit operation disappeared during recovery")?;
+        ensure!(
+            recovered.state != AuditOperationState::Interrupted,
+            "audit operation was interrupted: {}",
+            recovered.error.as_deref().unwrap_or("unknown failure")
+        );
         remove_challenge_if_present(root, &token.challenge_id)?;
-        return Ok(authorized_operation(&operation));
+        return Ok(authorized_operation(&recovered, true));
     }
+    recover_operation_progress(root, &hmac_key)?;
+    verify_authorized_inventory_unchanged(
+        root,
+        &hmac_key,
+        expected_action,
+        expected_arguments_hash,
+        expected_targets,
+        &inventory_hash,
+        expected_inventory_hash,
+    )?;
     ensure!(
         !read_operation_records(root, &hmac_key)?
             .iter()
@@ -4120,7 +4165,58 @@ fn begin_manager_audit_operation_at_inventory(
     )?;
     pending_hmac_key(root, &hmac_key, true)?;
     remove_challenge_if_present(root, &token.challenge_id)?;
-    Ok(authorized_operation(&operation))
+    Ok(authorized_operation(&operation, false))
+}
+
+fn verify_authorized_inventory_unchanged(
+    root: &Path,
+    key: &[u8; 32],
+    action: AuditAction,
+    expected_arguments_hash: &str,
+    expected_targets: &[String],
+    authorized_inventory_hash: &str,
+    expected_inventory_hash: Option<&str>,
+) -> Result<()> {
+    match action.descriptor().authorization_inventory {
+        AuditAuthorizationInventory::CurrentCheckpoint => {
+            ensure!(
+                expected_inventory_hash.is_none(),
+                "current-checkpoint audit action supplied a sealed inventory override"
+            );
+            ensure!(
+                checkpoint_payload_unlocked(root)?.inventory_hash == authorized_inventory_hash,
+                "audit inventory changed while recovering previous transactions"
+            );
+        }
+        AuditAuthorizationInventory::ManagerSealedDamage => {
+            let expected_inventory_hash = expected_inventory_hash
+                .context("Manager-sealed recovery inventory is unavailable")?;
+            ensure!(
+                expected_inventory_hash == authorized_inventory_hash,
+                "Manager-sealed recovery authorization inventory mismatch"
+            );
+            ensure!(
+                expected_targets.len() == 1,
+                "Manager-sealed recovery requires exactly one module target"
+            );
+            let status = sealed_integrity_status_unlocked(root, key)?;
+            ensure!(
+                status.inventory_hash == authorized_inventory_hash,
+                "Manager-sealed recovery inventory changed after authorization"
+            );
+            let failure = status
+                .failures
+                .iter()
+                .find(|failure| failure.module_id.as_str() == expected_targets[0].as_str())
+                .context("Manager-sealed recovery target no longer has integrity damage")?;
+            ensure!(
+                sealed_recovery_arguments_hash(&status.seal_hash, &status.inventory_hash, failure,)?
+                    == expected_arguments_hash,
+                "Manager-sealed integrity damage changed after authorization"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn ensure_operation_matches(
@@ -4141,11 +4237,17 @@ fn ensure_operation_matches(
     Ok(())
 }
 
-fn authorized_operation(operation: &AuditOperationRecord) -> AuthorizedAuditOperation {
+fn authorized_operation(
+    operation: &AuditOperationRecord,
+    replayed: bool,
+) -> AuthorizedAuditOperation {
     AuthorizedAuditOperation {
         operation_id: operation.operation_id.clone(),
+        targets: operation.targets.clone(),
         completed_targets: operation.completed_targets.clone(),
+        base_inventory_hash: operation.base_inventory_hash.clone(),
         applied: operation.state == AuditOperationState::Applied,
+        replayed,
     }
 }
 
@@ -5428,6 +5530,16 @@ mod tests {
         begin_manager_audit_operation(root, &token, action, &arguments_hash, &targets).unwrap()
     }
 
+    fn complete_test_operation_target(
+        root: &Path,
+        operation: &AuthorizedAuditOperation,
+        action: AuditAction,
+        target: &str,
+    ) {
+        complete_manager_audit_operation_target(root, &operation.operation_id, action, target)
+            .unwrap();
+    }
+
     fn checkpoint_envelope(root: &Path, signing_key: &SigningKey, generation: u64) -> String {
         let payload = checkpoint_payload(root).unwrap();
         let payload_base64 = encode_base64(&serde_json::to_vec(&payload).unwrap());
@@ -5738,6 +5850,7 @@ mod tests {
             &operation.operation_id,
         )
         .unwrap();
+        complete_test_operation_target(&audit_root, &operation, AuditAction::Prune, "module.beta");
         finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
 
         let payload = checkpoint_payload(&audit_root).unwrap();
@@ -6177,6 +6290,7 @@ mod tests {
             &operation.operation_id,
         )
         .unwrap();
+        complete_test_operation_target(&audit_root, &operation, AuditAction::Prune, "stale.module");
         finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
 
         let snapshot = verified_audit_snapshot(&audit_root).unwrap();
@@ -6282,7 +6396,7 @@ mod tests {
     }
 
     #[test]
-    fn manager_authorized_recovery_rebuilds_a_damaged_sealed_module_only() {
+    fn manager_authorized_recovery_rebuilds_damage_with_an_unexpected_entry() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         record(root, "module.alpha", "ab");
@@ -6291,11 +6405,22 @@ mod tests {
         register_manager_audit_auth_key(root, &public_key_hex(&manager), false).unwrap();
         commit_manager_audit_seal(root, &checkpoint_envelope(root, &manager, 1)).unwrap();
 
-        std::fs::write(event_path(root, "module.alpha", 2), b"corrupt").unwrap();
+        let damaged_event = event_path(root, "module.alpha", 2);
+        let unexpected_backup = damaged_event.with_extension("json.bak");
+        std::fs::write(&damaged_event, b"corrupt").unwrap();
+        std::fs::write(&unexpected_backup, b"untrusted backup").unwrap();
         let failure = sealed_integrity_status(root).unwrap();
         assert_eq!(failure.failures.len(), 1);
         assert_eq!(failure.failures[0].module_id, "module.alpha");
         assert_eq!(failure.failures[0].corrupted_from_sequence, 2);
+        assert_eq!(
+            failure.failures[0].cause,
+            AuditIncidentCause::AuditEventInvalid
+        );
+        assert_eq!(
+            failure.failures[0].unexpected_paths,
+            vec![unexpected_backup.to_string_lossy().into_owned()]
+        );
         assert!(verify_module(root, "module.alpha", true).is_err());
         let resilient = list_histories_resilient(root, true).unwrap();
         assert_eq!(resilient.len(), 2);
@@ -6332,9 +6457,15 @@ mod tests {
         );
 
         let token = sealed_recovery_token(root, &manager, "module.alpha");
-        let recovered = recover_manager_sealed_module(root, "module.alpha", &token).unwrap();
+        let (recovered, receipt) =
+            recover_manager_sealed_module(root, "module.alpha", &token).unwrap();
         assert!(recovered.unresolved_risk);
         assert_eq!(recovered.verification, VerificationState::Recovered);
+        assert_eq!(
+            receipt.state,
+            crate::module_audit_transaction::AuditTransactionState::Committed
+        );
+        assert!(!unexpected_backup.exists());
         assert!(sealed_integrity_status(root).unwrap().failures.is_empty());
 
         let payload = checkpoint_payload(root).unwrap();
@@ -6463,6 +6594,7 @@ mod tests {
             Ok(report("test.module", "cd")),
         )
         .unwrap();
+        complete_test_operation_target(temp.path(), &operation, AuditAction::Rescan, "test.module");
         finish_manager_audit_operation(temp.path(), &operation.operation_id).unwrap();
         let first = checkpoint_envelope(temp.path(), &manager, 1);
         commit_manager_audit_seal(temp.path(), &first).unwrap();
@@ -6605,6 +6737,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status.event_count, 1);
+        complete_test_operation_target(temp.path(), &first, AuditAction::Rescan, "test.module");
         finish_manager_audit_operation(temp.path(), &first.operation_id).unwrap();
 
         let second = begin_test_operation(temp.path(), AuditAction::Rescan, &["test.module"]);
@@ -6615,6 +6748,7 @@ mod tests {
             Err("unable to read service.sh".to_owned()),
         )
         .unwrap();
+        complete_test_operation_target(temp.path(), &second, AuditAction::Rescan, "test.module");
         finish_manager_audit_operation(temp.path(), &second.operation_id).unwrap();
         assert_eq!(status.event_count, 2);
         let history = read_module_history(temp.path(), "test.module", false).unwrap();
@@ -6626,6 +6760,112 @@ mod tests {
             history.events[1].kind,
             AuditEventKind::InstalledRescanFailed { .. }
         ));
+    }
+
+    #[test]
+    fn transaction_commit_returns_an_idempotent_receipt() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(29);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        let targets = vec!["test.module".to_owned()];
+        let arguments_hash =
+            manager_operation_arguments_hash(AuditAction::Rescan, &targets).unwrap();
+        let token =
+            authorization_token(temp.path(), &manager, AuditAction::Rescan, &arguments_hash);
+
+        let mut transaction = crate::module_audit_transaction::AuditTransaction::begin(
+            temp.path(),
+            &token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
+        record_installed_rescan(
+            temp.path(),
+            transaction.operation_id(),
+            "test.module",
+            Ok(report("test.module", "cd")),
+        )
+        .unwrap();
+        transaction.complete_target("test.module").unwrap();
+        let first = transaction.commit().unwrap();
+        assert_eq!(
+            first.state,
+            crate::module_audit_transaction::AuditTransactionState::Committed
+        );
+        assert!(!first.replayed);
+        assert_eq!(first.targets, targets);
+
+        let replay = crate::module_audit_transaction::AuditTransaction::begin(
+            temp.path(),
+            &token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
+        assert!(replay.is_committed());
+        let second = replay.commit().unwrap();
+        assert!(second.replayed);
+        assert_eq!(second.operation_id, first.operation_id);
+        assert_eq!(
+            second.committed_store_revision,
+            first.committed_store_revision
+        );
+        assert_eq!(
+            second.committed_inventory_hash,
+            first.committed_inventory_hash
+        );
+    }
+
+    #[test]
+    fn transaction_retry_recovers_side_effect_before_returning_receipt() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(29);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        let targets = vec!["test.module".to_owned()];
+        let arguments_hash =
+            manager_operation_arguments_hash(AuditAction::Rescan, &targets).unwrap();
+        let first_token =
+            authorization_token(temp.path(), &manager, AuditAction::Rescan, &arguments_hash);
+        let interrupted = crate::module_audit_transaction::AuditTransaction::begin(
+            temp.path(),
+            &first_token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
+        record_installed_rescan(
+            temp.path(),
+            interrupted.operation_id(),
+            "test.module",
+            Ok(report("test.module", "cd")),
+        )
+        .unwrap();
+        drop(interrupted);
+
+        assert_eq!(
+            active_manager_audit_operation_targets(temp.path(), AuditAction::Rescan).unwrap(),
+            Some(targets.clone())
+        );
+        let retry_token =
+            authorization_token(temp.path(), &manager, AuditAction::Rescan, &arguments_hash);
+        let recovered = crate::module_audit_transaction::AuditTransaction::begin(
+            temp.path(),
+            &retry_token,
+            AuditAction::Rescan,
+            &arguments_hash,
+            &targets,
+        )
+        .unwrap();
+        assert!(recovered.is_committed());
+        let receipt = recovered.commit().unwrap();
+        assert!(receipt.replayed);
+        assert_eq!(receipt.targets, targets);
     }
 
     #[test]
@@ -6695,6 +6935,7 @@ mod tests {
             &operation.operation_id,
         )
         .unwrap();
+        complete_test_operation_target(&audit_root, &operation, AuditAction::Prune, "stale.module");
         finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0].removed_event_count, 2);
@@ -6731,6 +6972,14 @@ mod tests {
         let pending_root = temp.path().join("modules_update");
         std::fs::create_dir(&installed_root).unwrap();
         record(&audit_root, "stale.module", "ab");
+        let key = load_key(&audit_root, false).unwrap();
+        write_risk(
+            &audit_root,
+            "stale.module",
+            &key,
+            "test interrupted cleanup",
+        )
+        .unwrap();
         let operation = begin_test_operation(&audit_root, AuditAction::Prune, &["stale.module"]);
         prune_stale_histories(
             &audit_root,
@@ -6740,7 +6989,13 @@ mod tests {
         )
         .unwrap();
 
-        let key = load_key(&audit_root, false).unwrap();
+        let trash_history =
+            operation_trash_path(&audit_root, &operation.operation_id, "stale.module");
+        std::fs::rename(
+            trash_history.join("risk.json"),
+            risk_path(&audit_root, "stale.module"),
+        )
+        .unwrap();
         let mut interrupted = read_operation(&audit_root, &operation.operation_id, &key)
             .unwrap()
             .unwrap();
@@ -6772,6 +7027,8 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.state, AuditOperationState::Applied);
         assert_eq!(recovered.completed_targets, vec!["stale.module"]);
+        assert!(!risk_path(&audit_root, "stale.module").exists());
+        assert!(trash_history.join("risk.json").exists());
         let trash = audit_root
             .join(OPERATION_TRASH_DIR)
             .join(&operation.operation_id);
@@ -6925,6 +7182,7 @@ mod tests {
             Ok(report("risky.module", "cd")),
         )
         .unwrap();
+        complete_test_operation_target(&audit_root, &rescan, AuditAction::Rescan, "risky.module");
         finish_manager_audit_operation(&audit_root, &rescan.operation_id).unwrap();
         assert!(
             module_requires_secure_removal(&audit_root, "risky.module").unwrap(),
@@ -6969,6 +7227,12 @@ mod tests {
         assert!(!status.unresolved_risk);
         assert_eq!(status.containment_state, None);
         assert!(!module_requires_containment(&audit_root, "risky.module").unwrap());
+        complete_test_operation_target(
+            &audit_root,
+            &operation,
+            AuditAction::SecureRemove,
+            "risky.module",
+        );
         finish_manager_audit_operation(&audit_root, &operation.operation_id).unwrap();
 
         let manager = signing_key(29);

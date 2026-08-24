@@ -1,6 +1,5 @@
 package me.weishu.kernelsu.security
 
-import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.ui.util.commitModuleAuditSeal
 import me.weishu.kernelsu.ui.util.registerModuleAuditAuthorizationKey
 import me.weishu.kernelsu.ui.util.streamModuleAuditDashboard
@@ -11,7 +10,10 @@ data class ModuleAuditInstallTrust(
     val releasableModuleIds: Set<String>,
 )
 
-suspend fun sealModuleAuditSession(installSession: String): ModuleAuditInstallTrust {
+suspend fun sealModuleAuditSession(
+    installSession: String,
+    store: ModuleAuditCheckpointStore,
+): ModuleAuditInstallTrust {
     val histories = linkedMapOf<String, JSONObject>()
     var completion: JSONObject? = null
     streamModuleAuditDashboard(installSession) { rawLine ->
@@ -38,7 +40,6 @@ suspend fun sealModuleAuditSession(installSession: String): ModuleAuditInstallTr
     check(assessment.inventoryRelation != AuditInventoryRelation.SealedDamage) {
         "Module audit installation session produced sealed inventory damage"
     }
-    val store = ModuleAuditCheckpointStore(ksuApp)
     val sealStatus = completed.getJSONObject("seal_status")
     val checkpoint = store.reconcile(
         completed.getJSONObject("checkpoint").toString(),

@@ -45,6 +45,7 @@ mod module_audit_action;
 #[cfg(any(target_os = "android", test))]
 mod module_audit_assessment;
 mod module_audit_log;
+mod module_audit_transaction;
 #[cfg(target_os = "android")]
 mod module_config;
 #[cfg(target_os = "android")]
