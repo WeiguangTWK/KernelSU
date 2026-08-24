@@ -30,15 +30,11 @@ import kotlinx.coroutines.withContext
 import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.ksuApp
-import me.weishu.kernelsu.security.ModuleAuditCheckpointStore
-import me.weishu.kernelsu.security.sealModuleAuditSession
 import me.weishu.kernelsu.ui.util.FlashResult
 import me.weishu.kernelsu.ui.util.LkmSelection
-import me.weishu.kernelsu.ui.util.beginAuditInstallSession
 import me.weishu.kernelsu.ui.util.flashModule
 import me.weishu.kernelsu.ui.util.installBoot
 import me.weishu.kernelsu.ui.util.listModules
-import me.weishu.kernelsu.ui.util.releaseAuditInstallSession
 import me.weishu.kernelsu.ui.util.restoreBoot
 import me.weishu.kernelsu.ui.util.toggleModule
 import me.weishu.kernelsu.ui.util.uninstallPermanently
@@ -102,46 +98,41 @@ suspend fun flashModulesSequentially(
     onStdout: (String) -> Unit,
     onStderr: (String) -> Unit
 ): FlashResult {
-    val session = runCatching { beginAuditInstallSession() }.getOrElse { error ->
-        return FlashResult(1, error.message ?: "Unable to protect module installation", false)
-    }
-    val checkpointStore = ModuleAuditCheckpointStore(ksuApp)
-    var result = FlashResult(0, "", true)
-    try {
-        // Establish and seal an empty Manager-trusted baseline before the first
-        // installation operation is written. Initializing after flashing would
-        // correctly be rejected because an unpaired Manager must not bless
-        // pre-existing operations.
-        sealModuleAuditSession(session, checkpointStore)
-        val before = moduleEnabledStates()
-        for (uri in uris) {
-            val installed = flashModule(uri, onStdout, onStderr)
-            if (installed.code != 0) {
-                result = installed
-                break
+    return try {
+        onStdout("- Waiting for the audit coordinator")
+        ksuApp.auditCoordinator.withInstallationSession {
+            var result = FlashResult(0, "", true)
+            // Establish and seal a Manager-trusted baseline before the first
+            // installation operation is written. The coordinator keeps the
+            // same checkpoint state through the final seal and HMAC rotation.
+            onStdout("- Verifying the module audit baseline")
+            seal()
+            val before = moduleEnabledStates()
+            for (uri in uris) {
+                val installed = flashModule(uri, onStdout, onStderr)
+                if (installed.code != 0) {
+                    result = installed
+                    break
+                }
             }
-        }
-        if (result.code == 0) {
-            val after = moduleEnabledStates()
-            val intendedEnabled = before.filterValues { it }.keys + (after.keys - before.keys)
-            val trust = sealModuleAuditSession(session, checkpointStore)
-            val restore = intendedEnabled.intersect(trust.releasableModuleIds)
-            val failed = restore.filterNot { toggleModule(it, enable = true) }
-            check(failed.isEmpty()) {
-                "Unable to release sealed module isolation: ${failed.joinToString()}"
+            if (result.code == 0) {
+                onStdout("- Verifying and sealing the installed modules")
+                val after = moduleEnabledStates()
+                val intendedEnabled = before.filterValues { it }.keys + (after.keys - before.keys)
+                val trust = seal()
+                val restore = intendedEnabled.intersect(trust.releasableModuleIds)
+                val failed = restore.filterNot { toggleModule(it, enable = true) }
+                check(failed.isEmpty()) {
+                    "Unable to release sealed module isolation: ${failed.joinToString()}"
+                }
             }
+            result
         }
     } catch (error: Throwable) {
         val message = error.message ?: error::class.java.simpleName
         onStderr(message)
-        result = FlashResult(1, message, false)
+        FlashResult(1, message, false)
     }
-    runCatching { releaseAuditInstallSession(session) }.onFailure { error ->
-        val message = error.message ?: "Unable to restart audit protection"
-        onStderr(message)
-        if (result.code == 0) result = FlashResult(1, message, false)
-    }
-    return result
 }
 
 private fun moduleEnabledStates(): Map<String, Boolean> {

@@ -7,12 +7,17 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.UserManager
 import androidx.core.app.NotificationCompat
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.ksuApp
 
 class AuditEventReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION) return
+        if (context.getSystemService(UserManager::class.java)?.isUserUnlocked == true) {
+            ksuApp.auditCoordinator.invalidate()
+        }
         val kind = intent.getStringExtra(EXTRA_KIND).orEmpty()
         val fallbackMessage = intent.getStringExtra(EXTRA_MESSAGE)?.takeIf(String::isNotBlank)
         val message = when (kind) {

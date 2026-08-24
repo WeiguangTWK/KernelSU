@@ -801,17 +801,50 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
             "type": "complete",
             "uninitialized": true,
             "store_revision": crate::module_audit_log::dashboard_store_revision(root)?,
+            "response_status": {
+                "kernel_safe_mode": ksucalls::try_check_kernel_safemode()
+                    .context("query KernelSU safe mode for audit dashboard")?,
+                "emergency": crate::module_response::audit_emergency_status()?,
+            },
         }));
     }
 
-    let assessed = crate::module_response::current_audit_assessment()?;
+    let snapshot =
+        crate::module_audit_log::verified_audit_snapshot_with_progress(root, |progress| {
+            use crate::module_audit_log::VerifiedAuditProgress;
+            match progress {
+                VerifiedAuditProgress::Start { total_modules } => {
+                    emit_audit_dashboard_line(&serde_json::json!({
+                        "type": "start",
+                        "total_modules": total_modules,
+                    }))
+                }
+                VerifiedAuditProgress::Module {
+                    module_id,
+                    completed,
+                    total_modules,
+                } => emit_audit_dashboard_line(&serde_json::json!({
+                    "type": "progress",
+                    "phase": "history",
+                    "module_id": module_id,
+                    "completed": completed,
+                    "total_modules": total_modules,
+                })),
+                VerifiedAuditProgress::Checkpoint {
+                    completed,
+                    total_modules,
+                } => emit_audit_dashboard_line(&serde_json::json!({
+                    "type": "progress",
+                    "phase": "checkpoint",
+                    "completed": completed,
+                    "total_modules": total_modules,
+                })),
+            }
+        })?;
+    let assessed = crate::module_response::assess_current_audit_snapshot(snapshot)?;
     let snapshot = assessed.snapshot;
     let assessment = assessed.assessment;
     let total_modules = snapshot.histories.len();
-    emit_audit_dashboard_line(&serde_json::json!({
-        "type": "start",
-        "total_modules": total_modules,
-    }))?;
 
     for (index, history) in snapshot.histories.iter().enumerate() {
         emit_audit_dashboard_line(&serde_json::json!({
@@ -824,13 +857,6 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
     }
 
     emit_audit_dashboard_line(&serde_json::json!({
-        "type": "progress",
-        "phase": "checkpoint",
-        "completed": total_modules,
-        "total_modules": total_modules,
-    }))?;
-
-    emit_audit_dashboard_line(&serde_json::json!({
         "type": "complete",
         "checkpoint": snapshot.checkpoint,
         "checkpoint_degraded": !snapshot.integrity_failures.is_empty(),
@@ -839,6 +865,11 @@ fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
         "seal_status": snapshot.seal_status,
         "authorization_status": snapshot.authorization_status,
         "store_revision": snapshot.store_revision,
+        "response_status": {
+            "kernel_safe_mode": ksucalls::try_check_kernel_safemode()
+                .context("query KernelSU safe mode for audit dashboard")?,
+            "emergency": crate::module_response::audit_emergency_status()?,
+        },
     }))
 }
 

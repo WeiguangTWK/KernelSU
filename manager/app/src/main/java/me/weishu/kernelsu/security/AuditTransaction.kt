@@ -1,7 +1,5 @@
 package me.weishu.kernelsu.security
 
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -55,18 +53,6 @@ fun parseAuditTransactionReceipt(commandOutput: String): AuditTransactionReceipt
         "Invalid committed audit inventory"
     }
     return receipt
-}
-
-/** Notifies independent readers that a ksud audit transaction committed. */
-object AuditTransactionCommits {
-    private val mutableCommits = MutableSharedFlow<AuditTransactionReceipt>(
-        extraBufferCapacity = 16,
-    )
-    val commits = mutableCommits.asSharedFlow()
-
-    suspend fun publish(receipt: AuditTransactionReceipt) {
-        mutableCommits.emit(receipt)
-    }
 }
 
 private fun String.isSha256Hex(): Boolean =

@@ -280,13 +280,6 @@ suspend fun streamModuleAuditDashboard(
         }
     }
 
-suspend fun getModuleAuditAssessment(): String = withContext(Dispatchers.IO) {
-    runModuleAuditCommand(
-        "audit-status --json",
-        "Unable to read module audit assessment",
-    )
-}
-
 suspend fun reconcileModuleAuditResponse(): String = withContext(Dispatchers.IO) {
     runModuleAuditCommand(
         "audit-reconcile-response",

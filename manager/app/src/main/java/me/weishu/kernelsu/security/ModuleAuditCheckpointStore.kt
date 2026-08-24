@@ -179,6 +179,11 @@ enum class AuditStoreDomain(
     ),
 }
 
+class AuditInventoryChangedBeforeAuthorization internal constructor(
+    val expectedInventoryHash: String,
+    val challengeInventoryHash: String,
+) : IllegalStateException("Audit inventory changed before authorization")
+
 class ModuleAuditCheckpointStore(
     context: Context,
     private val domain: AuditStoreDomain = AuditStoreDomain.ModuleAudit,
@@ -827,8 +832,11 @@ class ModuleAuditCheckpointStore(
         check(keyId == authorizationKeyId()) {
             "Audit authorization key does not match this Manager"
         }
-        check(inventoryHash == expectedInventoryHash) {
-            "Audit inventory changed before authorization"
+        if (inventoryHash != expectedInventoryHash) {
+            throw AuditInventoryChangedBeforeAuthorization(
+                expectedInventoryHash,
+                inventoryHash,
+            )
         }
         check(action.matches(Regex("[a-z-]{1,64}"))) { "Invalid audit authorization action" }
         check(inventoryHash.isSha256Hex()) { "Invalid audit inventory hash" }

@@ -529,6 +529,22 @@ pub struct VerifiedAuditSnapshot {
     pub authorization_status: ManagerAuditAuthStatus,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifiedAuditProgress {
+    Start {
+        total_modules: usize,
+    },
+    Module {
+        module_id: String,
+        completed: usize,
+        total_modules: usize,
+    },
+    Checkpoint {
+        completed: usize,
+        total_modules: usize,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg(test)]
 pub struct DashboardCheckpointSnapshot {
@@ -984,17 +1000,27 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
     } else {
         read_key(root)?
     };
-    let identity_failure = verify_identity(root, module_id, &key).err();
-    let sealed = verified_sealed_event_hashes(root, module_id, &key)?;
-    let mut chain = verify_chain(root, module_id, &key, repair)?;
+    Ok(verify_module_with_key_unlocked(root, module_id, repair, &key)?.0)
+}
+
+fn verify_module_with_key_unlocked(
+    root: &Path,
+    module_id: &str,
+    repair: bool,
+    key: &[u8; 32],
+) -> Result<(ModuleAuditStatus, VerifiedChain)> {
+    validate_module_id(module_id)?;
+    let identity_failure = verify_identity(root, module_id, key).err();
+    let sealed = verified_sealed_event_hashes(root, module_id, key)?;
+    let mut chain = verify_chain(root, module_id, key, repair)?;
     if repair && let Some(error) = identity_failure {
         let identity_path = module_path(root, module_id).join("identity.json");
         let quarantine = quarantine_auxiliary(root, module_id, &identity_path, "identity")?;
-        ensure_identity(root, module_id, &key)?;
+        ensure_identity(root, module_id, key)?;
         append_incident(
             root,
             module_id,
-            &key,
+            key,
             &mut chain.events,
             0,
             AuditIncidentCause::IdentityRecordInvalid,
@@ -1007,7 +1033,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         .events
         .iter()
         .any(|entry| matches!(entry.event.kind, AuditEventKind::IntegrityIncident { .. }));
-    let risk_record_high_risk = match read_risk(root, module_id, &key) {
+    let risk_record_high_risk = match read_risk(root, module_id, key) {
         Ok(Some(risk)) => {
             high_risk |= risk.high_risk;
             Some(risk.high_risk)
@@ -1022,7 +1048,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
                 append_incident(
                     root,
                     module_id,
-                    &key,
+                    key,
                     &mut chain.events,
                     0,
                     AuditIncidentCause::RiskRecordInvalid,
@@ -1036,7 +1062,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         }
     };
     if repair && high_risk && risk_record_high_risk != Some(true) {
-        write_risk(root, module_id, &key, "audit history integrity failure")?;
+        write_risk(root, module_id, key, "audit history integrity failure")?;
     }
     let last_secure_removal = chain
         .events
@@ -1060,8 +1086,8 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         .last()
         .map_or_else(|| GENESIS_HASH.to_owned(), |entry| entry.event_hash.clone());
     let (quarantined_persistent_scripts, persistent_script_ownership) =
-        read_persistent_quarantine_summary(root, module_id, &key)?;
-    let persistent_result = read_persistent_containment_result(root, module_id, &key)?;
+        read_persistent_quarantine_summary(root, module_id, key)?;
+    let persistent_result = read_persistent_containment_result(root, module_id, key)?;
     let quarantined_persistent_scripts =
         quarantined_persistent_scripts.max(persistent_result.quarantined_paths.len());
     let persistent_script_ownership = if persistent_result.uncertain_ownership {
@@ -1069,7 +1095,7 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
     } else {
         persistent_script_ownership
     };
-    Ok(ModuleAuditStatus {
+    let status = ModuleAuditStatus {
         module_id: module_id.to_owned(),
         verification: chain.state,
         high_risk,
@@ -1082,13 +1108,14 @@ fn verify_module_unlocked(root: &Path, module_id: &str, repair: bool) -> Result<
         } else {
             CheckpointState::Sealed
         },
-        containment_state: read_containment_state(root, module_id, &key)?,
+        containment_state: read_containment_state(root, module_id, key)?,
         quarantined_persistent_scripts,
         persistent_script_ownership,
         quarantined_persistent_script_paths: persistent_result.quarantined_paths,
         persistent_script_failures: persistent_result.failures,
         incidents,
-    })
+    };
+    Ok((status, chain))
 }
 
 #[cfg(test)]
@@ -1258,8 +1285,8 @@ fn read_module_history_unlocked(
     repair: bool,
     key: &[u8; 32],
 ) -> Result<ModuleAuditHistory> {
-    let status = verify_module_unlocked(root, module_id, repair)?;
-    let events = verify_chain(root, module_id, key, false)?
+    let (status, chain) = verify_module_with_key_unlocked(root, module_id, repair, key)?;
+    let events = chain
         .events
         .into_iter()
         .map(|entry| entry.event)
@@ -2492,15 +2519,26 @@ pub fn sealed_integrity_status(root: &Path) -> Result<SealedIntegrityStatus> {
 }
 
 pub fn verified_audit_snapshot(root: &Path) -> Result<VerifiedAuditSnapshot> {
+    verified_audit_snapshot_with_progress(root, |_| Ok(()))
+}
+
+pub fn verified_audit_snapshot_with_progress(
+    root: &Path,
+    mut progress: impl FnMut(VerifiedAuditProgress) -> Result<()>,
+) -> Result<VerifiedAuditSnapshot> {
     let _lock = AuditLock::acquire(root, false)?;
     let key = read_key(root)?;
     retry_verified_snapshot(
-        || verified_audit_snapshot_once(root, &key),
+        || verified_audit_snapshot_once(root, &key, &mut progress),
         || std::thread::sleep(VERIFIED_SNAPSHOT_RETRY_DELAY),
     )
 }
 
-fn verified_audit_snapshot_once(root: &Path, key: &[u8; 32]) -> Result<VerifiedAuditSnapshot> {
+fn verified_audit_snapshot_once(
+    root: &Path,
+    key: &[u8; 32],
+    progress: &mut impl FnMut(VerifiedAuditProgress) -> Result<()>,
+) -> Result<VerifiedAuditSnapshot> {
     let revision_before =
         dashboard_store_revision(root).context("read audit revision before verified snapshot")?;
     verify_tombstones(root, key)?;
@@ -2515,10 +2553,23 @@ fn verified_audit_snapshot_once(root: &Path, key: &[u8; 32]) -> Result<VerifiedA
     } else {
         Vec::new()
     };
-    let histories = module_ids
-        .iter()
-        .map(|module_id| read_module_history_resilient_unlocked(root, module_id, key))
-        .collect::<Result<Vec<_>>>()?;
+    let total_modules = module_ids.len();
+    progress(VerifiedAuditProgress::Start { total_modules })?;
+    let mut histories = Vec::with_capacity(total_modules);
+    for (index, module_id) in module_ids.iter().enumerate() {
+        histories.push(read_module_history_resilient_unlocked(
+            root, module_id, key,
+        )?);
+        progress(VerifiedAuditProgress::Module {
+            module_id: module_id.clone(),
+            completed: index + 1,
+            total_modules,
+        })?;
+    }
+    progress(VerifiedAuditProgress::Checkpoint {
+        completed: total_modules,
+        total_modules,
+    })?;
     let current_checkpoint = checkpoint_payload_readonly_unlocked(root, key);
 
     let (inventory_relation, checkpoint, integrity_failures) = match &seal {
@@ -2528,7 +2579,12 @@ fn verified_audit_snapshot_once(root: &Path, key: &[u8; 32]) -> Result<VerifiedA
             Vec::new(),
         ),
         Some(seal) => {
-            let integrity = sealed_integrity_status_unlocked(root, key)?;
+            let integrity = sealed_integrity_status_with_snapshot_unlocked(
+                root,
+                key,
+                &histories,
+                current_checkpoint.as_ref().ok(),
+            )?;
             match current_checkpoint {
                 Ok(current)
                     if histories
@@ -2692,17 +2748,33 @@ pub fn dashboard_checkpoint_snapshot(root: &Path) -> Result<DashboardCheckpointS
 }
 
 fn sealed_integrity_status_unlocked(root: &Path, key: &[u8; 32]) -> Result<SealedIntegrityStatus> {
+    sealed_integrity_status_with_snapshot_unlocked(root, key, &[], None)
+}
+
+fn sealed_integrity_status_with_snapshot_unlocked(
+    root: &Path,
+    key: &[u8; 32],
+    histories: &[ModuleAuditHistory],
+    current_checkpoint: Option<&CheckpointPayload>,
+) -> Result<SealedIntegrityStatus> {
     let registry = read_manager_auth_registry(root, key)?
         .context("Manager audit authorization key is not configured")?;
     let seal = load_verified_manager_seal(root, &registry)?
         .context("Manager audit seal is not configured")?;
     let mut failures = Vec::new();
     for module in &seal.payload.modules {
+        let verified_history = histories
+            .iter()
+            .find(|history| history.status.module_id == module.module_id);
         if let Some(recovery) = read_sealed_recovery(root, &module.module_id, key)?
             && recovery.seal_hash == seal.seal_hash
         {
             verify_sealed_recovery_record(&recovery, &seal, &registry, root, key)?;
-            match verify_chain(root, &module.module_id, key, false) {
+            let verified_chain = match verified_history {
+                Some(history) if history.integrity_error.is_none() => Ok(()),
+                _ => verify_chain(root, &module.module_id, key, false).map(|_| ()),
+            };
+            match verified_chain {
                 Ok(_) => continue,
                 Err(error) => {
                     if let Some(failure) = diagnose_sealed_module(root, module)? {
@@ -2713,6 +2785,19 @@ fn sealed_integrity_status_unlocked(root: &Path, key: &[u8; 32]) -> Result<Seale
                         .context("recovered audit chain failed without sealed damage");
                 }
             }
+        }
+        let sealed_prefix_verified = verified_history
+            .is_some_and(|history| history.integrity_error.is_none())
+            && current_checkpoint
+                .and_then(|checkpoint| {
+                    checkpoint
+                        .modules
+                        .iter()
+                        .find(|current| current.module_id == module.module_id)
+                })
+                .is_some_and(|current| current.event_hashes.starts_with(&module.event_hashes));
+        if sealed_prefix_verified {
+            continue;
         }
         if let Some(failure) = diagnose_sealed_module(root, module)? {
             failures.push(failure);

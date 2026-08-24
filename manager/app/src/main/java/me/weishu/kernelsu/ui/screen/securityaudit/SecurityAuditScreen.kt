@@ -77,7 +77,7 @@ fun SecurityAuditScreen() {
 
     val actions = SecurityAuditActions(
         onBack = dropUnlessResumed { navigator.pop() },
-        onRefresh = viewModel::refresh,
+        onRefresh = viewModel::revalidate,
         onRescan = viewModel::rescanInstalledModules,
         onPrune = {
             pruneDialog.showConfirm(
@@ -132,7 +132,7 @@ fun SecurityAuditCategoryScreen(categoryKey: String) {
     LaunchedEffect(Unit) { viewModel.refresh() }
     val actions = SecurityAuditActions(
         onBack = dropUnlessResumed { navigator.pop() },
-        onRefresh = viewModel::refresh,
+        onRefresh = viewModel::revalidate,
         onRescan = viewModel::rescanInstalledModules,
         onPrune = {},
         onRecover = viewModel::recoverCheckpointAfterChainRebuild,
@@ -211,7 +211,7 @@ fun SecurityAuditModuleScreen(
         onBack = dropUnlessResumed {
             if (!state.secureRemovalInProgress) navigator.pop()
         },
-        onRefresh = viewModel::refresh,
+        onRefresh = viewModel::revalidate,
         onRescan = viewModel::rescanInstalledModules,
         onPrune = {},
         onRecover = viewModel::recoverCheckpointAfterChainRebuild,

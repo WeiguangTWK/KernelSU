@@ -1059,10 +1059,40 @@ pub(crate) fn current_audit_assessment() -> Result<AssessedAuditSnapshot> {
     )
 }
 
+pub(crate) fn assess_current_audit_snapshot(
+    snapshot: module_audit_log::VerifiedAuditSnapshot,
+) -> Result<AssessedAuditSnapshot> {
+    assess_audit_snapshot_for(
+        snapshot,
+        &[
+            Path::new(defs::MODULE_DIR),
+            Path::new(defs::MODULE_UPDATE_DIR),
+        ],
+    )
+}
+
 fn current_audit_assessment_for(
     audit_root: &Path,
     module_roots: &[&Path],
 ) -> Result<AssessedAuditSnapshot> {
+    let context = audit_assessment_context(module_roots)?;
+    let snapshot = module_audit_log::verified_audit_snapshot(audit_root)?;
+    Ok(module_audit_assessment::assess_verified_snapshot(
+        snapshot, &context,
+    ))
+}
+
+fn assess_audit_snapshot_for(
+    snapshot: module_audit_log::VerifiedAuditSnapshot,
+    module_roots: &[&Path],
+) -> Result<AssessedAuditSnapshot> {
+    let context = audit_assessment_context(module_roots)?;
+    Ok(module_audit_assessment::assess_verified_snapshot(
+        snapshot, &context,
+    ))
+}
+
+fn audit_assessment_context(module_roots: &[&Path]) -> Result<AuditAssessmentContext> {
     let module_content_ids = managed_module_paths(module_roots)?
         .into_iter()
         .map(|(module_id, _)| {
@@ -1071,14 +1101,10 @@ fn current_audit_assessment_for(
             Ok(module_id)
         })
         .collect::<Result<BTreeSet<_>>>()?;
-    let snapshot = module_audit_log::verified_audit_snapshot(audit_root)?;
-    Ok(module_audit_assessment::assess_verified_snapshot(
-        snapshot,
-        &AuditAssessmentContext {
-            kernel_safe_mode: ksucalls::try_check_kernel_safemode().unwrap_or(false),
-            module_content_ids,
-        },
-    ))
+    Ok(AuditAssessmentContext {
+        kernel_safe_mode: ksucalls::try_check_kernel_safemode().unwrap_or(false),
+        module_content_ids,
+    })
 }
 
 fn managed_module_paths(module_roots: &[&Path]) -> Result<Vec<(String, PathBuf)>> {

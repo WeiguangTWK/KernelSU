@@ -30,11 +30,9 @@ import me.weishu.kernelsu.data.repository.ModuleRepositoryImpl
 import me.weishu.kernelsu.data.repository.SettingsRepository
 import me.weishu.kernelsu.data.repository.SettingsRepositoryImpl
 import me.weishu.kernelsu.ksuApp
-import me.weishu.kernelsu.security.ModuleAuditResponseStatus
-import me.weishu.kernelsu.security.AuditTransactionCommits
+import me.weishu.kernelsu.security.AuditSnapshotPolicy
 import me.weishu.kernelsu.security.AuditModuleDisposition
-import me.weishu.kernelsu.security.parseAuditAssessment
-import me.weishu.kernelsu.security.parseModuleAuditResponseStatus
+import me.weishu.kernelsu.security.ManagerAuditSnapshot
 import me.weishu.kernelsu.ui.component.SearchStatus
 import me.weishu.kernelsu.ui.screen.module.ModuleConfirmDialogState
 import me.weishu.kernelsu.ui.screen.module.ModuleConfirmRequest
@@ -42,8 +40,6 @@ import me.weishu.kernelsu.ui.screen.module.ModuleEffect
 import me.weishu.kernelsu.ui.screen.module.ModuleUiState
 import me.weishu.kernelsu.ui.util.PinyinUtil
 import me.weishu.kernelsu.ui.util.hasMagisk
-import me.weishu.kernelsu.ui.util.getModuleAuditAssessment
-import me.weishu.kernelsu.ui.util.getModuleAuditResponseStatus
 import me.weishu.kernelsu.ui.util.module.fetchModuleDetail
 import me.weishu.kernelsu.ui.util.module.fetchReleaseDescriptionHtml
 import okhttp3.Request
@@ -98,7 +94,7 @@ class ModuleViewModel(
     init {
         viewModelScope.launchSearchQueryCollector(searchQuery, ::applySearchText)
         viewModelScope.launch {
-            AuditTransactionCommits.commits.collect {
+            ksuApp.auditCoordinator.commits.collect {
                 isNeedRefresh = true
                 fetchModuleList(checkUpdate = false, resort = false)
             }
@@ -139,7 +135,7 @@ class ModuleViewModel(
             val magiskInstalled = withContext(Dispatchers.IO) { hasMagisk() }
             val auditResponse = withContext(Dispatchers.IO) {
                 runCatching {
-                    parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
+                    ksuApp.auditCoordinator.snapshot(AuditSnapshotPolicy.ReuseVerified)
                 }
             }
             _uiState.update {
@@ -147,7 +143,7 @@ class ModuleViewModel(
                     magiskInstalled = magiskInstalled,
                     isSafeMode = auditResponse.getOrNull()?.kernelSafeMode ?: false,
                     auditResponseAvailable = auditResponse.isSuccess,
-                    auditEmergencyStatus = auditResponse.getOrNull()?.emergency,
+                    auditEmergencyStatus = auditResponse.getOrNull()?.emergencyStatus,
                 )
             }
         }
@@ -254,33 +250,40 @@ class ModuleViewModel(
     }
 
     suspend fun loadModuleList(resort: Boolean = true) {
-        val (parsedModules, secureRemovalModuleIds, secureRemovalStates) = withContext(Dispatchers.IO) {
-            val modules = repo.getModules().getOrElse {
-                Log.e(TAG, "fetchModuleList: ", it)
-                emptyList()
-            }
-            val restricted: Pair<Set<String>, Map<String, String>> =
-                runCatching<Pair<Set<String>, Map<String, String>>> {
-                    val assessment = parseAuditAssessment(getModuleAuditAssessment())
-                    val restrictedModules = assessment.modules.filter { module ->
-                        module.disposition == AuditModuleDisposition.SecureRemovalRequired ||
-                            module.disposition == AuditModuleDisposition.SealedRecoveryRequired
-                    }
-                    restrictedModules.mapTo(mutableSetOf()) { it.moduleId } to
-                        restrictedModules.mapNotNull { module ->
-                            module.containmentState?.let { module.moduleId to it }
-                        }.toMap()
-                }.getOrElse { assessmentError ->
-                    Log.e(TAG, "load module audit assessment: ", assessmentError)
-                    emptySet<String>() to emptyMap<String, String>()
+        val (parsedModules, auditSnapshot) = coroutineScope {
+            val modules = async(Dispatchers.IO) {
+                repo.getModules().getOrElse {
+                    Log.e(TAG, "fetchModuleList: ", it)
+                    emptyList()
                 }
-            Triple(modules, restricted.first, restricted.second)
-        }
-        val auditResponse = withContext(Dispatchers.IO) {
-            runCatching {
-                parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
             }
+            val audit = async(Dispatchers.IO) {
+                runCatching {
+                    ksuApp.auditCoordinator.snapshot(AuditSnapshotPolicy.ReuseVerified)
+                }
+            }
+            modules.await() to audit.await()
         }
+        val restricted: Pair<Set<String>, Map<String, String>> =
+            runCatching<Pair<Set<String>, Map<String, String>>> {
+                val assessment = checkNotNull(auditSnapshot.getOrThrow().assessment) {
+                    "Module audit assessment is unavailable"
+                }
+                val restrictedModules = assessment.modules.filter { module ->
+                    module.disposition == AuditModuleDisposition.SecureRemovalRequired ||
+                        module.disposition == AuditModuleDisposition.SealedRecoveryRequired
+                }
+                restrictedModules.mapTo(mutableSetOf()) { it.moduleId } to
+                    restrictedModules.mapNotNull { module ->
+                        module.containmentState?.let { module.moduleId to it }
+                    }.toMap()
+            }.getOrElse { assessmentError ->
+                Log.e(TAG, "load module audit assessment: ", assessmentError)
+                emptySet<String>() to emptyMap<String, String>()
+            }
+        val secureRemovalModuleIds = restricted.first
+        val secureRemovalStates = restricted.second
+        val auditResponse = auditSnapshot.getOrNull()
 
         withContext(Dispatchers.Main) {
             _uiState.update {
@@ -288,9 +291,9 @@ class ModuleViewModel(
                     modules = parsedModules,
                     secureRemovalModuleIds = secureRemovalModuleIds,
                     secureRemovalStates = secureRemovalStates,
-                    isSafeMode = auditResponse.getOrNull()?.kernelSafeMode ?: it.isSafeMode,
-                    auditResponseAvailable = auditResponse.isSuccess,
-                    auditEmergencyStatus = auditResponse.getOrNull()?.emergency,
+                    isSafeMode = auditResponse?.kernelSafeMode ?: it.isSafeMode,
+                    auditResponseAvailable = auditSnapshot.isSuccess,
+                    auditEmergencyStatus = auditResponse?.emergencyStatus,
                 )
             }
             // Trigger recalculation of moduleList
@@ -427,10 +430,10 @@ class ModuleViewModel(
             if (!module.enabled) {
                 val auditResponse = withContext(Dispatchers.IO) {
                     runCatching {
-                        parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
+                        ksuApp.auditCoordinator.snapshot(AuditSnapshotPolicy.ReuseVerified)
                     }
                 }
-                applyAuditResponse(auditResponse)
+                applyAuditSnapshot(auditResponse)
                 if (auditResponse.isFailure) {
                     emitEffect(
                         ModuleEffect.Toast(
@@ -439,7 +442,7 @@ class ModuleViewModel(
                     )
                     return@launch
                 }
-                if (auditResponse.getOrThrow().emergency?.active == true) {
+                if (auditResponse.getOrThrow().emergencyStatus?.active == true) {
                     emitEffect(
                         ModuleEffect.Toast(
                             res.getString(R.string.module_enable_blocked_emergency, module.name),
@@ -456,13 +459,14 @@ class ModuleViewModel(
                 emitEffect(ModuleEffect.SnackBar(res.getString(R.string.reboot_to_apply)))
             } else {
                 if (!module.enabled) {
+                    ksuApp.auditCoordinator.invalidate()
                     val auditResponse = withContext(Dispatchers.IO) {
                         runCatching {
-                            parseModuleAuditResponseStatus(getModuleAuditResponseStatus())
+                            ksuApp.auditCoordinator.snapshot(AuditSnapshotPolicy.Revalidate)
                         }
                     }
-                    applyAuditResponse(auditResponse)
-                    if (auditResponse.getOrNull()?.emergency?.active == true) {
+                    applyAuditSnapshot(auditResponse)
+                    if (auditResponse.getOrNull()?.emergencyStatus?.active == true) {
                         emitEffect(
                             ModuleEffect.Toast(
                                 res.getString(R.string.module_enable_blocked_emergency, module.name),
@@ -478,12 +482,12 @@ class ModuleViewModel(
         }
     }
 
-    private fun applyAuditResponse(result: Result<ModuleAuditResponseStatus>) {
+    private fun applyAuditSnapshot(result: Result<ManagerAuditSnapshot>) {
         _uiState.update { state ->
             state.copy(
                 isSafeMode = result.getOrNull()?.kernelSafeMode ?: state.isSafeMode,
                 auditResponseAvailable = result.isSuccess,
-                auditEmergencyStatus = result.getOrNull()?.emergency,
+                auditEmergencyStatus = result.getOrNull()?.emergencyStatus,
             )
         }
     }
