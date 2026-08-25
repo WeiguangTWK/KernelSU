@@ -525,6 +525,14 @@ pub fn run_auditd() -> Result<()> {
     {
         warn!("failed to clean stale audit install sessions: {error:#}");
     }
+    for (label, root) in [
+        ("module", defs::MODULE_AUDIT_DIR),
+        ("global", defs::GLOBAL_AUDIT_DIR),
+    ] {
+        if let Err(error) = crate::module_audit_log::migrate_audit_store_v2(Path::new(root)) {
+            warn!("failed to remove legacy {label} audit metadata: {error:#}");
+        }
+    }
 
     let mut last_contained = BTreeSet::new();
     let mut store_missing_recorded = false;

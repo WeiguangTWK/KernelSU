@@ -419,8 +419,16 @@ class ModuleAuditCheckpointStore(
         evidence: Map<String, RecoveryEvidence>,
         authorizationKey: PublicKey,
     ): PayloadTransition {
-        if (previous.schemaVersion != current.schemaVersion) {
-            return PayloadTransition("Audit checkpoint schema changed unexpectedly")
+        val sameStoreFormat =
+            previous.schemaVersion == current.schemaVersion &&
+                previous.storeFormatVersion == current.storeFormatVersion
+        val migratesToV2 =
+            previous.schemaVersion == LEGACY_CHECKPOINT_SCHEMA_VERSION &&
+                previous.storeFormatVersion == LEGACY_STORE_FORMAT_VERSION &&
+                current.schemaVersion == CHECKPOINT_SCHEMA_VERSION &&
+                current.storeFormatVersion == STORE_FORMAT_VERSION
+        if (!sameStoreFormat && !migratesToV2) {
+            return PayloadTransition("Audit store format changed unexpectedly")
         }
         if (
             previous.hmacKeyId != current.hmacKeyId &&
@@ -1167,11 +1175,21 @@ class ModuleAuditCheckpointStore(
     private fun parsePayload(raw: String): CheckpointPayload {
         val json = JSONObject(raw)
         val schemaVersion = json.getInt("schema_version")
-        check(schemaVersion == CHECKPOINT_SCHEMA_VERSION) {
+        val storeFormatVersion = json.optInt(
+            "store_format_version",
+            LEGACY_STORE_FORMAT_VERSION,
+        )
+        check(
+            (schemaVersion == LEGACY_CHECKPOINT_SCHEMA_VERSION &&
+                storeFormatVersion == LEGACY_STORE_FORMAT_VERSION) ||
+                (schemaVersion == CHECKPOINT_SCHEMA_VERSION &&
+                    storeFormatVersion == STORE_FORMAT_VERSION)
+        ) {
             "Unsupported audit checkpoint payload schema"
         }
         return CheckpointPayload(
             schemaVersion = schemaVersion,
+            storeFormatVersion = storeFormatVersion,
             hmacKeyId = json.getString("hmac_key_id"),
             nextHmacKeyId = json.getString("next_hmac_key_id").also {
                 check(it.isSha256Hex())
@@ -1310,6 +1328,7 @@ class ModuleAuditCheckpointStore(
 
     private data class CheckpointPayload(
         val schemaVersion: Int,
+        val storeFormatVersion: Int,
         val hmacKeyId: String,
         val nextHmacKeyId: String,
         val inventoryHash: String,
@@ -1420,7 +1439,10 @@ class ModuleAuditCheckpointStore(
         const val SIGNATURE_ALGORITHM = "SHA256withECDSA"
         const val ENVELOPE_SCHEMA_VERSION = 2
         const val SOFTWARE_KEY_SCHEMA_VERSION = 1
-        const val CHECKPOINT_SCHEMA_VERSION = 6
+        const val LEGACY_CHECKPOINT_SCHEMA_VERSION = 6
+        const val CHECKPOINT_SCHEMA_VERSION = 7
+        const val LEGACY_STORE_FORMAT_VERSION = 1
+        const val STORE_FORMAT_VERSION = 2
         const val AUTHORIZATION_SCHEMA_VERSION = 2
         const val DASHBOARD_CACHE_SCHEMA_VERSION = 1
         const val P256_COORDINATE_BYTES = 32

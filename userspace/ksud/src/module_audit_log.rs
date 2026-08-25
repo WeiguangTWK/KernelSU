@@ -16,7 +16,10 @@ use crate::module_audit_action::{
 
 const SCHEMA_VERSION: u32 = 1;
 const EVENT_SCHEMA_VERSION: u32 = 2;
-const CHECKPOINT_SCHEMA_VERSION: u32 = 6;
+const LEGACY_CHECKPOINT_SCHEMA_VERSION: u32 = 6;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 7;
+const LEGACY_STORE_FORMAT_VERSION: u32 = 1;
+const STORE_FORMAT_VERSION: u32 = 2;
 const MANAGER_AUTH_SCHEMA_VERSION: u32 = 2;
 const KEY_FILE: &str = ".hmac-key";
 const MANAGER_AUTH_FILE: &str = "manager-auth.json";
@@ -33,6 +36,10 @@ const VERIFIED_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const AUTH_CHALLENGE_TTL_SECONDS: u64 = 5 * 60;
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 static ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+const fn legacy_store_format_version() -> u32 {
+    LEGACY_STORE_FORMAT_VERSION
+}
 
 #[derive(Debug)]
 struct AuditSnapshotChanged;
@@ -119,29 +126,6 @@ struct AuthenticatedEvent {
     event: AuditEvent,
     event_hash: String,
     hmac_sha256: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct ModuleIdentity {
-    schema_version: u32,
-    module_id: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct RiskRecord {
-    schema_version: u32,
-    module_id: String,
-    high_risk: bool,
-    reason: String,
-    updated_at_unix_seconds: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct HeadRecord {
-    schema_version: u32,
-    module_id: String,
-    sequence: u64,
-    head_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -380,6 +364,8 @@ pub struct CheckpointOperation {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CheckpointPayload {
     pub schema_version: u32,
+    #[serde(default = "legacy_store_format_version")]
+    pub store_format_version: u32,
     pub created_at_unix_seconds: u64,
     pub hmac_key_id: String,
     pub next_hmac_key_id: String,
@@ -1010,60 +996,12 @@ fn verify_module_with_key_unlocked(
     key: &[u8; 32],
 ) -> Result<(ModuleAuditStatus, VerifiedChain)> {
     validate_module_id(module_id)?;
-    let identity_failure = verify_identity(root, module_id, key).err();
     let sealed = verified_sealed_event_hashes(root, module_id, key)?;
-    let mut chain = verify_chain(root, module_id, key, repair)?;
-    if repair && let Some(error) = identity_failure {
-        let identity_path = module_path(root, module_id).join("identity.json");
-        let quarantine = quarantine_auxiliary(root, module_id, &identity_path, "identity")?;
-        ensure_identity(root, module_id, key)?;
-        append_incident(
-            root,
-            module_id,
-            key,
-            &mut chain.events,
-            0,
-            AuditIncidentCause::IdentityRecordInvalid,
-            format!("audit identity integrity failure: {error:#}"),
-            &quarantine,
-        )?;
-        chain.state = VerificationState::Recovered;
-    }
-    let mut high_risk = chain
+    let chain = verify_chain(root, module_id, key, repair)?;
+    let high_risk = chain
         .events
         .iter()
         .any(|entry| matches!(entry.event.kind, AuditEventKind::IntegrityIncident { .. }));
-    let risk_record_high_risk = match read_risk(root, module_id, key) {
-        Ok(Some(risk)) => {
-            high_risk |= risk.high_risk;
-            Some(risk.high_risk)
-        }
-        Ok(None) => None,
-        Err(error) => {
-            if !repair {
-                None
-            } else {
-                let risk_path = risk_path(root, module_id);
-                let quarantine = quarantine_auxiliary(root, module_id, &risk_path, "risk")?;
-                append_incident(
-                    root,
-                    module_id,
-                    key,
-                    &mut chain.events,
-                    0,
-                    AuditIncidentCause::RiskRecordInvalid,
-                    format!("audit risk registry integrity failure: {error:#}"),
-                    &quarantine,
-                )?;
-                chain.state = VerificationState::Recovered;
-                high_risk = true;
-                None
-            }
-        }
-    };
-    if repair && high_risk && risk_record_high_risk != Some(true) {
-        write_risk(root, module_id, key, "audit history integrity failure")?;
-    }
     let last_secure_removal = chain
         .events
         .iter()
@@ -1226,6 +1164,9 @@ pub fn dashboard_store_revision(root: &Path) -> Result<String> {
         entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
             let path = entry.path();
+            if is_legacy_derived_audit_path(root, &path) {
+                continue;
+            }
             let metadata = std::fs::symlink_metadata(&path)?;
             digest.update(
                 path.strip_prefix(root)
@@ -1233,13 +1174,6 @@ pub fn dashboard_store_revision(root: &Path) -> Result<String> {
                     .as_os_str()
                     .as_encoded_bytes(),
             );
-            digest.update(metadata.len().to_le_bytes());
-            if let Ok(modified) = metadata.modified()
-                && let Ok(elapsed) = modified.duration_since(UNIX_EPOCH)
-            {
-                digest.update(elapsed.as_secs().to_le_bytes());
-                digest.update(elapsed.subsec_nanos().to_le_bytes());
-            }
             let file_type = metadata.file_type();
             digest.update([
                 u8::from(file_type.is_dir()),
@@ -1248,6 +1182,7 @@ pub fn dashboard_store_revision(root: &Path) -> Result<String> {
             if file_type.is_dir() {
                 pending.push(path);
             } else if file_type.is_file() {
+                digest.update(metadata.len().to_le_bytes());
                 let mut file = File::open(&path)
                     .with_context(|| format!("open audit dashboard input {}", path.display()))?;
                 let mut buffer = [0_u8; 8192];
@@ -1258,10 +1193,27 @@ pub fn dashboard_store_revision(root: &Path) -> Result<String> {
                     }
                     digest.update(&buffer[..read]);
                 }
+            } else if file_type.is_symlink() {
+                digest.update(std::fs::read_link(&path)?.as_os_str().as_encoded_bytes());
             }
         }
     }
     Ok(hex(&digest.finalize()))
+}
+
+fn is_legacy_derived_audit_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    if relative.starts_with("risk") {
+        return true;
+    }
+    relative.starts_with("modules")
+        && relative.components().count() == 3
+        && matches!(
+            relative.file_name().and_then(std::ffi::OsStr::to_str),
+            Some("identity.json" | "head.json")
+        )
 }
 
 pub fn read_module_history(
@@ -1550,17 +1502,6 @@ pub fn prune_stale_histories(
                 trash.exists(),
                 "cleaned audit history and its quarantine are missing"
             );
-        }
-        let risk = risk_path(root, &module_id);
-        if risk.exists() {
-            let trash_risk = trash.join("risk.json");
-            ensure!(
-                !trash_risk.exists(),
-                "cleanup risk quarantine already exists"
-            );
-            std::fs::rename(&risk, &trash_risk)
-                .with_context(|| format!("quarantine risk record for {module_id}"))?;
-            sync_dir(risk.parent().context("risk record has no parent")?)?;
         }
         pruned.push(PrunedAuditHistory {
             module_id,
@@ -1874,6 +1815,7 @@ pub fn repair_audit_store(root: &Path) -> Result<()> {
     }
     let _lock = AuditLock::acquire(root, false)?;
     let key = load_key(root, false)?;
+    remove_legacy_derived_state_unlocked(root)?;
     recover_operation_progress(root, &key)?;
     let registry = read_manager_auth_registry(root, &key)?;
     if let Some(seal) = match &registry {
@@ -1884,6 +1826,52 @@ pub fn repair_audit_store(root: &Path) -> Result<()> {
         finalize_sealed_operation_trash(root, &seal.payload)?;
     }
     Ok(())
+}
+
+/// Remove v1 metadata that duplicated authenticated event-chain state.
+///
+/// v2 readers never consult these paths, so every individual removal is an
+/// idempotent cleanup rather than a trust transition.  A crash can leave only
+/// ignored v1 files behind; the next maintenance pass safely resumes removal.
+pub fn migrate_audit_store_v2(root: &Path) -> Result<()> {
+    if dashboard_store_uninitialized(root)? {
+        return Ok(());
+    }
+    let _lock = AuditLock::acquire(root, false)?;
+    read_key(root)?;
+    remove_legacy_derived_state_unlocked(root)
+}
+
+fn remove_legacy_derived_state_unlocked(root: &Path) -> Result<()> {
+    remove_legacy_path(&root.join("risk"))?;
+    let modules = root.join("modules");
+    if modules.exists() {
+        for module_id in audit_module_ids(&modules)? {
+            let module = module_path(root, &module_id);
+            remove_legacy_path(&module.join("identity.json"))?;
+            remove_legacy_path(&module.join("head.json"))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_legacy_path(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect legacy audit path {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove legacy audit directory {}", path.display()))?;
+    } else {
+        std::fs::remove_file(path)
+            .with_context(|| format!("remove legacy audit file {}", path.display()))?;
+    }
+    sync_dir(path.parent().context("legacy audit path has no parent")?)
 }
 
 fn checkpoint_payload_unlocked(root: &Path) -> Result<CheckpointPayload> {
@@ -1933,6 +1921,8 @@ fn checkpoint_payload_readonly_unlocked(root: &Path, key: &[u8; 32]) -> Result<C
     let next_hmac_key_id =
         next_hmac_key_id_for_checkpoint(root, key, &modules, &tombstones, &operations)?;
     let inventory_hash = checkpoint_inventory_hash(
+        CHECKPOINT_SCHEMA_VERSION,
+        STORE_FORMAT_VERSION,
         &hmac_key_id,
         &next_hmac_key_id,
         &modules,
@@ -1941,6 +1931,7 @@ fn checkpoint_payload_readonly_unlocked(root: &Path, key: &[u8; 32]) -> Result<C
     )?;
     Ok(CheckpointPayload {
         schema_version: CHECKPOINT_SCHEMA_VERSION,
+        store_format_version: STORE_FORMAT_VERSION,
         created_at_unix_seconds: now(),
         hmac_key_id,
         next_hmac_key_id,
@@ -2025,18 +2016,6 @@ fn recover_prune_completion(root: &Path, module_id: &str, operation_id: &str) ->
         !live.exists(),
         "cleanup recovery found both live and quarantined audit histories"
     );
-    let risk = risk_path(root, module_id);
-    let trash_risk = trash.join("risk.json");
-    if risk.exists() {
-        ensure!(
-            !trash_risk.exists(),
-            "cleanup recovery found duplicate risk records"
-        );
-        std::fs::rename(&risk, &trash_risk)
-            .with_context(|| format!("finish quarantining risk record for {module_id}"))?;
-        sync_dir(risk.parent().context("risk record has no parent")?)?;
-        sync_dir(&trash)?;
-    }
     Ok(true)
 }
 
@@ -2195,6 +2174,8 @@ fn next_hmac_key_id_for_checkpoint(
 }
 
 fn checkpoint_inventory_hash(
+    schema_version: u32,
+    store_format_version: u32,
     hmac_key_id: &str,
     next_hmac_key_id: &str,
     modules: &[CheckpointModuleHead],
@@ -2202,7 +2183,7 @@ fn checkpoint_inventory_hash(
     operations: &[CheckpointOperation],
 ) -> Result<String> {
     #[derive(Serialize)]
-    struct Inventory<'a> {
+    struct LegacyInventory<'a> {
         schema_version: u32,
         hmac_key_id: &'a str,
         next_hmac_key_id: &'a str,
@@ -2211,14 +2192,49 @@ fn checkpoint_inventory_hash(
         operations: &'a [CheckpointOperation],
     }
 
-    let bytes = serde_json::to_vec(&Inventory {
-        schema_version: CHECKPOINT_SCHEMA_VERSION,
-        hmac_key_id,
-        next_hmac_key_id,
-        modules,
-        tombstones,
-        operations,
-    })?;
+    #[derive(Serialize)]
+    struct Inventory<'a> {
+        schema_version: u32,
+        store_format_version: u32,
+        hmac_key_id: &'a str,
+        next_hmac_key_id: &'a str,
+        modules: &'a [CheckpointModuleHead],
+        tombstones: &'a [CheckpointTombstone],
+        operations: &'a [CheckpointOperation],
+    }
+
+    let bytes = match schema_version {
+        LEGACY_CHECKPOINT_SCHEMA_VERSION => {
+            ensure!(
+                store_format_version == LEGACY_STORE_FORMAT_VERSION,
+                "legacy checkpoint has an invalid store format"
+            );
+            serde_json::to_vec(&LegacyInventory {
+                schema_version,
+                hmac_key_id,
+                next_hmac_key_id,
+                modules,
+                tombstones,
+                operations,
+            })?
+        }
+        CHECKPOINT_SCHEMA_VERSION => {
+            ensure!(
+                store_format_version == STORE_FORMAT_VERSION,
+                "checkpoint has an invalid store format"
+            );
+            serde_json::to_vec(&Inventory {
+                schema_version,
+                store_format_version,
+                hmac_key_id,
+                next_hmac_key_id,
+                modules,
+                tombstones,
+                operations,
+            })?
+        }
+        _ => bail!("unsupported checkpoint schema"),
+    };
     Ok(hex(&Sha256::digest(bytes)))
 }
 
@@ -3355,7 +3371,13 @@ fn verify_manager_checkpoint_envelope(
     let payload: CheckpointPayload =
         serde_json::from_slice(&payload_bytes).context("parse Manager audit seal payload")?;
     ensure!(
-        payload.schema_version == CHECKPOINT_SCHEMA_VERSION,
+        matches!(
+            (payload.schema_version, payload.store_format_version),
+            (
+                LEGACY_CHECKPOINT_SCHEMA_VERSION,
+                LEGACY_STORE_FORMAT_VERSION
+            ) | (CHECKPOINT_SCHEMA_VERSION, STORE_FORMAT_VERSION)
+        ),
         "unsupported Manager audit seal payload schema"
     );
     validate_sha256_hex(&payload.hmac_key_id, "HMAC key id")?;
@@ -3366,6 +3388,8 @@ fn verify_manager_checkpoint_envelope(
     }
     ensure!(
         checkpoint_inventory_hash(
+            payload.schema_version,
+            payload.store_format_version,
             &payload.hmac_key_id,
             &payload.next_hmac_key_id,
             &payload.modules,
@@ -3447,6 +3471,15 @@ fn ensure_checkpoint_extends(
     current: &CheckpointPayload,
     registry: &ManagerAuditAuthRegistry,
 ) -> Result<()> {
+    ensure!(
+        (previous.schema_version == current.schema_version
+            && previous.store_format_version == current.store_format_version)
+            || (previous.schema_version == LEGACY_CHECKPOINT_SCHEMA_VERSION
+                && previous.store_format_version == LEGACY_STORE_FORMAT_VERSION
+                && current.schema_version == CHECKPOINT_SCHEMA_VERSION
+                && current.store_format_version == STORE_FORMAT_VERSION),
+        "Manager audit store format changed unexpectedly"
+    );
     let same_hmac_key = previous.hmac_key_id == current.hmac_key_id;
     let authorized_hmac_rotation = previous.next_hmac_key_id == current.hmac_key_id;
     ensure!(
@@ -3957,7 +3990,6 @@ pub fn recover_manager_sealed_module(
             failure.reason,
             &quarantine,
         )?;
-        write_risk(root, module_id, &key, "audit history integrity failure")?;
     }
     let module_status = if unexpected_only {
         verify_module_unlocked(root, module_id, false)?
@@ -4599,9 +4631,6 @@ fn operation_tombstone_path(root: &Path, module_id: &str, operation_id: &str) ->
 #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
 fn append_event(root: &Path, module_id: &str, kind: AuditEventKind) -> Result<()> {
     let key = load_key(root, true)?;
-    if !module_path(root, module_id).exists() {
-        ensure_identity(root, module_id, &key)?;
-    }
     verify_module_unlocked(root, module_id, true)?;
     let chain = verify_chain(root, module_id, &key, true)?;
     let sequence = u64::try_from(chain.events.len())
@@ -4697,38 +4726,6 @@ fn verify_chain(
             })
         })
     else {
-        if !valid.is_empty() {
-            match verify_head(root, module_id, key, &valid) {
-                Ok(HeadState::Current) => {}
-                Ok(HeadState::StaleButValid) if repair => write_head(
-                    root,
-                    module_id,
-                    key,
-                    valid.last().context("non-empty audit chain has no head")?,
-                )?,
-                Ok(HeadState::StaleButValid) => {}
-                Err(_) if !repair => {}
-                Err(error) => {
-                    let head_path = head_path(root, module_id);
-                    let quarantine = quarantine_auxiliary(root, module_id, &head_path, "head")?;
-                    append_incident(
-                        root,
-                        module_id,
-                        key,
-                        &mut valid,
-                        0,
-                        AuditIncidentCause::HeadRecordInvalid,
-                        format!("audit head integrity failure: {error:#}"),
-                        &quarantine,
-                    )?;
-                    write_risk(root, module_id, key, "audit history integrity failure")?;
-                    return Ok(VerifiedChain {
-                        events: valid,
-                        state: VerificationState::Recovered,
-                    });
-                }
-            }
-        }
         let state = if valid.is_empty() {
             VerificationState::Empty
         } else {
@@ -4756,7 +4753,6 @@ fn verify_chain(
         reason,
         &quarantine,
     )?;
-    write_risk(root, module_id, key, "audit history integrity failure")?;
     Ok(VerifiedChain {
         events: valid,
         state: VerificationState::Recovered,
@@ -4876,8 +4872,7 @@ fn write_event(root: &Path, module_id: &str, key: &[u8; 32], event: AuditEvent) 
     };
     let path = event_path(root, module_id, entry.event.sequence);
     ensure_dir(path.parent().context("event path has no parent")?)?;
-    atomic_write_json(&path, &entry)?;
-    write_head(root, module_id, key, &entry)
+    atomic_write_json(&path, &entry)
 }
 
 fn authenticated_event_hash(event: &[u8], hmac_sha256: &str) -> String {
@@ -4910,126 +4905,6 @@ fn audit_event_paths(events_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> 
     Ok((events, unexpected))
 }
 
-enum HeadState {
-    Current,
-    StaleButValid,
-}
-
-fn verify_head(
-    root: &Path,
-    module_id: &str,
-    key: &[u8; 32],
-    events: &[AuthenticatedEvent],
-) -> Result<HeadState> {
-    let path = head_path(root, module_id);
-    let head: AuthenticatedRecord<HeadRecord> = read_json(&path)?;
-    verify_record(&head.record, &head.hmac_sha256, key)?;
-    ensure!(
-        head.record.schema_version == SCHEMA_VERSION,
-        "unsupported audit head schema"
-    );
-    ensure!(
-        head.record.module_id == module_id,
-        "audit head module id mismatch"
-    );
-    ensure!(head.record.sequence > 0, "invalid audit head sequence");
-    let last = events.last().context("cannot verify an empty audit head")?;
-    if head.record.sequence == last.event.sequence && head.record.head_hash == last.event_hash {
-        return Ok(HeadState::Current);
-    }
-    if head.record.sequence < last.event.sequence {
-        let index = usize::try_from(head.record.sequence.saturating_sub(1))?;
-        if events
-            .get(index)
-            .is_some_and(|entry| entry.event_hash == head.record.head_hash)
-        {
-            return Ok(HeadState::StaleButValid);
-        }
-    }
-    bail!("audit head does not match the verified event chain")
-}
-
-fn write_head(
-    root: &Path,
-    module_id: &str,
-    key: &[u8; 32],
-    entry: &AuthenticatedEvent,
-) -> Result<()> {
-    let record = HeadRecord {
-        schema_version: SCHEMA_VERSION,
-        module_id: module_id.to_owned(),
-        sequence: entry.event.sequence,
-        head_hash: entry.event_hash.clone(),
-    };
-    write_record(&head_path(root, module_id), record, key)
-}
-
-fn ensure_identity(root: &Path, module_id: &str, key: &[u8; 32]) -> Result<()> {
-    let path = module_path(root, module_id).join("identity.json");
-    if path.exists() {
-        let identity: AuthenticatedRecord<ModuleIdentity> = read_json(&path)?;
-        verify_record(&identity.record, &identity.hmac_sha256, key)?;
-        ensure!(
-            identity.record.schema_version == SCHEMA_VERSION,
-            "unsupported audit identity schema"
-        );
-        ensure!(
-            identity.record.module_id == module_id,
-            "module audit identity mismatch"
-        );
-        return Ok(());
-    }
-    let record = ModuleIdentity {
-        schema_version: SCHEMA_VERSION,
-        module_id: module_id.to_owned(),
-    };
-    write_record(&path, record, key)
-}
-
-fn verify_identity(root: &Path, module_id: &str, key: &[u8; 32]) -> Result<()> {
-    let path = module_path(root, module_id).join("identity.json");
-    let identity: AuthenticatedRecord<ModuleIdentity> = read_json(&path)?;
-    verify_record(&identity.record, &identity.hmac_sha256, key)?;
-    ensure!(
-        identity.record.schema_version == SCHEMA_VERSION,
-        "unsupported audit identity schema"
-    );
-    ensure!(
-        identity.record.module_id == module_id,
-        "module audit identity mismatch"
-    );
-    Ok(())
-}
-
-fn write_risk(root: &Path, module_id: &str, key: &[u8; 32], reason: &str) -> Result<()> {
-    let record = RiskRecord {
-        schema_version: SCHEMA_VERSION,
-        module_id: module_id.to_owned(),
-        high_risk: true,
-        reason: reason.to_owned(),
-        updated_at_unix_seconds: now(),
-    };
-    write_record(&risk_path(root, module_id), record, key)
-}
-
-fn read_risk(root: &Path, module_id: &str, key: &[u8; 32]) -> Result<Option<RiskRecord>> {
-    let path = risk_path(root, module_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let risk: AuthenticatedRecord<RiskRecord> = read_json(&path)?;
-    verify_record(&risk.record, &risk.hmac_sha256, key)?;
-    ensure!(
-        risk.record.schema_version == SCHEMA_VERSION,
-        "unsupported risk record schema"
-    );
-    ensure!(
-        risk.record.module_id == module_id,
-        "risk record module id mismatch"
-    );
-    Ok(Some(risk.record))
-}
-
 fn write_record<T: Serialize>(path: &Path, record: T, key: &[u8; 32]) -> Result<()> {
     let bytes = serde_json::to_vec(&record)?;
     let envelope = AuthenticatedRecord {
@@ -5057,11 +4932,6 @@ fn quarantine_suffix(root: &Path, module_id: &str, paths: &[PathBuf]) -> Result<
         let name = path.file_name().context("audit event has no filename")?;
         std::fs::rename(path, directory.join(name)).context("quarantine corrupt audit event")?;
     }
-    let head = head_path(root, module_id);
-    if head.exists() {
-        std::fs::rename(&head, directory.join("head.json"))
-            .context("quarantine invalid audit head")?;
-    }
     sync_dir(directory.parent().context("quarantine has no parent")?)?;
     Ok(directory)
 }
@@ -5081,19 +4951,6 @@ fn quarantine_unexpected_entries(
     }
     sync_dir(directory.parent().context("quarantine has no parent")?)?;
     Ok(directory)
-}
-
-fn quarantine_auxiliary(root: &Path, module_id: &str, path: &Path, label: &str) -> Result<PathBuf> {
-    let directory = module_path(root, module_id)
-        .join("quarantine")
-        .join(format!("{}-{}", now(), std::process::id()));
-    ensure_dir(&directory)?;
-    let destination = directory.join(format!("{label}.json"));
-    if path.exists() {
-        std::fs::rename(path, &destination).context("quarantine corrupt audit metadata")?;
-        sync_dir(path.parent().context("audit metadata has no parent")?)?;
-    }
-    Ok(destination)
 }
 
 fn load_key(root: &Path, create: bool) -> Result<[u8; 32]> {
@@ -5259,22 +5116,6 @@ fn reauthenticate_audit_metadata(root: &Path, previous: &[u8; 32], next: &[u8; 3
         previous,
         next,
     )?;
-    let modules = root.join("modules");
-    if modules.exists() {
-        for module_id in audit_module_ids(&modules)? {
-            let module = module_path(root, &module_id);
-            rewrite_authenticated_file::<ModuleIdentity>(
-                &module.join("identity.json"),
-                previous,
-                next,
-            )?;
-            let head = module.join("head.json");
-            if head.exists() {
-                rewrite_authenticated_file::<HeadRecord>(&head, previous, next)?;
-            }
-        }
-    }
-    rewrite_authenticated_directory::<RiskRecord>(&root.join("risk"), previous, next)?;
     rewrite_authenticated_directory::<PrunedHistoryTombstone>(
         &root.join("tombstones"),
         previous,
@@ -5427,15 +5268,6 @@ fn event_path(root: &Path, module_id: &str, sequence: u64) -> PathBuf {
     module_path(root, module_id)
         .join("events")
         .join(format!("{sequence:020}.json"))
-}
-
-fn risk_path(root: &Path, module_id: &str) -> PathBuf {
-    root.join("risk")
-        .join(format!("{}.json", module_dir_name(module_id)))
-}
-
-fn head_path(root: &Path, module_id: &str) -> PathBuf {
-    module_path(root, module_id).join("head.json")
 }
 
 fn now() -> u64 {
@@ -5627,7 +5459,19 @@ mod tests {
 
     fn checkpoint_envelope(root: &Path, signing_key: &SigningKey, generation: u64) -> String {
         let payload = checkpoint_payload(root).unwrap();
-        let payload_base64 = encode_base64(&serde_json::to_vec(&payload).unwrap());
+        checkpoint_envelope_for_payload(
+            &serde_json::to_vec(&payload).unwrap(),
+            signing_key,
+            generation,
+        )
+    }
+
+    fn checkpoint_envelope_for_payload(
+        payload: &[u8],
+        signing_key: &SigningKey,
+        generation: u64,
+    ) -> String {
+        let payload_base64 = encode_base64(payload);
         let key_id = hex(&Sha256::digest(
             signing_key
                 .verifying_key()
@@ -5834,12 +5678,7 @@ mod tests {
                 .join("quarantine")
                 .exists()
         );
-        assert!(
-            temp.path()
-                .join("risk")
-                .join(format!("{}.json", module_dir_name("test.module")))
-                .exists()
-        );
+        assert_eq!(recovered.incidents.len(), 1);
     }
 
     #[test]
@@ -5860,44 +5699,42 @@ mod tests {
     }
 
     #[test]
-    fn deleted_event_suffix_is_detected_by_authenticated_head() {
+    fn deleted_event_suffix_is_detected_by_manager_seal() {
         let temp = TempDir::new().unwrap();
         record(temp.path(), "test.module", "ab");
         record(temp.path(), "test.module", "cd");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+        commit_manager_audit_seal(temp.path(), &checkpoint_envelope(temp.path(), &manager, 1))
+            .unwrap();
         std::fs::remove_file(event_path(temp.path(), "test.module", 4)).unwrap();
 
-        let status = verify_module(temp.path(), "test.module", true).unwrap();
-        assert_eq!(status.verification, VerificationState::Recovered);
-        assert_eq!(status.event_count, 4);
-        assert!(status.high_risk);
+        assert!(verify_module(temp.path(), "test.module", true).is_err());
     }
 
     #[test]
-    fn stale_head_after_completed_event_is_healed_without_tamper_alarm() {
+    fn legacy_derived_metadata_is_ignored_and_removed() {
         let temp = TempDir::new().unwrap();
         record(temp.path(), "test.module", "ab");
-        let key = load_key(temp.path(), false).unwrap();
-        let first: AuthenticatedEvent =
-            read_json(&event_path(temp.path(), "test.module", 1)).unwrap();
-        record(temp.path(), "test.module", "cd");
-        write_head(temp.path(), "test.module", &key, &first).unwrap();
+        let revision = dashboard_store_revision(temp.path()).unwrap();
+        let module = module_path(temp.path(), "test.module");
+        std::fs::write(module.join("identity.json"), b"legacy identity").unwrap();
+        std::fs::write(module.join("head.json"), b"legacy head").unwrap();
+        std::fs::create_dir(temp.path().join("risk")).unwrap();
+        std::fs::write(temp.path().join("risk/test.module.json"), b"legacy risk").unwrap();
+
+        assert_eq!(dashboard_store_revision(temp.path()).unwrap(), revision);
 
         let status = verify_module(temp.path(), "test.module", true).unwrap();
         assert_eq!(status.verification, VerificationState::Verified);
-        assert_eq!(status.event_count, 4);
+        assert_eq!(status.event_count, 2);
         assert!(!status.high_risk);
-        assert!(matches!(
-            verify_head(
-                temp.path(),
-                "test.module",
-                &key,
-                &verify_chain(temp.path(), "test.module", &key, false)
-                    .unwrap()
-                    .events
-            )
-            .unwrap(),
-            HeadState::Current
-        ));
+
+        migrate_audit_store_v2(temp.path()).unwrap();
+        assert!(!module.join("identity.json").exists());
+        assert!(!module.join("head.json").exists());
+        assert!(!temp.path().join("risk").exists());
+        assert_eq!(dashboard_store_revision(temp.path()).unwrap(), revision);
     }
 
     #[test]
@@ -5956,6 +5793,7 @@ mod tests {
         );
         assert_eq!(payload.hmac_key_id.len(), 64);
         assert_eq!(payload.schema_version, CHECKPOINT_SCHEMA_VERSION);
+        assert_eq!(payload.store_format_version, STORE_FORMAT_VERSION);
         assert_eq!(payload.inventory_hash.len(), 64);
         assert_eq!(
             checkpoint_payload(&audit_root).unwrap().inventory_hash,
@@ -6200,6 +6038,75 @@ mod tests {
     }
 
     #[test]
+    fn legacy_manager_seal_migrates_once_to_store_v2() {
+        let temp = TempDir::new().unwrap();
+        record(temp.path(), "test.module", "ab");
+        let manager = signing_key(7);
+        register_manager_audit_auth_key(temp.path(), &public_key_hex(&manager), false).unwrap();
+
+        let mut legacy = checkpoint_payload(temp.path()).unwrap();
+        legacy.schema_version = LEGACY_CHECKPOINT_SCHEMA_VERSION;
+        legacy.store_format_version = LEGACY_STORE_FORMAT_VERSION;
+        legacy.inventory_hash = checkpoint_inventory_hash(
+            legacy.schema_version,
+            legacy.store_format_version,
+            &legacy.hmac_key_id,
+            &legacy.next_hmac_key_id,
+            &legacy.modules,
+            &legacy.tombstones,
+            &legacy.operations,
+        )
+        .unwrap();
+        let mut legacy_json = serde_json::to_value(&legacy).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("store_format_version");
+        let envelope_hex = checkpoint_envelope_for_payload(
+            &serde_json::to_vec(&legacy_json).unwrap(),
+            &manager,
+            1,
+        );
+        let envelope_bytes = decode_hex(&envelope_hex).unwrap();
+        let seal_hash = hex(&Sha256::digest(&envelope_bytes));
+        atomic_write_json(
+            &manager_seal_path(temp.path()),
+            &StoredManagerSeal {
+                envelope_hex,
+                seal_hash: seal_hash.clone(),
+            },
+        )
+        .unwrap();
+        let key = read_key(temp.path()).unwrap();
+        complete_hmac_rotation(temp.path(), &key, &legacy, &seal_hash).unwrap();
+
+        let transition = verified_audit_snapshot(temp.path()).unwrap();
+        assert_eq!(
+            transition.inventory_relation,
+            AuditInventoryRelation::AuthorizedTransition
+        );
+        assert_eq!(
+            transition.checkpoint.schema_version,
+            CHECKPOINT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            transition.checkpoint.store_format_version,
+            STORE_FORMAT_VERSION
+        );
+
+        let status =
+            commit_manager_audit_seal(temp.path(), &checkpoint_envelope(temp.path(), &manager, 2))
+                .unwrap();
+        assert_eq!(status.generation, Some(2));
+        assert_eq!(
+            verified_audit_snapshot(temp.path())
+                .unwrap()
+                .inventory_relation,
+            AuditInventoryRelation::SealedCurrent
+        );
+    }
+
+    #[test]
     fn manager_seal_detects_event_hmac_tampering() {
         let temp = TempDir::new().unwrap();
         record(temp.path(), "module.alpha", "ab");
@@ -6387,40 +6294,6 @@ mod tests {
         assert!(snapshot.histories.is_empty());
         assert!(snapshot.checkpoint.modules.is_empty());
         assert_eq!(snapshot.checkpoint.tombstones.len(), 1);
-    }
-
-    #[test]
-    fn verified_snapshot_does_not_repair_a_stale_head() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-        record(root, "test.module", "ab");
-        let manager = signing_key(7);
-        register_manager_audit_auth_key(root, &public_key_hex(&manager), false).unwrap();
-        commit_manager_audit_seal(root, &checkpoint_envelope(root, &manager, 1)).unwrap();
-        let key = read_key(root).unwrap();
-        let first: AuthenticatedEvent = read_json(&event_path(root, "test.module", 1)).unwrap();
-        write_head(root, "test.module", &key, &first).unwrap();
-        let revision = dashboard_store_revision(root).unwrap();
-
-        let snapshot = verified_audit_snapshot(root).unwrap();
-
-        assert_eq!(
-            snapshot.inventory_relation,
-            AuditInventoryRelation::SealedCurrent
-        );
-        assert_eq!(dashboard_store_revision(root).unwrap(), revision);
-        assert!(matches!(
-            verify_head(
-                root,
-                "test.module",
-                &key,
-                &verify_chain(root, "test.module", &key, false)
-                    .unwrap()
-                    .events
-            )
-            .unwrap(),
-            HeadState::StaleButValid
-        ));
     }
 
     #[test]
@@ -6954,51 +6827,6 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_risk_registry_is_recovered_and_recorded() {
-        let temp = TempDir::new().unwrap();
-        record(temp.path(), "test.module", "ab");
-        let event = event_path(temp.path(), "test.module", 1);
-        std::fs::write(&event, b"corrupt event").unwrap();
-        verify_module(temp.path(), "test.module", true).unwrap();
-        let risk = risk_path(temp.path(), "test.module");
-        std::fs::write(&risk, b"corrupt risk").unwrap();
-
-        let status = verify_module(temp.path(), "test.module", true).unwrap();
-        assert_eq!(status.verification, VerificationState::Recovered);
-        assert_eq!(status.event_count, 2);
-        assert!(status.high_risk);
-        assert!(
-            read_risk(
-                temp.path(),
-                "test.module",
-                &load_key(temp.path(), false).unwrap()
-            )
-            .unwrap()
-            .unwrap()
-            .high_risk
-        );
-    }
-
-    #[test]
-    fn corrupted_identity_is_recovered_and_recorded() {
-        let temp = TempDir::new().unwrap();
-        record(temp.path(), "test.module", "ab");
-        let identity = module_path(temp.path(), "test.module").join("identity.json");
-        std::fs::write(&identity, b"corrupt identity").unwrap();
-
-        let status = verify_module(temp.path(), "test.module", true).unwrap();
-        assert_eq!(status.verification, VerificationState::Recovered);
-        assert_eq!(status.event_count, 3);
-        assert!(status.high_risk);
-        verify_identity(
-            temp.path(),
-            "test.module",
-            &load_key(temp.path(), false).unwrap(),
-        )
-        .unwrap();
-    }
-
-    #[test]
     fn stale_history_is_pruned_with_authenticated_tombstone() {
         let temp = TempDir::new().unwrap();
         let audit_root = temp.path().join("audit");
@@ -7058,13 +6886,6 @@ mod tests {
         std::fs::create_dir(&installed_root).unwrap();
         record(&audit_root, "stale.module", "ab");
         let key = load_key(&audit_root, false).unwrap();
-        write_risk(
-            &audit_root,
-            "stale.module",
-            &key,
-            "test interrupted cleanup",
-        )
-        .unwrap();
         let operation = begin_test_operation(&audit_root, AuditAction::Prune, &["stale.module"]);
         prune_stale_histories(
             &audit_root,
@@ -7076,11 +6897,6 @@ mod tests {
 
         let trash_history =
             operation_trash_path(&audit_root, &operation.operation_id, "stale.module");
-        std::fs::rename(
-            trash_history.join("risk.json"),
-            risk_path(&audit_root, "stale.module"),
-        )
-        .unwrap();
         let mut interrupted = read_operation(&audit_root, &operation.operation_id, &key)
             .unwrap()
             .unwrap();
@@ -7112,8 +6928,7 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.state, AuditOperationState::Applied);
         assert_eq!(recovered.completed_targets, vec!["stale.module"]);
-        assert!(!risk_path(&audit_root, "stale.module").exists());
-        assert!(trash_history.join("risk.json").exists());
+        assert!(trash_history.exists());
         let trash = audit_root
             .join(OPERATION_TRASH_DIR)
             .join(&operation.operation_id);
