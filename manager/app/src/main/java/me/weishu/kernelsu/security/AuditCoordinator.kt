@@ -519,10 +519,6 @@ class AuditCoordinator internal constructor(context: Context) {
             "Installed modules are missing from the verified audit inventory: " +
                 assessment.unauditedModuleIds.joinToString()
         }
-        check(assessment.unsealedModuleIds.isEmpty()) {
-            "Module audit histories are not Manager-sealed: " +
-                assessment.unsealedModuleIds.joinToString()
-        }
         check(assessment.kernelSafeMode == responseStatus.kernelSafeMode) {
             "Audit assessment safe-mode state does not match its response snapshot"
         }
@@ -592,6 +588,16 @@ class AuditCoordinator internal constructor(context: Context) {
             check(sealPass < 3) { "Manager audit seal did not converge to a stable snapshot" }
             invalidate()
             return verifySnapshotUnlocked(installSession, sealPass + 1)
+        }
+        // A verified installation or audit transaction is expected to extend
+        // the current Manager seal.  Its new module histories are necessarily
+        // unsealed until ensureSealUnlocked() commits that candidate inventory.
+        // Enforce completeness only after seal synchronization has converged;
+        // otherwise the coordinator rejects the transition before it can seal
+        // it and auditd correctly fail-closes as soon as the session is released.
+        check(assessment.unsealedModuleIds.isEmpty()) {
+            "Module audit histories are not Manager-sealed: " +
+                assessment.unsealedModuleIds.joinToString()
         }
         val authorizationReady = authorizationResult.getOrDefault(false) && sealResult.isSuccess
         if (authorizationReady && checkpoint.trust != AuditCheckpointTrust.Compromised) {
