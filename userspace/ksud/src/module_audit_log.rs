@@ -1942,6 +1942,18 @@ fn checkpoint_payload_readonly_unlocked(root: &Path, key: &[u8; 32]) -> Result<C
     })
 }
 
+fn quarantined_script_action_completed(target: &str, action: AuditAction) -> Result<bool> {
+    #[cfg(target_os = "android")]
+    {
+        crate::module_response::quarantined_script_action_completed(target, action)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (target, action);
+        bail!("quarantined script recovery is only available on Android")
+    }
+}
+
 fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
     let directory = root.join(OPERATIONS_DIR);
     if !directory.exists() {
@@ -1981,10 +1993,7 @@ fn recover_operation_progress(root: &Path, key: &[u8; 32]) -> Result<()> {
                     operation_incident_close_exists(root, target, &operation.operation_id, key)?
                 }
                 AuditOperationRecovery::QuarantinedScriptState => {
-                    crate::module_response::quarantined_script_action_completed(
-                        target,
-                        operation.action,
-                    )?
+                    quarantined_script_action_completed(target, operation.action)?
                 }
             };
             if completed {

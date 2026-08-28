@@ -166,6 +166,20 @@ pub fn try_check_kernel_safemode() -> std::io::Result<bool> {
     Ok(cmd.in_safe_mode != 0)
 }
 
+pub fn get_provenance_info() -> std::io::Result<ksu_uapi::ksu_provenance_info_v1> {
+    let mut info = unsafe { std::mem::zeroed::<ksu_uapi::ksu_provenance_info_v1>() };
+    ksuctl(ksu_uapi::KSU_IOCTL_PROVENANCE_GET_INFO, &raw mut info)?;
+    if usize::from(info.size) != std::mem::size_of_val(&info)
+        || u32::from(info.version) != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid audit provenance diagnostics response",
+        ));
+    }
+    Ok(info)
+}
+
 pub fn check_kernel_safemode() -> bool {
     try_check_kernel_safemode().unwrap_or(false)
 }

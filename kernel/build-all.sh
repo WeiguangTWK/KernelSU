@@ -23,6 +23,31 @@ fi
 : "${KSU_EXPECTED_SIZE:?Please export KSU_EXPECTED_SIZE}"
 : "${KSU_EXPECTED_HASH:?Please export KSU_EXPECTED_HASH}"
 
+KSU_PROVENANCE_BUILD="${CONFIG_KSU_PROVENANCE:-n}"
+case "$KSU_PROVENANCE_BUILD" in
+    y)
+        : "${KSU_PROVENANCE_KEY_HEADER:?Please export KSU_PROVENANCE_KEY_HEADER when CONFIG_KSU_PROVENANCE=y}"
+        if [[ "$KSU_PROVENANCE_KEY_HEADER" != /* ]]; then
+            echo "Error: KSU_PROVENANCE_KEY_HEADER must be an absolute path" >&2
+            exit 2
+        fi
+        if [[ ! -f "$KSU_PROVENANCE_KEY_HEADER" || ! -r "$KSU_PROVENANCE_KEY_HEADER" ]]; then
+            echo "Error: provenance public key header is not a readable regular file: $KSU_PROVENANCE_KEY_HEADER" >&2
+            exit 2
+        fi
+        ;;
+    n)
+        if [[ -n "${KSU_PROVENANCE_KEY_HEADER:-}" ]]; then
+            echo "Error: KSU_PROVENANCE_KEY_HEADER is set but CONFIG_KSU_PROVENANCE is not y" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "Error: CONFIG_KSU_PROVENANCE must be y or n" >&2
+        exit 2
+        ;;
+esac
+
 DDK_BIN="${DDK_BIN:-ddk}"
 DDK_ROOT="${DDK_ROOT:-/opt/ddk}"
 OUTPUT_DIR="$SCRIPT_DIR/out"
@@ -100,6 +125,13 @@ for kmi in "${KMIS[@]}"; do
 
     if [[ -n "${KSU_MANAGER_PACKAGE:-}" ]]; then
         make_args+=("KSU_MANAGER_PACKAGE=$KSU_MANAGER_PACKAGE")
+    fi
+
+    if [[ "$KSU_PROVENANCE_BUILD" == "y" ]]; then
+        make_args+=(
+            "CONFIG_KSU_PROVENANCE=y"
+            "KSU_PROVENANCE_KEY_HEADER=$KSU_PROVENANCE_KEY_HEADER"
+        )
     fi
 
     if "$DDK_BIN" build --target "$kmi" -- "${make_args[@]}"; then

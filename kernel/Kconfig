@@ -18,6 +18,16 @@ config KSU_DEBUG
 	help
 	  Enable KernelSU debug mode.
 
+config KSU_PROVENANCE
+	bool "Audit provenance protocol (experimental)"
+	depends on KSU && CRYPTO_SHA256 && CRYPTO_RSA
+	depends on ASYMMETRIC_KEY_TYPE && X509_CERTIFICATE_PARSER
+	default n
+	help
+	  Build the versioned audit provenance UAPI, canonical hashing, and
+	  signed ksud image verifier. The phase 1 implementation exposes only
+	  read-only diagnostics and no operational provenance capability.
+
 config KSU_DISABLE_MANAGER
 	bool "Disable KernelSU manager integration"
 	depends on KSU

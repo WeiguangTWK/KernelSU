@@ -122,6 +122,33 @@ object Natives {
     val managerUAPIVersion: Int
         external get
 
+    /** Phase 1 read-only audit provenance and image-verifier diagnostics. */
+    external fun getProvenanceInfo(): ProvenanceInfo?
+
+    @Keep
+    class ProvenanceInfo {
+        @JvmField var size: Int = 0
+        @JvmField var version: Int = 0
+        @JvmField var flags: Int = 0
+        @JvmField var providerState: Int = 0
+        @JvmField var trustTier: Int = 0
+        @JvmField var diagnosticCapabilities: Long = 0
+        @JvmField var operationalCapabilities: Long = 0
+        @JvmField var intentOperationClasses: Long = 0
+        @JvmField var resultOperationClasses: Long = 0
+        @JvmField var currentSequence: Long = 0
+        @JvmField var currentDigest: ByteArray = ByteArray(32)
+        @JvmField var bootEpoch: ByteArray = ByteArray(16)
+        @JvmField var eventSchemaVersion: Int = 0
+        @JvmField var manifestFormatVersion: Int = 0
+        @JvmField var uapiMin: Int = 0
+        @JvmField var uapiMax: Int = 0
+        @JvmField var verifierState: Int = 0
+        @JvmField var verifierError: Int = 0
+        @JvmField var minimumSecurityEpoch: Long = 0
+        @JvmField var signingKeyId: ByteArray = ByteArray(32)
+    }
+
     fun checkUAPIMismatch(): Boolean {
         return kernelUAPIVersion != managerUAPIVersion
     }

@@ -20,6 +20,13 @@
 
 static int fd = -1;
 
+static_assert(sizeof(ksu_provenance_event_header_v1) == 128);
+static_assert(sizeof(ksu_provenance_context_descriptor_v1) == 224);
+static_assert(sizeof(ksu_provenance_barrier_result_v1) == 96);
+static_assert(sizeof(ksu_provenance_control_cmd_v1) == 64);
+static_assert(sizeof(ksu_provenance_info_v1) == 192);
+static_assert(sizeof(ksu_provenance_image_manifest_v1) == 192);
+
 static inline int scan_driver_fd() {
     const char *kName = "[ksu_driver]";
     DIR *dir = opendir("/proc/self/fd");
@@ -103,6 +110,18 @@ uint32_t get_version() {
 
 bool get_allow_list(struct ksu_new_get_allow_list_cmd *cmd) {
     return ksuctl(KSU_IOCTL_NEW_GET_ALLOW_LIST, cmd) == 0;
+}
+
+bool get_provenance_info(struct ksu_provenance_info_v1 *info) {
+    if (!info) {
+        return false;
+    }
+    memset(info, 0, sizeof(*info));
+    if (ksuctl(KSU_IOCTL_PROVENANCE_GET_INFO, info) != 0) {
+        return false;
+    }
+    return info->size == sizeof(*info) &&
+           info->version == KSU_PROVENANCE_UAPI_VERSION;
 }
 
 bool is_safe_mode() {

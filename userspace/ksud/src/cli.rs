@@ -269,6 +269,9 @@ enum Debug {
     /// Get kernel info
     Info,
 
+    /// Get read-only audit provenance capability and verifier diagnostics
+    ProvenanceInfo,
+
     /// Print default package name
     Package,
 }
@@ -1574,6 +1577,39 @@ pub fn run() -> Result<()> {
                 println!(
                     "pr_build: {}",
                     (info.flags & ksu_uapi::KSU_GET_INFO_FLAG_PR_BUILD) != 0
+                );
+                Ok(())
+            }
+            Debug::ProvenanceInfo => {
+                let info = ksucalls::get_provenance_info()?;
+                println!("version: {}", info.version);
+                println!("provider_state: {}", info.provider_state);
+                println!("trust_tier: {}", info.trust_tier);
+                println!(
+                    "diagnostic_capabilities: 0x{:016x}",
+                    info.diagnostic_capabilities
+                );
+                println!(
+                    "operational_capabilities: 0x{:016x}",
+                    info.operational_capabilities
+                );
+                println!(
+                    "intent_operation_classes: 0x{:016x}",
+                    info.intent_operation_classes
+                );
+                println!(
+                    "result_operation_classes: 0x{:016x}",
+                    info.result_operation_classes
+                );
+                println!("event_schema_version: {}", info.event_schema_version);
+                println!("manifest_format_version: {}", info.manifest_format_version);
+                println!("uapi: {}..={}", info.uapi_min, info.uapi_max);
+                println!("verifier_state: {}", info.verifier_state);
+                println!("verifier_error: {}", info.verifier_error);
+                println!("minimum_security_epoch: {}", info.minimum_security_epoch);
+                println!(
+                    "signing_key_id: {}",
+                    base16ct::lower::encode_string(&info.signing_key_id)
                 );
                 Ok(())
             }

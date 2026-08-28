@@ -1,8 +1,12 @@
 use anyhow::Result;
 use clap::Parser;
+use std::path::PathBuf;
 
 use crate::boot_patch::{BootPatchArgs, BootRestoreArgs};
 use crate::lkm_image::BootPatchV2Args;
+use crate::provenance_manifest::{
+    GenerateCertificateOptions, KernelKeyHeaderOptions, SignOptions, VerifyOptions,
+};
 use crate::{apk_sign, defs};
 
 /// KernelSU cli for non-android
@@ -61,6 +65,77 @@ enum Commands {
         /// audit history root
         root: String,
     },
+
+    /// Build and inspect signed audit provenance artifacts
+    ProvenanceManifest {
+        #[command(subcommand)]
+        command: ProvenanceManifestCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ProvenanceManifestCommand {
+    /// Generate a new RSA-3072 private key and self-signed X.509 certificate
+    GenerateCertificate {
+        #[arg(long)]
+        private_key: PathBuf,
+        #[arg(long)]
+        certificate: PathBuf,
+        #[arg(long, default_value = "KernelSU provenance build")]
+        common_name: String,
+        #[arg(long, default_value_t = 3650)]
+        validity_days: u32,
+    },
+    /// Create a canonical detached manifest and RSA-3072 signature sidecar
+    Sign {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        certificate: PathBuf,
+        #[arg(long)]
+        private_key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        /// 32-byte build identity encoded as 64 hexadecimal characters
+        #[arg(long)]
+        build_id: String,
+        /// Role bitmap: supervisor=1, init-proxy=2
+        #[arg(long, default_value_t = 1)]
+        roles: u32,
+        #[arg(long)]
+        security_epoch: u64,
+        #[arg(long, default_value_t = 1)]
+        uapi_min: u32,
+        #[arg(long, default_value_t = 1)]
+        uapi_max: u32,
+    },
+    /// Verify a detached manifest and image using the kernel-equivalent rules
+    Verify {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        certificate: PathBuf,
+        #[arg(long)]
+        sidecar: PathBuf,
+        /// Required role bitmap: supervisor=1, init-proxy=2
+        #[arg(long, default_value_t = 1)]
+        required_role: u32,
+        #[arg(long, default_value_t = 0)]
+        minimum_security_epoch: u64,
+    },
+    /// Emit the public-only header consumed by built-in and LKM builds
+    EmitKernelKeyHeader {
+        #[arg(long)]
+        current_certificate: PathBuf,
+        #[arg(long)]
+        current_minimum_epoch: u64,
+        #[arg(long)]
+        next_certificate: Option<PathBuf>,
+        #[arg(long)]
+        next_minimum_epoch: Option<u64>,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -109,10 +184,97 @@ pub fn run() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&payload)?);
             Ok(())
         }
+        Commands::ProvenanceManifest { command } => match command {
+            ProvenanceManifestCommand::GenerateCertificate {
+                private_key,
+                certificate,
+                common_name,
+                validity_days,
+            } => crate::provenance_manifest::generate_certificate(&GenerateCertificateOptions {
+                private_key,
+                certificate,
+                common_name,
+                validity_days,
+            }),
+            ProvenanceManifestCommand::Sign {
+                image,
+                certificate,
+                private_key,
+                output,
+                build_id,
+                roles,
+                security_epoch,
+                uapi_min,
+                uapi_max,
+            } => {
+                let manifest = crate::provenance_manifest::sign(&SignOptions {
+                    image,
+                    certificate,
+                    private_key,
+                    output,
+                    build_id: crate::provenance_manifest::parse_digest_hex(&build_id, "build id")?,
+                    roles,
+                    security_epoch,
+                    uapi_min,
+                    uapi_max,
+                })?;
+                print_manifest(&manifest);
+                Ok(())
+            }
+            ProvenanceManifestCommand::Verify {
+                image,
+                certificate,
+                sidecar,
+                required_role,
+                minimum_security_epoch,
+            } => {
+                let manifest = crate::provenance_manifest::verify(&VerifyOptions {
+                    image,
+                    certificate,
+                    sidecar,
+                    required_role,
+                    minimum_security_epoch,
+                })?;
+                print_manifest(&manifest);
+                Ok(())
+            }
+            ProvenanceManifestCommand::EmitKernelKeyHeader {
+                current_certificate,
+                current_minimum_epoch,
+                next_certificate,
+                next_minimum_epoch,
+                output,
+            } => crate::provenance_manifest::emit_kernel_key_header(&KernelKeyHeaderOptions {
+                current_certificate,
+                current_minimum_epoch,
+                next_certificate,
+                next_minimum_epoch,
+                output,
+            }),
+        },
     };
 
     if let Err(e) = &result {
         log::error!("Error: {e:?}");
     }
     result
+}
+
+fn print_manifest(manifest: &crate::provenance_manifest::ImageManifestV1) {
+    println!("roles: 0x{:x}", manifest.roles);
+    println!("image_size: {}", manifest.image_size);
+    println!(
+        "image_sha256: {}",
+        base16ct::lower::encode_string(&manifest.image_sha256)
+    );
+    println!(
+        "build_id: {}",
+        base16ct::lower::encode_string(&manifest.build_id)
+    );
+    println!("uapi: {}..={}", manifest.uapi_min, manifest.uapi_max);
+    println!("security_epoch: {}", manifest.security_epoch);
+    println!(
+        "signing_key_id: {}",
+        base16ct::lower::encode_string(&manifest.signing_key_id)
+    );
 }

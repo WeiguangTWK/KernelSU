@@ -53,6 +53,8 @@ bool is_selinux_hide_enabled();
 
 bool get_allow_list(struct ksu_new_get_allow_list_cmd *);
 
+bool get_provenance_info(struct ksu_provenance_info_v1 *info);
+
 inline std::pair<int, int> legacy_get_info() {
     int32_t version = -1;
     int32_t flags = 0;

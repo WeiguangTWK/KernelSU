@@ -23,6 +23,10 @@ kernelsu-objs += infra/seccomp_cache.o
 kernelsu-objs += infra/su_mount_ns.o
 kernelsu-objs += infra/symbol_resolver.o
 
+kernelsu-objs += provenance/core.o
+kernelsu-$(CONFIG_KSU_PROVENANCE) += provenance/canonical.o
+kernelsu-$(CONFIG_KSU_PROVENANCE) += provenance/image_verify.o
+
 ifneq ($(CONFIG_KSU_DISABLE_MANAGER),y)
 kernelsu-objs += manager/apk_sign.o
 kernelsu-objs += manager/pkg_observer.o
@@ -61,12 +65,16 @@ endif
 ifeq ($(CONFIG_KSU_DEBUG),y)
 ccflags-y += -DCONFIG_KSU_DEBUG=1
 endif
+ifeq ($(CONFIG_KSU_PROVENANCE),y)
+ccflags-y += -DCONFIG_KSU_PROVENANCE=1
+endif
 ifeq ($(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER),y)
 ccflags-y += -DCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=1
 endif
 endif
 
 ccflags-y += -I$(srctree)/security/selinux -I$(srctree)/security/selinux/include
+ccflags-y += -I$(srctree)/crypto/asymmetric_keys
 ccflags-y += -I$(objtree)/security/selinux -include $(srctree)/include/uapi/asm-generic/errno.h
 
 ifeq ($(filter /%,$(src)),)
@@ -76,6 +84,12 @@ KSU_KERNEL_DIR := $(src)
 endif
 
 ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include
+
+ifneq ($(strip $(KSU_PROVENANCE_KEY_HEADER)),)
+KSU_PROVENANCE_KEY_HEADER_ABS := $(abspath $(KSU_PROVENANCE_KEY_HEADER))
+ccflags-y += -DKSU_PROVENANCE_KEY_HEADER=\"$(KSU_PROVENANCE_KEY_HEADER_ABS)\"
+$(info -- KernelSU provenance public key header: $(KSU_PROVENANCE_KEY_HEADER_ABS))
+endif
 
 obj-$(CONFIG_KSU) += kernelsu.o
 

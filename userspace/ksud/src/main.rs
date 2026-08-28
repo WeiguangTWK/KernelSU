@@ -52,6 +52,7 @@ mod module_config;
 mod module_response;
 #[cfg(target_os = "android")]
 mod profile;
+mod provenance_manifest;
 #[cfg(target_os = "android")]
 mod resetprop;
 #[cfg(target_os = "android")]

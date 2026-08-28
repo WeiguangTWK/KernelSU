@@ -21,6 +21,7 @@
 #include "sulog/event.h"
 #include "sulog/fd.h"
 #include "supercall/supercall.h"
+#include "provenance/provenance.h"
 
 static int do_grant_root(void __user *arg)
 {
@@ -89,6 +90,18 @@ static int do_get_info_legacy(void __user *arg)
         return -EFAULT;
     }
 
+    return 0;
+}
+
+static int do_get_provenance_info(void __user *arg)
+{
+    struct ksu_provenance_info_v1 info;
+
+    ksu_provenance_get_info(&info);
+    if (copy_to_user(arg, &info, sizeof(info))) {
+        pr_err("get_provenance_info: copy_to_user failed\n");
+        return -EFAULT;
+    }
     return 0;
 }
 
@@ -707,6 +720,12 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .cmd = KSU_IOCTL_GET_INFO_LEGACY,
         .name = "GET_INFO_LEGACY",
         .handler = do_get_info_legacy,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_PROVENANCE_GET_INFO,
+        .name = "PROVENANCE_GET_INFO",
+        .handler = do_get_provenance_info,
         .perm_check = always_allow
     },
     {
