@@ -19,6 +19,7 @@
 #include "provenance/image_verify.h"
 
 #define KSU_PROVENANCE_MAX_KEYS 2
+#define KSU_PROVENANCE_RSA3072_DER_MODULUS_SIZE 385
 
 struct ksu_provenance_embedded_key {
     const u8 *certificate_der;
@@ -67,8 +68,60 @@ static bool ksu_provenance_all_zero(const u8 *data, size_t size)
     return true;
 }
 
-static int ksu_provenance_reject(struct ksu_provenance_verified_image *verified,
-                                 u32 reason, int error)
+static bool ksu_provenance_normalize_rsa3072_modulus(const u8 **modulus, size_t *modulus_size)
+{
+    if (!modulus || !*modulus || !modulus_size)
+        return false;
+
+    /*
+     * rsa_parse_pub_key() preserves the DER INTEGER value verbatim. A
+     * 3072-bit positive modulus therefore has one required 0x00 sign octet
+     * followed by exactly 384 bytes whose high bit is set.
+     */
+    if (*modulus_size != KSU_PROVENANCE_RSA3072_SIGNATURE_SIZE + 1 || (*modulus)[0] != 0 || !((*modulus)[1] & 0x80))
+        return false;
+
+    (*modulus)++;
+    (*modulus_size)--;
+    return true;
+}
+
+static bool ksu_provenance_rsa3072_modulus_selftest(void)
+{
+    static const u8 valid[KSU_PROVENANCE_RSA3072_DER_MODULUS_SIZE] = {
+        [1] = 0x80,
+        [KSU_PROVENANCE_RSA3072_DER_MODULUS_SIZE - 1] = 1,
+    };
+    static const u8 noncanonical[KSU_PROVENANCE_RSA3072_DER_MODULUS_SIZE] = {
+        [0] = 1,
+        [1] = 0x80,
+    };
+    static const u8 short_modulus[KSU_PROVENANCE_RSA3072_DER_MODULUS_SIZE] = {
+        [1] = 0x7f,
+    };
+    const u8 *modulus = valid;
+    size_t modulus_size = sizeof(valid);
+
+    if (!ksu_provenance_normalize_rsa3072_modulus(&modulus, &modulus_size) || modulus != valid + 1 ||
+        modulus_size != KSU_PROVENANCE_RSA3072_SIGNATURE_SIZE)
+        return false;
+
+    modulus = valid + 1;
+    modulus_size = sizeof(valid) - 1;
+    if (ksu_provenance_normalize_rsa3072_modulus(&modulus, &modulus_size))
+        return false;
+
+    modulus = noncanonical;
+    modulus_size = sizeof(noncanonical);
+    if (ksu_provenance_normalize_rsa3072_modulus(&modulus, &modulus_size))
+        return false;
+
+    modulus = short_modulus;
+    modulus_size = sizeof(short_modulus);
+    return !ksu_provenance_normalize_rsa3072_modulus(&modulus, &modulus_size);
+}
+
+static int ksu_provenance_reject(struct ksu_provenance_verified_image *verified, u32 reason, int error)
 {
     atomic_set(&ksu_provenance_last_error, reason);
     if (verified)
@@ -81,30 +134,29 @@ static int ksu_provenance_validate_certificate(struct ksu_provenance_runtime_key
 {
     struct rsa_key rsa = { 0 };
     struct x509_certificate *certificate;
+    const u8 *modulus;
+    size_t modulus_size;
     u8 digest[32];
     int error;
 
-    error = ksu_provenance_sha256(embedded->certificate_der,
-                                  embedded->certificate_size, digest);
+    error = ksu_provenance_sha256(embedded->certificate_der, embedded->certificate_size, digest);
     if (error)
         return KSU_PROVENANCE_VERIFY_CRYPTO;
     if (memcmp(digest, embedded->key_id, sizeof(digest)))
         return KSU_PROVENANCE_VERIFY_CERT_KEY_ID;
 
-    certificate = x509_cert_parse(embedded->certificate_der,
-                                  embedded->certificate_size);
+    certificate = x509_cert_parse(embedded->certificate_der, embedded->certificate_size);
     if (IS_ERR(certificate))
         return KSU_PROVENANCE_VERIFY_CERT_PARSE;
-    if (!certificate->pub || !certificate->pub->pkey_algo ||
-        strcmp(certificate->pub->pkey_algo, "rsa")) {
+    if (!certificate->pub || !certificate->pub->pkey_algo || strcmp(certificate->pub->pkey_algo, "rsa")) {
         x509_free_certificate(certificate);
         return KSU_PROVENANCE_VERIFY_CERT_KEY;
     }
 
-    error = rsa_parse_pub_key(&rsa, certificate->pub->key,
-                              certificate->pub->keylen);
-    if (error || rsa.n_sz != KSU_PROVENANCE_RSA3072_SIGNATURE_SIZE ||
-        !rsa.n || !(rsa.n[0] & 0x80)) {
+    error = rsa_parse_pub_key(&rsa, certificate->pub->key, certificate->pub->keylen);
+    modulus = rsa.n;
+    modulus_size = rsa.n_sz;
+    if (error || !ksu_provenance_normalize_rsa3072_modulus(&modulus, &modulus_size)) {
         x509_free_certificate(certificate);
         return KSU_PROVENANCE_VERIFY_CERT_KEY;
     }
@@ -118,6 +170,12 @@ int ksu_provenance_image_verifier_init(void)
 {
     unsigned int index;
     int reason;
+
+    if (!ksu_provenance_rsa3072_modulus_selftest()) {
+        ksu_provenance_verifier_state = KSU_PROVENANCE_VERIFIER_FAILED;
+        atomic_set(&ksu_provenance_last_error, KSU_PROVENANCE_VERIFY_INTERNAL);
+        return -EINVAL;
+    }
 
     if (!KSU_PROVENANCE_EMBEDDED_KEY_COUNT) {
         ksu_provenance_verifier_state = KSU_PROVENANCE_VERIFIER_NOT_CONFIGURED;

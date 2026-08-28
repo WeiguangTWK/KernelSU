@@ -60,36 +60,51 @@ function Require-Command {
     return $command
 }
 
-function Test-ByteSequence {
+function Read-DecimalCDefine {
     param(
-        [Parameter(Mandatory = $true)][byte[]]$Data,
-        [Parameter(Mandatory = $true)][byte[]]$Needle
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
     )
 
-    if ($Needle.Length -eq 0 -or $Data.Length -lt $Needle.Length) {
-        return $false
+    $text = Get-Content -LiteralPath $Path -Raw
+    $pattern = '(?m)^\s*#define\s+{0}\s+([0-9]+)\s*$' -f [regex]::Escape($Name)
+    $match = [regex]::Match($text, $pattern)
+    if (-not $match.Success) {
+        throw "Unable to read $Name from $Path"
+    }
+    return [int]::Parse($match.Groups[1].Value)
+}
+
+function Read-LkmMetadataValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModuleText,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$ModulePath
+    )
+
+    $pattern = '(?:^|\x00){0}=([^\x00]*)\x00' -f [regex]::Escape($Name)
+    $match = [regex]::Match($ModuleText, $pattern)
+    if (-not $match.Success) {
+        throw "LKM is missing Manager identity metadata '$Name': $ModulePath"
+    }
+    return $match.Groups[1].Value
+}
+
+function Convert-CUnsignedLiteral {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    if ($Value -match '^0[xX]([0-9a-fA-F]+)$') {
+        return [Convert]::ToUInt32($Matches[1], 16)
     }
 
-    $lastStart = $Data.Length - $Needle.Length
-    for ($i = 0; $i -le $lastStart; $i++) {
-        if ($Data[$i] -ne $Needle[0]) {
-            continue
-        }
-
-        $matched = $true
-        for ($j = 1; $j -lt $Needle.Length; $j++) {
-            if ($Data[$i + $j] -ne $Needle[$j]) {
-                $matched = $false
-                break
-            }
-        }
-
-        if ($matched) {
-            return $true
-        }
+    $parsed = [uint32]0
+    if ([uint32]::TryParse($Value, [ref]$parsed)) {
+        return $parsed
     }
-
-    return $false
+    throw "Invalid C unsigned literal for ${Description}: $Value"
 }
 
 function Read-RepoVersion {
@@ -159,6 +174,10 @@ if ([string]::IsNullOrWhiteSpace($PackageName)) {
         $PackageName = $PackageName.Trim()
         $PackageNameSource = "manager\gradle.properties"
     }
+}
+$PackageName = $PackageName.Trim()
+if ($PackageName -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$') {
+    throw "Invalid Android package name: $PackageName"
 }
 
 $NdkVersion = Read-RepoVersion `
@@ -258,7 +277,14 @@ try {
 
     $CertFile = Get-Item $CertDer
     $CertHash = (Get-FileHash $CertDer -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-Host ("Certificate size  : 0x{0:x4} ({0} bytes)" -f $CertFile.Length)
+    $CertSizeHex = "0x{0:x4}" -f $CertFile.Length
+    $ManagerCertificateMaxLength = Read-DecimalCDefine `
+        -Path (Join-Path $RepoRoot "kernel\manager\apk_sign.h") `
+        -Name "KSU_MANAGER_CERT_MAX_LENGTH"
+    if ($CertFile.Length -gt $ManagerCertificateMaxLength) {
+        throw "Manager certificate is $($CertFile.Length) bytes; kernel maximum is $ManagerCertificateMaxLength bytes"
+    }
+    Write-Host ("Certificate size  : $CertSizeHex ({0} bytes)" -f $CertFile.Length)
     Write-Host "Certificate SHA256: $CertHash"
 
     $Kmis = @(
@@ -270,7 +296,6 @@ try {
         "android15-6.6",
         "android16-6.12"
     )
-    $CertHashBytes = [Text.Encoding]::ASCII.GetBytes($CertHash)
     foreach ($kmi in $Kmis) {
         $modulePath = Join-Path $RepoRoot "kernel\dist\${kmi}_kernelsu.ko"
         if (-not (Test-Path $modulePath -PathType Leaf)) {
@@ -278,8 +303,40 @@ try {
         }
 
         $moduleBytes = [IO.File]::ReadAllBytes($modulePath)
-        if (-not (Test-ByteSequence -Data $moduleBytes -Needle $CertHashBytes)) {
-            throw "LKM does not contain the selected certificate hash: $modulePath"
+        $moduleText = [Text.Encoding]::ASCII.GetString($moduleBytes)
+        $identityVersion = Read-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_manager_identity_version" `
+            -ModulePath $modulePath
+        if ($identityVersion -ne "1") {
+            throw "Unsupported LKM Manager identity version '$identityVersion': $modulePath"
+        }
+
+        $moduleCertSizeText = Read-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_manager_cert_size" `
+            -ModulePath $modulePath
+        $moduleCertSize = Convert-CUnsignedLiteral `
+            -Value $moduleCertSizeText `
+            -Description "LKM Manager certificate size"
+        if ($moduleCertSize -ne $CertFile.Length) {
+            throw "LKM Manager certificate size is $moduleCertSizeText, expected ${CertSizeHex}: $modulePath"
+        }
+
+        $moduleCertHash = Read-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_manager_cert_sha256" `
+            -ModulePath $modulePath
+        if (-not [string]::Equals($moduleCertHash, $CertHash, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "LKM Manager certificate hash is $moduleCertHash, expected ${CertHash}: $modulePath"
+        }
+
+        $modulePackage = Read-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_manager_package" `
+            -ModulePath $modulePath
+        if (-not [string]::Equals($modulePackage, $PackageName, [StringComparison]::Ordinal)) {
+            throw "LKM Manager package is $modulePackage, expected ${PackageName}: $modulePath"
         }
     }
     Write-Host "All LKM files recognize the selected certificate."

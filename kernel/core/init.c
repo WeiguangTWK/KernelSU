@@ -233,6 +233,12 @@ module_exit(kernelsu_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("weishu");
 MODULE_DESCRIPTION("Android KernelSU");
+MODULE_INFO(ksu_manager_identity_version, "1");
+MODULE_INFO(ksu_manager_cert_size, __stringify(EXPECTED_SIZE));
+MODULE_INFO(ksu_manager_cert_sha256, EXPECTED_HASH);
+#ifdef KSU_MANAGER_PACKAGE
+MODULE_INFO(ksu_manager_package, KSU_MANAGER_PACKAGE);
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
 #else

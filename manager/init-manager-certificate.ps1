@@ -107,6 +107,25 @@ function Quote-ShellLiteral {
     return "'" + $Value + "'"
 }
 
+function Read-DecimalCDefine {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $text = Get-Content -LiteralPath $Path -Raw
+    $pattern = '(?m)^\s*#define\s+{0}\s+([0-9]+)\s*$' -f [regex]::Escape($Name)
+    $match = [regex]::Match($text, $pattern)
+    if (-not $match.Success) {
+        throw "Unable to read $Name from $Path"
+    }
+    return [int]::Parse($match.Groups[1].Value)
+}
+
+$ManagerCertificateMaxLength = Read-DecimalCDefine `
+    -Path (Join-Path $RepoRoot "kernel\manager\apk_sign.h") `
+    -Name "KSU_MANAGER_CERT_MAX_LENGTH"
+
 if ([string]::IsNullOrWhiteSpace($DistinguishedName) -or
     $DistinguishedName.Contains("`n") -or
     $DistinguishedName.Contains("`r")) {
@@ -181,6 +200,9 @@ try {
 
     $CertificateFile = Get-Item -LiteralPath $StageCertificate
     $CertificateLength = $CertificateFile.Length
+    if ($CertificateLength -gt $ManagerCertificateMaxLength) {
+        throw "Manager certificate is $CertificateLength bytes; kernel maximum is $ManagerCertificateMaxLength bytes"
+    }
     $CertificateSizeHex = "0x{0:x4}" -f $CertificateLength
     $CertificateHash = (Get-FileHash -LiteralPath $StageCertificate -Algorithm SHA256).Hash.ToLowerInvariant()
     $FinalKeystore = Join-Path $OutputDirectory $KeystoreName
@@ -213,6 +235,7 @@ try {
         key_size = if ($KeyAlgorithm -eq "RSA") { $KeySize } else { $null }
         certificate_size = $CertificateLength
         certificate_size_hex = $CertificateSizeHex
+        kernel_certificate_max_size = $ManagerCertificateMaxLength
         certificate_sha256 = $CertificateHash
         keystore_file = $KeystoreName
         certificate_file = "manager-certificate.der"
