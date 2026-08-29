@@ -12,6 +12,7 @@ use std::{
     path::Path,
     process::Command,
 };
+use tempfile::NamedTempFile;
 
 use crate::defs::KSU_TEMP_BACKUP_DIR_NAME;
 use crate::{assets, boot_patch, defs, ksucalls, module, restorecon};
@@ -231,16 +232,88 @@ fn link_ksud_to_bin() -> Result<()> {
     Ok(())
 }
 
-pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Result<()> {
+fn prepare_install_file(source: &Path, expected_size: Option<u64>) -> Result<NamedTempFile> {
+    let metadata = source
+        .metadata()
+        .with_context(|| format!("stat install source {}", source.display()))?;
+    if !metadata.is_file() {
+        bail!("install source is not a regular file: {}", source.display());
+    }
+    if let Some(expected_size) = expected_size.filter(|size| metadata.len() != *size) {
+        bail!(
+            "install source {} has size {}, expected {}",
+            source.display(),
+            metadata.len(),
+            expected_size
+        );
+    }
+
+    let mut input =
+        File::open(source).with_context(|| format!("open install source {}", source.display()))?;
+    let mut output = NamedTempFile::new_in(defs::ADB_DIR).context("create install temp file")?;
+    std::io::copy(&mut input, output.as_file_mut())
+        .with_context(|| format!("copy install source {}", source.display()))?;
+    output
+        .as_file()
+        .set_permissions(metadata.permissions())
+        .context("set install temp permissions")?;
+    output
+        .as_file()
+        .sync_all()
+        .context("sync install temp file")?;
+    restorecon::lsetfilecon(output.path(), restorecon::KSU_CON)?;
+    Ok(output)
+}
+
+fn persist_install_file(file: NamedTempFile, target: &Path) -> Result<()> {
+    file.persist(target)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {}", target.display()))?;
+    Ok(())
+}
+
+fn sync_adb_directory() -> Result<()> {
+    File::open(defs::ADB_DIR)?
+        .sync_all()
+        .context("sync /data/adb directory")
+}
+
+pub fn install(
+    libadbroot: Option<PathBuf>,
+    data_path: Option<PathBuf>,
+    provenance_sidecar: Option<&Path>,
+) -> Result<()> {
     ensure_dir_exists(defs::ADB_DIR)?;
-    let _ = std::fs::remove_file(defs::DAEMON_PATH);
-    std::fs::copy(
+    let daemon = prepare_install_file(
         // We should use /proc/self/exe, DO NOT resolve the real path
         // So that if someone execute /data/adb/ksud install, ksud won't be removed unexpectedly
-        "/proc/self/exe",
-        defs::DAEMON_PATH,
+        Path::new("/proc/self/exe"),
+        None,
     )?;
+    let sidecar = provenance_sidecar
+        .map(|path| {
+            prepare_install_file(path, Some(crate::provenance_manifest::SIDECAR_SIZE as u64))
+        })
+        .transpose()?;
+
+    if let Some(sidecar) = sidecar {
+        persist_install_file(sidecar, Path::new(defs::DAEMON_PROVENANCE_PATH))?;
+    } else {
+        match std::fs::remove_file(defs::DAEMON_PROVENANCE_PATH) {
+            std::result::Result::Ok(()) => {}
+            Err(error) if error.kind() == NotFound => {}
+            Err(error) => return Err(error).context("remove stale provenance sidecar"),
+        }
+    }
+    // Establish the detached manifest before switching the executable. A crash
+    // at any earlier point leaves either the old pair or a verifier mismatch.
+    sync_adb_directory()?;
+    persist_install_file(daemon, Path::new(defs::DAEMON_PATH))?;
+    sync_adb_directory()?;
     restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::KSU_CON)?;
+    if provenance_sidecar.is_some() {
+        restorecon::lsetfilecon(defs::DAEMON_PROVENANCE_PATH, restorecon::KSU_CON)?;
+    }
     // install binary assets
     assets::ensure_binaries(false).with_context(|| "Failed to extract assets")?;
 

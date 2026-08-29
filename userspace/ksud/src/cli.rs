@@ -107,6 +107,10 @@ enum Commands {
 
         #[arg(long, default_value = None)]
         data_path: Option<PathBuf>,
+
+        /// Detached signed provenance manifest for this exact ksud image
+        #[arg(long, default_value = None)]
+        provenance_sidecar: Option<PathBuf>,
     },
 
     /// Unload KernelSU kernel module (LKM Only)
@@ -271,6 +275,16 @@ enum Debug {
 
     /// Get read-only audit provenance capability and verifier diagnostics
     ProvenanceInfo,
+
+    /// Get read-only Phase 2 hook and signed-exec eligibility diagnostics
+    ProvenanceEligibility,
+
+    /// Verify that a Phase 2 supervisor claim is rejected as not ready
+    ProvenanceClaimTest {
+        /// Eligibility generation to place in the rejected request
+        #[arg(long)]
+        generation: Option<u64>,
+    },
 
     /// Print default package name
     Package,
@@ -1362,7 +1376,8 @@ pub fn run() -> Result<()> {
         Commands::Install {
             libadbroot,
             data_path,
-        } => utils::install(libadbroot, data_path),
+            provenance_sidecar,
+        } => utils::install(libadbroot, data_path, provenance_sidecar.as_deref()),
         Commands::Unload => crate::unload::unload(),
         Commands::Uninstall { package_name } => utils::uninstall(&package_name),
         Commands::Sepolicy { command } => match command {
@@ -1611,6 +1626,45 @@ pub fn run() -> Result<()> {
                     "signing_key_id: {}",
                     base16ct::lower::encode_string(&info.signing_key_id)
                 );
+                Ok(())
+            }
+            Debug::ProvenanceEligibility => {
+                let info = ksucalls::get_provenance_eligibility_info()?;
+                println!("version: {}", info.version);
+                println!("core_hook_state: {}", info.core_hook_state);
+                println!("core_hook_error: {}", info.core_hook_error);
+                println!("eligibility_state: {}", info.eligibility_state);
+                println!("eligibility_error: {}", info.eligibility_error);
+                println!("eligibility_generation: {}", info.eligibility_generation);
+                println!("candidate_pid: {}", info.candidate_pid);
+                println!("candidate_tgid: {}", info.candidate_tgid);
+                println!("roles: 0x{:08x}", info.roles);
+                println!("verifier_error: {}", info.verifier_error);
+                println!("security_epoch: {}", info.security_epoch);
+                println!(
+                    "image_sha256: {}",
+                    base16ct::lower::encode_string(&info.image_sha256)
+                );
+                println!(
+                    "build_id: {}",
+                    base16ct::lower::encode_string(&info.build_id)
+                );
+                println!(
+                    "signing_key_id: {}",
+                    base16ct::lower::encode_string(&info.signing_key_id)
+                );
+                println!("uapi: {}..={}", info.uapi_min, info.uapi_max);
+                Ok(())
+            }
+            Debug::ProvenanceClaimTest { generation } => {
+                let generation = match generation {
+                    Some(generation) => generation,
+                    None => ksucalls::get_provenance_eligibility_info()?.eligibility_generation,
+                };
+                let result = ksucalls::expect_provenance_claim_not_ready(generation)?;
+                println!("result: {}", result.result);
+                println!("eligibility_state: {}", result.eligibility_state);
+                println!("eligibility_generation: {}", result.eligibility_generation);
                 Ok(())
             }
             Debug::Package => {

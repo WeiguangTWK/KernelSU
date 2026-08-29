@@ -32,6 +32,8 @@ static const __u64 KSU_PROVENANCE_CAP_UAPI_V1 = (1ULL << 0);
 static const __u64 KSU_PROVENANCE_CAP_CANONICAL_HASH_V1 = (1ULL << 1);
 static const __u64 KSU_PROVENANCE_CAP_IMAGE_VERIFIER_V1 = (1ULL << 2);
 static const __u64 KSU_PROVENANCE_CAP_SIGNING_KEY_V1 = (1ULL << 3);
+static const __u64 KSU_PROVENANCE_CAP_CORE_HOOK_DIAGNOSTIC_V1 = (1ULL << 4);
+static const __u64 KSU_PROVENANCE_CAP_SIGNED_EXEC_ELIGIBILITY_V1 = (1ULL << 5);
 static const __u64 KSU_PROVENANCE_CAP_SUPERVISOR_CLAIM = (1ULL << 8);
 static const __u64 KSU_PROVENANCE_CAP_TASK_CONTEXT = (1ULL << 9);
 static const __u64 KSU_PROVENANCE_CAP_CREDENTIAL_CONTEXT = (1ULL << 10);
@@ -112,6 +114,52 @@ enum ksu_provenance_verifier_error {
     KSU_PROVENANCE_VERIFY_SIGNATURE = 23,
     KSU_PROVENANCE_VERIFY_CRYPTO = 24,
     KSU_PROVENANCE_VERIFY_INTERNAL = 25,
+};
+
+enum ksu_provenance_core_hook_state {
+    KSU_PROVENANCE_CORE_HOOK_DISABLED = 0,
+    KSU_PROVENANCE_CORE_HOOK_INSTALLED = 1,
+    KSU_PROVENANCE_CORE_HOOK_FAILED = 2,
+    KSU_PROVENANCE_CORE_HOOK_RESTORED = 3,
+};
+
+enum ksu_provenance_core_hook_error {
+    KSU_PROVENANCE_CORE_HOOK_OK = 0,
+    KSU_PROVENANCE_CORE_HOOK_NOT_CONFIGURED = 1,
+    KSU_PROVENANCE_CORE_HOOK_VERIFIER_NOT_READY = 2,
+    KSU_PROVENANCE_CORE_HOOK_TARGET_ABSENT = 3,
+    KSU_PROVENANCE_CORE_HOOK_TARGET_DUPLICATE = 4,
+    KSU_PROVENANCE_CORE_HOOK_SLOT_UNEXPECTED = 5,
+    KSU_PROVENANCE_CORE_HOOK_SLOT_CHANGED = 6,
+    KSU_PROVENANCE_CORE_HOOK_INSTALL = 7,
+    KSU_PROVENANCE_CORE_HOOK_ROLLBACK = 8,
+    KSU_PROVENANCE_CORE_HOOK_SELFTEST = 9,
+};
+
+enum ksu_provenance_eligibility_state {
+    KSU_PROVENANCE_ELIGIBILITY_NONE = 0,
+    KSU_PROVENANCE_ELIGIBILITY_PENDING_STAGE = 1,
+    KSU_PROVENANCE_ELIGIBILITY_ELIGIBLE = 2,
+    KSU_PROVENANCE_ELIGIBILITY_REJECTED = 3,
+};
+
+enum ksu_provenance_eligibility_error {
+    KSU_PROVENANCE_ELIGIBILITY_OK = 0,
+    KSU_PROVENANCE_ELIGIBILITY_CORE_PROVIDER_NOT_READY = 1,
+    KSU_PROVENANCE_ELIGIBILITY_WRONG_PARENT = 2,
+    KSU_PROVENANCE_ELIGIBILITY_WRONG_BOOT_STAGE = 3,
+    KSU_PROVENANCE_ELIGIBILITY_IMAGE = 4,
+    KSU_PROVENANCE_ELIGIBILITY_ROLE = 5,
+    KSU_PROVENANCE_ELIGIBILITY_UAPI = 6,
+    KSU_PROVENANCE_ELIGIBILITY_EPOCH = 7,
+    KSU_PROVENANCE_ELIGIBILITY_GENERATION = 8,
+    KSU_PROVENANCE_ELIGIBILITY_LATE_LOAD = 9,
+    KSU_PROVENANCE_ELIGIBILITY_INTERNAL = 10,
+};
+
+enum ksu_provenance_claim_result {
+    KSU_PROVENANCE_CLAIM_RESULT_OK = 0,
+    KSU_PROVENANCE_CLAIM_CORE_PROVIDER_NOT_READY = 1,
 };
 
 enum ksu_provenance_gap_reason {
@@ -253,7 +301,7 @@ struct ksu_provenance_barrier_result_v1 {
     __u8 reserved[24];
 };
 
-/* Exactly 64 bytes. The control ioctl is reserved and not handled in phase 1. */
+/* Exactly 64 bytes. Phase 2 handles only a fixed-reject supervisor claim. */
 struct ksu_provenance_control_cmd_v1 {
     __u16 size;
     __u16 version;
@@ -266,7 +314,55 @@ struct ksu_provenance_control_cmd_v1 {
     __aligned_u64 reserved[4];
 };
 
-/* Exactly 192 bytes. operational_capabilities is always zero in phase 1. */
+/* Exactly 64 bytes. Phase 2 defines the shape but does not issue a nonce. */
+struct ksu_provenance_claim_supervisor_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __aligned_u64 eligibility_generation;
+    __u8 boot_claim_nonce[16];
+    __u8 reserved[32];
+};
+
+/* Exactly 32 bytes. */
+struct ksu_provenance_claim_result_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __u32 result;
+    __u32 eligibility_state;
+    __aligned_u64 eligibility_generation;
+    __u8 reserved[8];
+};
+
+/*
+ * Exactly 192 bytes of read-only Phase 2 hook and exec diagnostics.
+ * eligibility_generation advances only when an authenticated candidate is
+ * recorded; rejected exec attempts never replace a pending or eligible one.
+ */
+struct ksu_provenance_eligibility_info_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __u32 core_hook_state;
+    __u32 core_hook_error;
+    __u32 eligibility_state;
+    __u32 eligibility_error;
+    __aligned_u64 eligibility_generation;
+    __u32 candidate_pid;
+    __u32 candidate_tgid;
+    __u32 roles;
+    __u32 verifier_error;
+    __aligned_u64 security_epoch;
+    __u8 image_sha256[32];
+    __u8 build_id[32];
+    __u8 signing_key_id[32];
+    __u32 uapi_min;
+    __u32 uapi_max;
+    __u8 reserved[32];
+};
+
+/* Exactly 192 bytes. operational_capabilities remains zero through phase 2. */
 struct ksu_provenance_info_v1 {
     __u16 size;
     __u16 version;
@@ -313,5 +409,7 @@ static const __u32 KSU_IOCTL_PROVENANCE_GET_INFO =
     _IOR('K', 32, struct ksu_provenance_info_v1);
 static const __u32 KSU_IOCTL_PROVENANCE_CONTROL =
     _IOWR('K', 33, struct ksu_provenance_control_cmd_v1);
+static const __u32 KSU_IOCTL_PROVENANCE_GET_ELIGIBILITY =
+    _IOR('K', 34, struct ksu_provenance_eligibility_info_v1);
 
 #endif /* __KSU_UAPI_PROVENANCE_H */

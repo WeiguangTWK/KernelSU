@@ -24,6 +24,9 @@ static_assert(sizeof(ksu_provenance_event_header_v1) == 128);
 static_assert(sizeof(ksu_provenance_context_descriptor_v1) == 224);
 static_assert(sizeof(ksu_provenance_barrier_result_v1) == 96);
 static_assert(sizeof(ksu_provenance_control_cmd_v1) == 64);
+static_assert(sizeof(ksu_provenance_claim_supervisor_v1) == 64);
+static_assert(sizeof(ksu_provenance_claim_result_v1) == 32);
+static_assert(sizeof(ksu_provenance_eligibility_info_v1) == 192);
 static_assert(sizeof(ksu_provenance_info_v1) == 192);
 static_assert(sizeof(ksu_provenance_image_manifest_v1) == 192);
 
@@ -118,6 +121,18 @@ bool get_provenance_info(struct ksu_provenance_info_v1 *info) {
     }
     memset(info, 0, sizeof(*info));
     if (ksuctl(KSU_IOCTL_PROVENANCE_GET_INFO, info) != 0) {
+        return false;
+    }
+    return info->size == sizeof(*info) &&
+           info->version == KSU_PROVENANCE_UAPI_VERSION;
+}
+
+bool get_provenance_eligibility_info(struct ksu_provenance_eligibility_info_v1 *info) {
+    if (!info) {
+        return false;
+    }
+    memset(info, 0, sizeof(*info));
+    if (ksuctl(KSU_IOCTL_PROVENANCE_GET_ELIGIBILITY, info) != 0) {
         return false;
     }
     return info->size == sizeof(*info) &&

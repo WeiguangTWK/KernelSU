@@ -22,6 +22,7 @@
 #include "sulog/fd.h"
 #include "supercall/supercall.h"
 #include "provenance/provenance.h"
+#include "provenance/eligibility.h"
 
 static int do_grant_root(void __user *arg)
 {
@@ -105,6 +106,27 @@ static int do_get_provenance_info(void __user *arg)
     return 0;
 }
 
+static int do_get_provenance_eligibility(void __user *arg)
+{
+    struct ksu_provenance_eligibility_info_v1 info;
+
+    ksu_provenance_get_eligibility_info(&info);
+    if (copy_to_user(arg, &info, sizeof(info))) {
+        pr_err("get_provenance_eligibility: copy_to_user failed\n");
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static int do_provenance_control(void __user *arg)
+{
+    struct ksu_provenance_control_cmd_v1 command;
+
+    if (copy_from_user(&command, arg, sizeof(command)))
+        return -EFAULT;
+    return ksu_provenance_handle_control(&command);
+}
+
 static int do_report_event(void __user *arg)
 {
     struct ksu_report_event_cmd cmd;
@@ -118,6 +140,7 @@ static int do_report_event(void __user *arg)
         static bool post_fs_data_lock = false;
         if (!post_fs_data_lock) {
             post_fs_data_lock = true;
+            ksu_provenance_note_post_fs_data(current);
             if (ksu_late_loaded) {
                 pr_info("post-fs-data skipped (late load)\n");
             } else {
@@ -726,6 +749,18 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .cmd = KSU_IOCTL_PROVENANCE_GET_INFO,
         .name = "PROVENANCE_GET_INFO",
         .handler = do_get_provenance_info,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_PROVENANCE_GET_ELIGIBILITY,
+        .name = "PROVENANCE_GET_ELIGIBILITY",
+        .handler = do_get_provenance_eligibility,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_PROVENANCE_CONTROL,
+        .name = "PROVENANCE_CONTROL",
+        .handler = do_provenance_control,
         .perm_check = always_allow
     },
     {

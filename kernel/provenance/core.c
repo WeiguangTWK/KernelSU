@@ -3,7 +3,9 @@
 #include <linux/string.h>
 
 #include "provenance/canonical.h"
+#include "provenance/eligibility.h"
 #include "provenance/image_verify.h"
+#include "provenance/provider_lsm.h"
 #include "provenance/provenance.h"
 #include "uapi/provenance_golden.h"
 
@@ -94,6 +96,9 @@ int ksu_provenance_init(void)
     BUILD_BUG_ON(sizeof(struct ksu_provenance_context_descriptor_v1) != 224);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_barrier_result_v1) != 96);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_control_cmd_v1) != 64);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_claim_supervisor_v1) != 64);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_claim_result_v1) != 32);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_eligibility_info_v1) != 192);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_info_v1) != 192);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_image_manifest_v1) != 192);
     BUILD_BUG_ON(sizeof(KSU_PROVENANCE_GOLDEN_MANIFEST_HEX) != 385);
@@ -107,18 +112,31 @@ int ksu_provenance_init(void)
 #endif
     if (!error)
         error = ksu_provenance_image_verifier_init();
+#ifdef CONFIG_KSU_PROVENANCE
+    if (!error)
+        error = ksu_provenance_eligibility_init();
+    if (!error)
+        error = ksu_provenance_provider_lsm_init();
+#endif
     ksu_provenance_initialization_error = error;
     return error;
 }
 
 void ksu_provenance_exit(void)
 {
+#ifdef CONFIG_KSU_PROVENANCE
+    ksu_provenance_provider_lsm_exit();
+    ksu_provenance_eligibility_exit();
+#endif
     ksu_provenance_image_verifier_exit();
 }
 
 void ksu_provenance_get_info(struct ksu_provenance_info_v1 *info)
 {
     u64 verifier_capabilities = 0;
+    u64 core_capabilities = 0;
+    u32 core_state;
+    u32 core_error;
 
     memset(info, 0, sizeof(*info));
     info->size = sizeof(*info);
@@ -143,8 +161,13 @@ void ksu_provenance_get_info(struct ksu_provenance_info_v1 *info)
         &info->minimum_security_epoch, info->signing_key_id,
         &verifier_capabilities);
     info->diagnostic_capabilities |= verifier_capabilities;
+#ifdef CONFIG_KSU_PROVENANCE
+    ksu_provenance_provider_lsm_diagnostics(&core_state, &core_error,
+                                             &core_capabilities);
+    info->diagnostic_capabilities |= core_capabilities;
+#endif
 
-    /* Phase 1 invariant: no operational capability may be advertised. */
+    /* Phase 2 invariant: no operational capability may be advertised. */
     info->operational_capabilities = 0;
     info->intent_operation_classes = 0;
     info->result_operation_classes = 0;

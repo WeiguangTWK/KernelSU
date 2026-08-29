@@ -83,7 +83,9 @@ pub struct AuditEmergencyScriptQuarantineEntry {
     pub recovery_routes: Vec<module_audit_log::AuditRecoveryRoute>,
 }
 
-fn is_false(value: &bool) -> bool {
+// serde's skip_serializing_if callback requires a shared reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
     !*value
 }
 

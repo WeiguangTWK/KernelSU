@@ -24,7 +24,8 @@ int ksu_provenance_image_verifier_init(void);
 void ksu_provenance_image_verifier_exit(void);
 /*
  * The caller owns image and must prevent writes for the complete verification
- * and later exec handoff. Phase 1 intentionally has no exec caller.
+ * and later exec handoff. Phase 2 authenticates the exact init-selected bprm
+ * file but does not authorize a supervisor claim.
  */
 int ksu_provenance_verify_image(struct file *image, const char *sidecar_path,
                                 u32 required_role,

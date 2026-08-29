@@ -26,6 +26,8 @@ kernelsu-objs += infra/symbol_resolver.o
 kernelsu-objs += provenance/core.o
 kernelsu-$(CONFIG_KSU_PROVENANCE) += provenance/canonical.o
 kernelsu-$(CONFIG_KSU_PROVENANCE) += provenance/image_verify.o
+kernelsu-$(CONFIG_KSU_PROVENANCE) += provenance/eligibility.o
+kernelsu-$(CONFIG_KSU_PROVENANCE) += provenance/provider_lsm.o
 
 ifneq ($(CONFIG_KSU_DISABLE_MANAGER),y)
 kernelsu-objs += manager/apk_sign.o

@@ -180,6 +180,81 @@ pub fn get_provenance_info() -> std::io::Result<ksu_uapi::ksu_provenance_info_v1
     Ok(info)
 }
 
+pub fn get_provenance_eligibility_info()
+-> std::io::Result<ksu_uapi::ksu_provenance_eligibility_info_v1> {
+    let mut info = unsafe { std::mem::zeroed::<ksu_uapi::ksu_provenance_eligibility_info_v1>() };
+    ksuctl(
+        ksu_uapi::KSU_IOCTL_PROVENANCE_GET_ELIGIBILITY,
+        &raw mut info,
+    )?;
+    if usize::from(info.size) != std::mem::size_of_val(&info)
+        || info.version != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid audit provenance eligibility response",
+        ));
+    }
+    Ok(info)
+}
+
+pub fn expect_provenance_claim_not_ready(
+    eligibility_generation: u64,
+) -> std::io::Result<ksu_uapi::ksu_provenance_claim_result_v1> {
+    let mut request = ksu_uapi::ksu_provenance_claim_supervisor_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_claim_supervisor_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        flags: 0,
+        eligibility_generation,
+        boot_claim_nonce: [0; 16],
+        reserved: [0; 32],
+    };
+    let mut result = ksu_uapi::ksu_provenance_claim_result_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_claim_result_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        flags: 0,
+        result: 0,
+        eligibility_state: 0,
+        eligibility_generation: 0,
+        reserved: [0; 8],
+    };
+    let mut command = ksu_uapi::ksu_provenance_control_cmd_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_control_cmd_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        operation:
+            ksu_uapi::ksu_provenance_control_operation_KSU_PROVENANCE_CONTROL_CLAIM_SUPERVISOR
+                as u16,
+        flags: 0,
+        request_size: std::mem::size_of_val(&request) as u32,
+        response_size: std::mem::size_of_val(&result) as u32,
+        request: std::ptr::from_mut(&mut request) as u64,
+        response: std::ptr::from_mut(&mut result) as u64,
+        reserved: [0; 4],
+    };
+
+    match ksuctl(ksu_uapi::KSU_IOCTL_PROVENANCE_CONTROL, &raw mut command) {
+        Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Phase 2 supervisor claim was unexpectedly accepted",
+            ));
+        }
+    }
+    if usize::from(result.size) != std::mem::size_of_val(&result)
+        || result.version != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
+        || result.result
+            != ksu_uapi::ksu_provenance_claim_result_KSU_PROVENANCE_CLAIM_CORE_PROVIDER_NOT_READY
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid Phase 2 supervisor claim rejection",
+        ));
+    }
+    Ok(result)
+}
+
 pub fn check_kernel_safemode() -> bool {
     try_check_kernel_safemode().unwrap_or(false)
 }

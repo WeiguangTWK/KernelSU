@@ -23,6 +23,7 @@ mod android {
 
     pub const KSURC_PATH: &str = concatcp!(WORKING_DIR, ".ksurc");
     pub const DAEMON_PATH: &str = concatcp!(ADB_DIR, "ksud");
+    pub const DAEMON_PROVENANCE_PATH: &str = concatcp!(ADB_DIR, "ksud.provenance");
     pub const LIBADBROOT_PATH: &str = concatcp!(LIBRARY_DIR, "libadbroot.so");
 
     pub const DAEMON_LINK_PATH: &str = concatcp!(BINARY_DIR, "ksud");

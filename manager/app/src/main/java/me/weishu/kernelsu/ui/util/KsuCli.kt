@@ -4,6 +4,7 @@ import android.content.ContentResolver
 import android.content.Context
 import android.database.Cursor
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.Parcelable
 import android.os.SystemClock
@@ -25,6 +26,7 @@ import me.weishu.kernelsu.security.parseAuditTransactionReceipt
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.Executor
 import java.util.UUID
 
@@ -164,7 +166,35 @@ suspend fun getFeaturePersistValue(feature: String): Long? = withContext(Dispatc
 fun install() {
     val start = SystemClock.elapsedRealtime()
     val libadbroot = File(ksuApp.applicationInfo.nativeLibraryDir, "libadbroot.so").absolutePath
-    val result = execKsud("install --libadbroot $libadbroot --data-path ${ksuApp.applicationInfo.deviceProtectedDataDir}", true)
+    val provenanceAbi = Build.SUPPORTED_ABIS.firstOrNull {
+        it == "arm64-v8a" || it == "x86_64"
+    }
+    val provenanceSidecar = provenanceAbi?.let { abi ->
+        runCatching {
+            ksuApp.assets.open("provenance/$abi/ksud.provenance").use { input ->
+                File.createTempFile("ksud-", ".provenance", ksuApp.cacheDir).also { outputFile ->
+                    FileOutputStream(outputFile).use { output ->
+                        input.copyTo(output)
+                        output.fd.sync()
+                    }
+                    check(outputFile.length() == 576L) {
+                        "Invalid ksud provenance sidecar size: ${outputFile.length()}"
+                    }
+                }
+            }
+        }.onFailure {
+            Log.w(TAG, "No usable provenance sidecar for $abi", it)
+        }.getOrNull()
+    }
+    val provenanceArg = provenanceSidecar?.let { " --provenance-sidecar ${it.absolutePath}" }.orEmpty()
+    val result = try {
+        execKsud(
+            "install --libadbroot $libadbroot --data-path ${ksuApp.applicationInfo.deviceProtectedDataDir}$provenanceArg",
+            true
+        )
+    } finally {
+        provenanceSidecar?.delete()
+    }
     Log.w(TAG, "install result: $result, cost: ${SystemClock.elapsedRealtime() - start}ms")
 }
 

@@ -246,8 +246,10 @@ pub enum AuditIncidentCause {
 }
 
 impl AuditIncidentCause {
-    pub(crate) fn is_unknown(&self) -> bool {
-        *self == Self::Unknown
+    // serde's skip_serializing_if callback requires a shared reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub(crate) const fn is_unknown(&self) -> bool {
+        matches!(*self, Self::Unknown)
     }
 }
 
@@ -1326,7 +1328,7 @@ fn compromised_sealed_history_unlocked(
     source: &anyhow::Error,
     key: &[u8; 32],
 ) -> Result<ModuleAuditHistory> {
-    let registry = read_manager_auth_registry(root, &key)?
+    let registry = read_manager_auth_registry(root, key)?
         .context("Manager audit authorization key is not configured")?;
     let seal = load_verified_manager_seal(root, &registry)?
         .context("Manager audit seal is not configured")?;
@@ -1339,8 +1341,8 @@ fn compromised_sealed_history_unlocked(
     let failure = diagnose_sealed_module(root, module)?
         .with_context(|| format!("audit history failed without sealed damage: {source:#}"))?;
     let (quarantined_persistent_scripts, persistent_script_ownership) =
-        read_persistent_quarantine_summary(root, module_id, &key)?;
-    let persistent_result = read_persistent_containment_result(root, module_id, &key)?;
+        read_persistent_quarantine_summary(root, module_id, key)?;
+    let persistent_result = read_persistent_containment_result(root, module_id, key)?;
     let quarantined_persistent_scripts =
         quarantined_persistent_scripts.max(persistent_result.quarantined_paths.len());
     let persistent_script_ownership = if persistent_result.uncertain_ownership {
@@ -1358,7 +1360,7 @@ fn compromised_sealed_history_unlocked(
             head_hash: module.head_hash.clone(),
             hmac_verified: false,
             manager_checkpoint: CheckpointState::Sealed,
-            containment_state: read_containment_state(root, module_id, &key)?,
+            containment_state: read_containment_state(root, module_id, key)?,
             quarantined_persistent_scripts,
             persistent_script_ownership,
             quarantined_persistent_script_paths: persistent_result.quarantined_paths,
@@ -2800,7 +2802,7 @@ fn sealed_integrity_status_with_snapshot_unlocked(
                 _ => verify_chain(root, &module.module_id, key, false).map(|_| ()),
             };
             match verified_chain {
-                Ok(_) => continue,
+                Ok(()) => continue,
                 Err(error) => {
                     if let Some(failure) = diagnose_sealed_module(root, module)? {
                         failures.push(failure);
@@ -3994,10 +3996,12 @@ pub fn recover_manager_sealed_module(
             module_id,
             &key,
             &mut chain.events,
-            failure.corrupted_from_sequence,
-            failure.cause,
-            failure.reason,
-            &quarantine,
+            AuditIncidentDetails {
+                corrupted_from_sequence: failure.corrupted_from_sequence,
+                cause: failure.cause,
+                reason: failure.reason,
+                quarantine: &quarantine,
+            },
         )?;
     }
     let module_status = if unexpected_only {
@@ -4753,14 +4757,16 @@ fn verify_chain(
         module_id,
         key,
         &mut valid,
-        corrupted_from_sequence,
-        if corrupted_from_sequence > u64::try_from(paths.len()).unwrap_or(u64::MAX) {
-            AuditIncidentCause::UnexpectedAuditPath
-        } else {
-            AuditIncidentCause::AuditEventInvalid
+        AuditIncidentDetails {
+            corrupted_from_sequence,
+            cause: if corrupted_from_sequence > u64::try_from(paths.len()).unwrap_or(u64::MAX) {
+                AuditIncidentCause::UnexpectedAuditPath
+            } else {
+                AuditIncidentCause::AuditEventInvalid
+            },
+            reason,
+            quarantine: &quarantine,
         },
-        reason,
-        &quarantine,
     )?;
     Ok(VerifiedChain {
         events: valid,
@@ -4768,15 +4774,19 @@ fn verify_chain(
     })
 }
 
+struct AuditIncidentDetails<'a> {
+    corrupted_from_sequence: u64,
+    cause: AuditIncidentCause,
+    reason: String,
+    quarantine: &'a Path,
+}
+
 fn append_incident(
     root: &Path,
     module_id: &str,
     key: &[u8; 32],
     events: &mut Vec<AuthenticatedEvent>,
-    corrupted_from_sequence: u64,
-    cause: AuditIncidentCause,
-    reason: String,
-    quarantine: &Path,
+    details: AuditIncidentDetails<'_>,
 ) -> Result<()> {
     let previous_hash = events
         .last()
@@ -4791,10 +4801,10 @@ fn append_incident(
         timestamp_unix_seconds: now(),
         previous_hash,
         kind: AuditEventKind::IntegrityIncident {
-            corrupted_from_sequence,
-            cause,
-            reason,
-            quarantine: quarantine.to_string_lossy().into_owned(),
+            corrupted_from_sequence: details.corrupted_from_sequence,
+            cause: details.cause,
+            reason: details.reason,
+            quarantine: details.quarantine.to_string_lossy().into_owned(),
         },
     };
     write_event(root, module_id, key, incident)?;

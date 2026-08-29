@@ -213,12 +213,12 @@ void __exit kernelsu_exit(void)
 
     ksu_allowlist_exit();
 
+    ksu_provenance_exit();
     ksu_selinux_hide_exit();
     ksu_lsm_hook_exit();
     ksu_adb_root_exit();
     ksu_sulog_exit();
     ksu_feature_exit();
-    ksu_provenance_exit();
 
     put_cred(ksu_cred);
 }

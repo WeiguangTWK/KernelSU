@@ -307,6 +307,8 @@ pub fn script_retry_route(
     )
 }
 
+// Each flag maps directly to a separately named recovery requirement.
+#[allow(clippy::fn_params_excessive_bools)]
 fn secure_removal_route(
     kernel_safe_mode: bool,
     authorization_configured: bool,
