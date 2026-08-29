@@ -94,6 +94,8 @@ android {
         jniLibs {
             useLegacyPackaging = true
             excludes += "lib/*/libandroidx.graphics.path.so"
+            // build-release.ps1 strips and signs these exact bytes before Gradle runs.
+            keepDebugSymbols += "**/libksud.so"
         }
     }
 

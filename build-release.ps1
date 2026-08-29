@@ -333,6 +333,7 @@ $NdkRoot = (Resolve-Path $NdkRoot).Path
 
 $LlvmRoot = Join-Path $NdkRoot "toolchains\llvm\prebuilt\windows-x86_64"
 $LlvmBin = Join-Path $LlvmRoot "bin"
+$LlvmStrip = Join-Path $LlvmBin "llvm-strip.exe"
 $BuildTools = Join-Path $AndroidSdk "build-tools\$BuildToolsVersion"
 $ZipAlign = Join-Path $BuildTools "zipalign.exe"
 $ApkSigner = Join-Path $BuildTools "apksigner.bat"
@@ -340,6 +341,7 @@ $ApkSigner = Join-Path $BuildTools "apksigner.bat"
 foreach ($requiredPath in @(
     $LlvmBin,
     (Join-Path $LlvmBin "libclang.dll"),
+    $LlvmStrip,
     $ZipAlign,
     $ApkSigner
 )) {
@@ -603,6 +605,7 @@ $KsudByAbi = @{
 
 $JniRoot = Join-Path $RepoRoot "manager\app\src\main\jniLibs"
 $ProvenanceAssetRoot = Join-Path $RepoRoot "manager\app\src\main\assets\provenance"
+$PackagedKsudByAbi = @{}
 $ProvenanceSidecars = @{}
 foreach ($abi in $KsudByAbi.Keys) {
     $ksud = $KsudByAbi[$abi]
@@ -612,7 +615,14 @@ foreach ($abi in $KsudByAbi.Keys) {
 
     $abiDir = Join-Path $JniRoot $abi
     New-Item -ItemType Directory $abiDir -Force | Out-Null
-    Copy-Item $ksud (Join-Path $abiDir "libksud.so") -Force
+    $packagedKsud = Join-Path $abiDir "libksud.so"
+    Copy-Item $ksud $packagedKsud -Force
+    & $LlvmStrip --strip-unneeded $packagedKsud
+    Assert-LastExitCode "$abi ksud strip"
+    if ((Get-Item $packagedKsud).Length -le 0) {
+        throw "Stripped $abi ksud is empty: $packagedKsud"
+    }
+    $PackagedKsudByAbi[$abi] = $packagedKsud
 
     $provenanceAbiDir = Join-Path $ProvenanceAssetRoot $abi
     New-Item -ItemType Directory $provenanceAbiDir -Force | Out-Null
@@ -623,7 +633,7 @@ foreach ($abi in $KsudByAbi.Keys) {
         & cargo run --quiet --release `
             --manifest-path "$RepoRoot\userspace\ksud\Cargo.toml" `
             -- provenance-manifest sign `
-            --image $ksud `
+            --image $packagedKsud `
             --certificate $ProvenanceCertificate `
             --private-key $ProvenancePrivateKey `
             --output $packagedSidecar `
@@ -637,7 +647,7 @@ foreach ($abi in $KsudByAbi.Keys) {
         & cargo run --quiet --release `
             --manifest-path "$RepoRoot\userspace\ksud\Cargo.toml" `
             -- provenance-manifest verify `
-            --image $ksud `
+            --image $packagedKsud `
             --certificate $ProvenanceCertificate `
             --sidecar $packagedSidecar `
             --required-role 1 `
@@ -716,6 +726,29 @@ if ($ProvenanceSigningEnabled) {
     $archive = [IO.Compression.ZipFile]::OpenRead($OutputApk)
     try {
         foreach ($abi in $ProvenanceSidecars.Keys) {
+            $libEntryName = "lib/$abi/libksud.so"
+            $libEntry = $archive.GetEntry($libEntryName)
+            if ($null -eq $libEntry) {
+                throw "Signed APK is missing ksud executable: $libEntryName"
+            }
+            $packagedKsud = $PackagedKsudByAbi[$abi]
+            $packagedKsudSize = (Get-Item $packagedKsud).Length
+            if ($libEntry.Length -ne $packagedKsudSize) {
+                throw "Signed APK changed $abi ksud size ($($libEntry.Length), expected $packagedKsudSize)"
+            }
+            $libStream = $libEntry.Open()
+            $libSha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+                $libEntryHash = ConvertTo-LowerHex ($libSha256.ComputeHash($libStream))
+            } finally {
+                $libSha256.Dispose()
+                $libStream.Dispose()
+            }
+            $packagedKsudHash = (Get-FileHash $packagedKsud -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($libEntryHash -ne $packagedKsudHash) {
+                throw "Signed APK changed $abi ksud bytes: $libEntryName"
+            }
+
             $entryName = "assets/provenance/$abi/ksud.provenance"
             $entry = $archive.GetEntry($entryName)
             if ($null -eq $entry) {
