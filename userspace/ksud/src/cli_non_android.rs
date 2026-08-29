@@ -128,9 +128,13 @@ enum ProvenanceManifestCommand {
         #[arg(long)]
         current_certificate: PathBuf,
         #[arg(long)]
+        current_private_key: PathBuf,
+        #[arg(long)]
         current_minimum_epoch: u64,
         #[arg(long)]
         next_certificate: Option<PathBuf>,
+        #[arg(long)]
+        next_private_key: Option<PathBuf>,
         #[arg(long)]
         next_minimum_epoch: Option<u64>,
         #[arg(long)]
@@ -240,14 +244,18 @@ pub fn run() -> Result<()> {
             }
             ProvenanceManifestCommand::EmitKernelKeyHeader {
                 current_certificate,
+                current_private_key,
                 current_minimum_epoch,
                 next_certificate,
+                next_private_key,
                 next_minimum_epoch,
                 output,
             } => crate::provenance_manifest::emit_kernel_key_header(&KernelKeyHeaderOptions {
                 current_certificate,
+                current_private_key,
                 current_minimum_epoch,
                 next_certificate,
+                next_private_key,
                 next_minimum_epoch,
                 output,
             }),

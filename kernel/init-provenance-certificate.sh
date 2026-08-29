@@ -138,6 +138,7 @@ cargo run --quiet --release \
     --manifest-path "$REPO_ROOT/userspace/ksud/Cargo.toml" \
     -- provenance-manifest emit-kernel-key-header \
     --current-certificate "$certificate_pem" \
+    --current-private-key "$private_key" \
     --current-minimum-epoch "$security_epoch" \
     --output "$public_header"
 
@@ -153,6 +154,7 @@ final_certificate="$output_dir/provenance-certificate.pem"
 
 {
     printf 'format_version=1\n'
+    printf 'key_header_format=2\n'
     printf 'algorithm=RSA-3072-PKCS1-v1_5-SHA256\n'
     printf 'security_epoch=%s\n' "$security_epoch"
     printf 'certificate_key_id=%s\n' "$certificate_key_id"

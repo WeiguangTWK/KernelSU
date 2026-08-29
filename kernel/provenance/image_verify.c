@@ -4,6 +4,7 @@
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/version.h>
@@ -26,10 +27,20 @@ struct ksu_provenance_embedded_key {
     size_t certificate_size;
     u8 key_id[32];
     u64 minimum_security_epoch;
+    const u8 *selftest_image;
+    size_t selftest_image_size;
+    const u8 *selftest_sidecar;
+    size_t selftest_sidecar_size;
 };
 
 #ifdef KSU_PROVENANCE_KEY_HEADER
 #include KSU_PROVENANCE_KEY_HEADER
+#if KSU_PROVENANCE_KEY_HEADER_FORMAT != 2
+#error "unsupported provenance key header format; regenerate the public header"
+#endif
+MODULE_INFO(ksu_provenance_key_header_format, "2");
+MODULE_INFO(ksu_provenance_key_ids, KSU_PROVENANCE_EMBEDDED_KEY_IDS_HEX);
+MODULE_INFO(ksu_provenance_minimum_epochs, KSU_PROVENANCE_EMBEDDED_MINIMUM_EPOCHS);
 #else
 static const struct ksu_provenance_embedded_key ksu_provenance_embedded_keys[1];
 #define KSU_PROVENANCE_EMBEDDED_KEY_COUNT 0
@@ -166,6 +177,8 @@ static int ksu_provenance_validate_certificate(struct ksu_provenance_runtime_key
     return KSU_PROVENANCE_VERIFY_OK;
 }
 
+static u32 ksu_provenance_verifier_selftest(const struct ksu_provenance_runtime_key *key);
+
 int ksu_provenance_image_verifier_init(void)
 {
     unsigned int index;
@@ -191,6 +204,15 @@ int ksu_provenance_image_verifier_init(void)
     for (index = 0; index < KSU_PROVENANCE_EMBEDDED_KEY_COUNT; index++) {
         reason = ksu_provenance_validate_certificate(&ksu_provenance_runtime_keys[index],
                                                      &ksu_provenance_embedded_keys[index]);
+        if (reason != KSU_PROVENANCE_VERIFY_OK) {
+            ksu_provenance_image_verifier_exit();
+            ksu_provenance_verifier_state = KSU_PROVENANCE_VERIFIER_FAILED;
+            atomic_set(&ksu_provenance_last_error, reason);
+            return -EKEYREJECTED;
+        }
+    }
+    for (index = 0; index < KSU_PROVENANCE_EMBEDDED_KEY_COUNT; index++) {
+        reason = ksu_provenance_verifier_selftest(&ksu_provenance_runtime_keys[index]);
         if (reason != KSU_PROVENANCE_VERIFY_OK) {
             ksu_provenance_image_verifier_exit();
             ksu_provenance_verifier_state = KSU_PROVENANCE_VERIFIER_FAILED;
@@ -227,8 +249,7 @@ static const struct ksu_provenance_runtime_key *ksu_provenance_find_key(const u8
     return NULL;
 }
 
-static int ksu_provenance_read_sidecar(const char *path, u8 **sidecar,
-                                       struct ksu_provenance_verified_image *verified)
+static int ksu_provenance_read_sidecar(const char *path, u8 **sidecar, struct ksu_provenance_verified_image *verified)
 {
     struct file *file;
     loff_t position = 0;
@@ -236,32 +257,27 @@ static int ksu_provenance_read_sidecar(const char *path, u8 **sidecar,
 
     file = filp_open(path, O_RDONLY | O_NOFOLLOW, 0);
     if (IS_ERR(file))
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_OPEN,
-                                     PTR_ERR(file));
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_OPEN, PTR_ERR(file));
     if (!S_ISREG(file_inode(file)->i_mode)) {
         filp_close(file, NULL);
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_TYPE,
-                                     -EINVAL);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_TYPE, -EINVAL);
     }
     if (i_size_read(file_inode(file)) != KSU_PROVENANCE_SIDECAR_SIZE_V1) {
         filp_close(file, NULL);
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_SIZE,
-                                     -EMSGSIZE);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_SIZE, -EMSGSIZE);
     }
 
     *sidecar = kmalloc(KSU_PROVENANCE_SIDECAR_SIZE_V1, GFP_KERNEL);
     if (!*sidecar) {
         filp_close(file, NULL);
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_INTERNAL,
-                                     -ENOMEM);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_INTERNAL, -ENOMEM);
     }
     count = kernel_read(file, *sidecar, KSU_PROVENANCE_SIDECAR_SIZE_V1, &position);
     filp_close(file, NULL);
     if (count != KSU_PROVENANCE_SIDECAR_SIZE_V1) {
         kfree(*sidecar);
         *sidecar = NULL;
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_READ,
-                                     count < 0 ? (int)count : -EIO);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_READ, count < 0 ? (int)count : -EIO);
     }
     return 0;
 }
@@ -271,27 +287,20 @@ static int ksu_provenance_parse_manifest(const u8 *manifest, u32 required_role,
                                          struct ksu_provenance_verified_image *verified)
 {
     if (memcmp(manifest, ksu_provenance_manifest_magic, sizeof(ksu_provenance_manifest_magic)))
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_MAGIC,
-                                     -EBADMSG);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_MAGIC, -EBADMSG);
     if (get_unaligned_le16(manifest + 8) != KSU_PROVENANCE_MANIFEST_FORMAT_VERSION)
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_VERSION,
-                                     -EPROTONOSUPPORT);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_VERSION, -EPROTONOSUPPORT);
     if (get_unaligned_le16(manifest + 10) != KSU_PROVENANCE_MANIFEST_SIZE_V1)
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_LENGTH,
-                                     -EMSGSIZE);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_LENGTH, -EMSGSIZE);
     if (get_unaligned_le32(manifest + 12))
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_FLAGS,
-                                     -EINVAL);
-    if (get_unaligned_le32(manifest + 20) ||
-        !ksu_provenance_all_zero(manifest + 144, 48))
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_RESERVED,
-                                     -EINVAL);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_FLAGS, -EINVAL);
+    if (get_unaligned_le32(manifest + 20) || !ksu_provenance_all_zero(manifest + 144, 48))
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_RESERVED, -EINVAL);
 
     parsed->roles = get_unaligned_le32(manifest + 16);
     if (!parsed->roles || (parsed->roles & ~KSU_PROVENANCE_ROLE_MASK_V1) ||
         (required_role && !(parsed->roles & required_role)))
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_ROLE,
-                                     -EACCES);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_ROLE, -EACCES);
 
     parsed->image_size = get_unaligned_le64(manifest + 24);
     parsed->image_sha256 = manifest + 32;
@@ -301,27 +310,22 @@ static int ksu_provenance_parse_manifest(const u8 *manifest, u32 required_role,
     parsed->security_epoch = get_unaligned_le64(manifest + 104);
     parsed->signing_key_id = manifest + 112;
 
-    if (!parsed->uapi_min || parsed->uapi_min > parsed->uapi_max ||
-        parsed->uapi_min > KSU_PROVENANCE_UAPI_VERSION ||
+    if (!parsed->uapi_min || parsed->uapi_min > parsed->uapi_max || parsed->uapi_min > KSU_PROVENANCE_UAPI_VERSION ||
         parsed->uapi_max < KSU_PROVENANCE_UAPI_VERSION)
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_UAPI,
-                                     -EPROTONOSUPPORT);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_UAPI, -EPROTONOSUPPORT);
     if (ksu_provenance_all_zero(parsed->build_id, 32))
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_RESERVED,
-                                     -EINVAL);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_MANIFEST_RESERVED, -EINVAL);
     return 0;
 }
 
-static int ksu_provenance_verify_manifest_signature(
-    const struct ksu_provenance_runtime_key *key, const u8 *manifest,
-    const u8 *signature, struct ksu_provenance_verified_image *verified)
+static int ksu_provenance_verify_manifest_signature(const struct ksu_provenance_runtime_key *key, const u8 *manifest,
+                                                    const u8 *signature, struct ksu_provenance_verified_image *verified)
 {
     struct public_key_signature public_signature = { 0 };
     u8 digest[32];
     int error;
 
-    error = ksu_provenance_hash_manifest(manifest, KSU_PROVENANCE_MANIFEST_SIZE_V1,
-                                         digest);
+    error = ksu_provenance_hash_manifest(manifest, KSU_PROVENANCE_MANIFEST_SIZE_V1, digest);
     if (error)
         return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_CRYPTO, error);
 
@@ -335,13 +339,166 @@ static int ksu_provenance_verify_manifest_signature(
 
     error = public_key_verify_signature(key->certificate->pub, &public_signature);
     if (error)
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIGNATURE,
-                                     -EKEYREJECTED);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIGNATURE, -EKEYREJECTED);
     return 0;
 }
 
-int ksu_provenance_verify_image(struct file *image, const char *sidecar_path,
-                                u32 required_role,
+static int ksu_provenance_verify_selftest_material(const struct ksu_provenance_runtime_key *key, const u8 *sidecar,
+                                                   size_t sidecar_size, const u8 *image, size_t image_size,
+                                                   u32 required_role, struct ksu_provenance_verified_image *verified)
+{
+    struct ksu_provenance_parsed_manifest parsed = { 0 };
+    u8 digest[32];
+    int error;
+
+    memset(verified, 0, sizeof(*verified));
+    if (!sidecar || sidecar_size != KSU_PROVENANCE_SIDECAR_SIZE_V1)
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_SIDECAR_SIZE, -EMSGSIZE);
+    if (!image || !image_size || !required_role || (required_role & ~KSU_PROVENANCE_ROLE_MASK_V1))
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_ROLE, -EINVAL);
+
+    error = ksu_provenance_parse_manifest(sidecar, required_role, &parsed, verified);
+    if (error)
+        return error;
+    if (memcmp(parsed.signing_key_id, key->embedded->key_id, 32))
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_KEY_ID, -ENOKEY);
+    if (parsed.security_epoch < key->embedded->minimum_security_epoch)
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_EPOCH, -EKEYREJECTED);
+    if (!parsed.image_size || parsed.image_size > KSU_PROVENANCE_MAX_IMAGE_SIZE || parsed.image_size != image_size)
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_SIZE, -EFBIG);
+
+    error = ksu_provenance_verify_manifest_signature(key, sidecar, sidecar + KSU_PROVENANCE_MANIFEST_SIZE_V1, verified);
+    if (error)
+        return error;
+    error = ksu_provenance_sha256(image, image_size, digest);
+    if (error)
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_CRYPTO, error);
+    if (memcmp(digest, parsed.image_sha256, sizeof(digest)))
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_DIGEST, -EKEYREJECTED);
+
+    verified->roles = parsed.roles;
+    verified->uapi_min = parsed.uapi_min;
+    verified->uapi_max = parsed.uapi_max;
+    verified->security_epoch = parsed.security_epoch;
+    verified->image_size = parsed.image_size;
+    memcpy(verified->image_sha256, parsed.image_sha256, 32);
+    memcpy(verified->build_id, parsed.build_id, 32);
+    memcpy(verified->signing_key_id, parsed.signing_key_id, 32);
+    verified->error = KSU_PROVENANCE_VERIFY_OK;
+    return 0;
+}
+
+static bool ksu_provenance_selftest_rejects(const struct ksu_provenance_runtime_key *key, const u8 *sidecar,
+                                            size_t sidecar_size, const u8 *image, size_t image_size, u32 required_role,
+                                            u32 expected_reason)
+{
+    struct ksu_provenance_verified_image verified;
+    int error;
+
+    error = ksu_provenance_verify_selftest_material(key, sidecar, sidecar_size, image, image_size, required_role,
+                                                    &verified);
+    return error && verified.error == expected_reason;
+}
+
+static u32 ksu_provenance_verifier_selftest(const struct ksu_provenance_runtime_key *key)
+{
+    const struct ksu_provenance_embedded_key *embedded = key->embedded;
+    struct ksu_provenance_verified_image verified;
+    u8 *sidecar;
+    u8 *image;
+    int error;
+
+    if (!embedded->selftest_image || !embedded->selftest_image_size || !embedded->selftest_sidecar ||
+        embedded->selftest_sidecar_size != KSU_PROVENANCE_SIDECAR_SIZE_V1)
+        return KSU_PROVENANCE_VERIFY_INTERNAL;
+
+    error = ksu_provenance_verify_selftest_material(key, embedded->selftest_sidecar, embedded->selftest_sidecar_size,
+                                                    embedded->selftest_image, embedded->selftest_image_size,
+                                                    KSU_PROVENANCE_ROLE_SUPERVISOR, &verified);
+    if (error)
+        return verified.error ?: KSU_PROVENANCE_VERIFY_INTERNAL;
+
+    if (!ksu_provenance_selftest_rejects(key, embedded->selftest_sidecar, embedded->selftest_sidecar_size - 1,
+                                         embedded->selftest_image, embedded->selftest_image_size,
+                                         KSU_PROVENANCE_ROLE_SUPERVISOR, KSU_PROVENANCE_VERIFY_SIDECAR_SIZE) ||
+        !ksu_provenance_selftest_rejects(key, embedded->selftest_sidecar, embedded->selftest_sidecar_size + 1,
+                                         embedded->selftest_image, embedded->selftest_image_size,
+                                         KSU_PROVENANCE_ROLE_SUPERVISOR, KSU_PROVENANCE_VERIFY_SIDECAR_SIZE) ||
+        !ksu_provenance_selftest_rejects(key, embedded->selftest_sidecar, embedded->selftest_sidecar_size,
+                                         embedded->selftest_image, embedded->selftest_image_size,
+                                         KSU_PROVENANCE_ROLE_INIT_PROXY, KSU_PROVENANCE_VERIFY_ROLE) ||
+        !ksu_provenance_selftest_rejects(key, embedded->selftest_sidecar, embedded->selftest_sidecar_size,
+                                         embedded->selftest_image, embedded->selftest_image_size - 1,
+                                         KSU_PROVENANCE_ROLE_SUPERVISOR, KSU_PROVENANCE_VERIFY_IMAGE_SIZE))
+        return KSU_PROVENANCE_VERIFY_INTERNAL;
+
+    sidecar = kmalloc(embedded->selftest_sidecar_size, GFP_KERNEL);
+    image = kmalloc(embedded->selftest_image_size, GFP_KERNEL);
+    if (!sidecar || !image) {
+        kfree(sidecar);
+        kfree(image);
+        return KSU_PROVENANCE_VERIFY_INTERNAL;
+    }
+    memcpy(sidecar, embedded->selftest_sidecar, embedded->selftest_sidecar_size);
+    memcpy(image, embedded->selftest_image, embedded->selftest_image_size);
+
+#define KSU_PROVENANCE_EXPECT_MUTATION(offset, reason)                                                                 \
+    do {                                                                                                               \
+        memcpy(sidecar, embedded->selftest_sidecar, embedded->selftest_sidecar_size);                                  \
+        sidecar[(offset)] ^= 1;                                                                                        \
+        if (!ksu_provenance_selftest_rejects(key, sidecar, embedded->selftest_sidecar_size, embedded->selftest_image,  \
+                                             embedded->selftest_image_size, KSU_PROVENANCE_ROLE_SUPERVISOR,            \
+                                             (reason))) {                                                              \
+            error = KSU_PROVENANCE_VERIFY_INTERNAL;                                                                    \
+            goto out;                                                                                                  \
+        }                                                                                                              \
+    } while (0)
+
+    KSU_PROVENANCE_EXPECT_MUTATION(0, KSU_PROVENANCE_VERIFY_MANIFEST_MAGIC);
+    KSU_PROVENANCE_EXPECT_MUTATION(8, KSU_PROVENANCE_VERIFY_MANIFEST_VERSION);
+    KSU_PROVENANCE_EXPECT_MUTATION(10, KSU_PROVENANCE_VERIFY_MANIFEST_LENGTH);
+    KSU_PROVENANCE_EXPECT_MUTATION(12, KSU_PROVENANCE_VERIFY_MANIFEST_FLAGS);
+    KSU_PROVENANCE_EXPECT_MUTATION(20, KSU_PROVENANCE_VERIFY_MANIFEST_RESERVED);
+    KSU_PROVENANCE_EXPECT_MUTATION(144, KSU_PROVENANCE_VERIFY_MANIFEST_RESERVED);
+    KSU_PROVENANCE_EXPECT_MUTATION(112, KSU_PROVENANCE_VERIFY_KEY_ID);
+    KSU_PROVENANCE_EXPECT_MUTATION(KSU_PROVENANCE_MANIFEST_SIZE_V1, KSU_PROVENANCE_VERIFY_SIGNATURE);
+
+    memcpy(sidecar, embedded->selftest_sidecar, embedded->selftest_sidecar_size);
+    put_unaligned_le32(KSU_PROVENANCE_UAPI_VERSION + 1, sidecar + 96);
+    put_unaligned_le32(KSU_PROVENANCE_UAPI_VERSION + 1, sidecar + 100);
+    if (!ksu_provenance_selftest_rejects(key, sidecar, embedded->selftest_sidecar_size, embedded->selftest_image,
+                                         embedded->selftest_image_size, KSU_PROVENANCE_ROLE_SUPERVISOR,
+                                         KSU_PROVENANCE_VERIFY_UAPI)) {
+        error = KSU_PROVENANCE_VERIFY_INTERNAL;
+        goto out;
+    }
+
+    memcpy(sidecar, embedded->selftest_sidecar, embedded->selftest_sidecar_size);
+    put_unaligned_le64(0, sidecar + 104);
+    if (!ksu_provenance_selftest_rejects(key, sidecar, embedded->selftest_sidecar_size, embedded->selftest_image,
+                                         embedded->selftest_image_size, KSU_PROVENANCE_ROLE_SUPERVISOR,
+                                         KSU_PROVENANCE_VERIFY_EPOCH)) {
+        error = KSU_PROVENANCE_VERIFY_INTERNAL;
+        goto out;
+    }
+
+    image[0] ^= 1;
+    if (!ksu_provenance_selftest_rejects(key, embedded->selftest_sidecar, embedded->selftest_sidecar_size, image,
+                                         embedded->selftest_image_size, KSU_PROVENANCE_ROLE_SUPERVISOR,
+                                         KSU_PROVENANCE_VERIFY_IMAGE_DIGEST)) {
+        error = KSU_PROVENANCE_VERIFY_INTERNAL;
+        goto out;
+    }
+
+    error = KSU_PROVENANCE_VERIFY_OK;
+out:
+    kfree(sidecar);
+    kfree(image);
+#undef KSU_PROVENANCE_EXPECT_MUTATION
+    return error;
+}
+
+int ksu_provenance_verify_image(struct file *image, const char *sidecar_path, u32 required_role,
                                 struct ksu_provenance_verified_image *verified)
 {
     const struct ksu_provenance_runtime_key *key;
@@ -357,25 +514,23 @@ int ksu_provenance_verify_image(struct file *image, const char *sidecar_path,
 
     if (ksu_provenance_verifier_state != KSU_PROVENANCE_VERIFIER_READY) {
         u32 reason = ksu_provenance_verifier_state == KSU_PROVENANCE_VERIFIER_FAILED ?
-            atomic_read(&ksu_provenance_last_error) : KSU_PROVENANCE_VERIFY_NO_KEY;
+                         atomic_read(&ksu_provenance_last_error) :
+                         KSU_PROVENANCE_VERIFY_NO_KEY;
 
         if (verified)
             verified->error = reason;
         return -ENOKEY;
     }
     if (!image || !sidecar_path)
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_INTERNAL,
-                                     -EINVAL);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_INTERNAL, -EINVAL);
     if (!S_ISREG(file_inode(image)->i_mode))
-        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_TYPE,
-                                     -EINVAL);
+        return ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_TYPE, -EINVAL);
 
     error = ksu_provenance_read_sidecar(sidecar_path, &sidecar, verified);
     if (error)
         return error;
     if (!required_role || (required_role & ~KSU_PROVENANCE_ROLE_MASK_V1)) {
-        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_ROLE,
-                                      -EINVAL);
+        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_ROLE, -EINVAL);
         goto out;
     }
     error = ksu_provenance_parse_manifest(sidecar, required_role, &parsed, verified);
@@ -384,35 +539,29 @@ int ksu_provenance_verify_image(struct file *image, const char *sidecar_path,
 
     key = ksu_provenance_find_key(parsed.signing_key_id);
     if (!key) {
-        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_KEY_ID,
-                                      -ENOKEY);
+        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_KEY_ID, -ENOKEY);
         goto out;
     }
     if (parsed.security_epoch < key->embedded->minimum_security_epoch) {
-        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_EPOCH,
-                                      -EKEYREJECTED);
+        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_EPOCH, -EKEYREJECTED);
         goto out;
     }
     if (!parsed.image_size || parsed.image_size > KSU_PROVENANCE_MAX_IMAGE_SIZE ||
         parsed.image_size != i_size_read(file_inode(image))) {
-        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_SIZE,
-                                      -EFBIG);
+        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_SIZE, -EFBIG);
         goto out;
     }
 
-    error = ksu_provenance_verify_manifest_signature(
-        key, sidecar, sidecar + KSU_PROVENANCE_MANIFEST_SIZE_V1, verified);
+    error = ksu_provenance_verify_manifest_signature(key, sidecar, sidecar + KSU_PROVENANCE_MANIFEST_SIZE_V1, verified);
     if (error)
         goto out;
     error = ksu_provenance_sha256_file(image, parsed.image_size, actual_digest);
     if (error) {
-        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_READ,
-                                      error);
+        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_READ, error);
         goto out;
     }
     if (memcmp(actual_digest, parsed.image_sha256, sizeof(actual_digest))) {
-        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_DIGEST,
-                                      -EKEYREJECTED);
+        error = ksu_provenance_reject(verified, KSU_PROVENANCE_VERIFY_IMAGE_DIGEST, -EKEYREJECTED);
         goto out;
     }
 
@@ -432,10 +581,8 @@ out:
     return error;
 }
 
-void ksu_provenance_image_verifier_diagnostics(u32 *state, u32 *error,
-                                                u64 *minimum_epoch,
-                                                u8 key_id[32],
-                                                u64 *capabilities)
+void ksu_provenance_image_verifier_diagnostics(u32 *state, u32 *error, u64 *minimum_epoch, u8 key_id[32],
+                                               u64 *capabilities)
 {
     *state = ksu_provenance_verifier_state;
     *error = atomic_read(&ksu_provenance_last_error);

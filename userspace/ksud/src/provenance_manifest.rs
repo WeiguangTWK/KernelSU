@@ -19,6 +19,8 @@ const MANIFEST_MAGIC: &[u8; 8] = b"KSUIMV1\0";
 const MANIFEST_DOMAIN: &[u8; 24] = b"KSU-PROVENANCE-IMAGE-V1\0";
 #[allow(dead_code)]
 const EVENT_DOMAIN: &[u8; 24] = b"KSU-PROVENANCE-EVENT-V1\0";
+const KERNEL_SELFTEST_IMAGE: &[u8] = b"KSU-PROVENANCE-KERNEL-SELFTEST-V1\0";
+const KERNEL_SELFTEST_BUILD_DOMAIN: &[u8] = b"KSU-PROVENANCE-SELFTEST-BUILD-V1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageManifestV1 {
@@ -123,8 +125,10 @@ pub struct VerifyOptions {
 #[derive(Clone, Debug)]
 pub struct KernelKeyHeaderOptions {
     pub current_certificate: PathBuf,
+    pub current_private_key: PathBuf,
     pub current_minimum_epoch: u64,
     pub next_certificate: Option<PathBuf>,
+    pub next_private_key: Option<PathBuf>,
     pub next_minimum_epoch: Option<u64>,
     pub output: PathBuf,
 }
@@ -186,26 +190,7 @@ pub fn sign(options: &SignOptions) -> Result<ImageManifestV1> {
         "manifest UAPI interval does not include version {UAPI_VERSION}"
     );
 
-    let signed_input = signed_manifest_input(&encoded);
-    let temporary_directory = tempfile::tempdir().context("create signing temporary directory")?;
-    let input_path = temporary_directory.path().join("manifest.input");
-    let signature_path = temporary_directory.path().join("manifest.signature");
-    fs::write(&input_path, signed_input).context("write signing input")?;
-    run_openssl([
-        "dgst",
-        "-sha256",
-        "-sign",
-        path_text(&options.private_key)?,
-        "-out",
-        path_text(&signature_path)?,
-        path_text(&input_path)?,
-    ])?;
-    let signature = fs::read(&signature_path).context("read generated signature")?;
-    ensure!(
-        signature.len() == SIGNATURE_SIZE,
-        "RSA signature is {} bytes, expected {SIGNATURE_SIZE}",
-        signature.len()
-    );
+    let signature = sign_manifest(&options.private_key, &encoded)?;
     verify_signature(&options.certificate, &encoded, &signature)?;
 
     let mut sidecar = Vec::with_capacity(SIDECAR_SIZE);
@@ -262,32 +247,63 @@ pub fn verify(options: &VerifyOptions) -> Result<ImageManifestV1> {
 
 pub fn emit_kernel_key_header(options: &KernelKeyHeaderOptions) -> Result<()> {
     ensure!(
-        options.next_certificate.is_some() == options.next_minimum_epoch.is_some(),
-        "next certificate and minimum epoch must be supplied together"
+        options.current_minimum_epoch != 0,
+        "current minimum security epoch must be positive"
+    );
+    ensure!(
+        options.next_certificate.is_some() == options.next_private_key.is_some()
+            && options.next_certificate.is_some() == options.next_minimum_epoch.is_some(),
+        "next certificate, private key, and minimum epoch must be supplied together"
     );
     let mut certificates = vec![(
         options.current_certificate.as_path(),
+        options.current_private_key.as_path(),
         options.current_minimum_epoch,
     )];
-    if let (Some(certificate), Some(epoch)) = (
+    if let (Some(certificate), Some(private_key), Some(epoch)) = (
         options.next_certificate.as_deref(),
+        options.next_private_key.as_deref(),
         options.next_minimum_epoch,
     ) {
-        certificates.push((certificate, epoch));
+        ensure!(epoch != 0, "next minimum security epoch must be positive");
+        certificates.push((certificate, private_key, epoch));
     }
 
     let mut output = String::from(
-        "#ifndef __KSU_PROVENANCE_GENERATED_KEY_H\n#define __KSU_PROVENANCE_GENERATED_KEY_H\n\n",
+        "#ifndef __KSU_PROVENANCE_GENERATED_KEY_H\n#define __KSU_PROVENANCE_GENERATED_KEY_H\n\n#define KSU_PROVENANCE_KEY_HEADER_FORMAT 2\n\n",
     );
     let mut entries = Vec::new();
-    for (index, (certificate, epoch)) in certificates.iter().enumerate() {
+    for (index, (certificate, private_key, epoch)) in certificates.iter().enumerate() {
         validate_rsa3072_certificate(certificate)?;
         let der = certificate_der(certificate)?;
         let key_id: [u8; 32] = Sha256::digest(&der).into();
+        let build_id: [u8; 32] = Sha256::new()
+            .chain_update(KERNEL_SELFTEST_BUILD_DOMAIN)
+            .chain_update(key_id)
+            .finalize()
+            .into();
+        let selftest_manifest = ImageManifestV1 {
+            roles: ROLE_SUPERVISOR,
+            image_size: KERNEL_SELFTEST_IMAGE.len() as u64,
+            image_sha256: Sha256::digest(KERNEL_SELFTEST_IMAGE).into(),
+            build_id,
+            uapi_min: UAPI_VERSION,
+            uapi_max: UAPI_VERSION,
+            security_epoch: *epoch,
+            signing_key_id: key_id,
+        }
+        .encode()?;
+        let selftest_signature = sign_manifest(private_key, &selftest_manifest)?;
+        verify_signature(certificate, &selftest_manifest, &selftest_signature)?;
+        let mut selftest_sidecar = Vec::with_capacity(SIDECAR_SIZE);
+        selftest_sidecar.extend_from_slice(&selftest_manifest);
+        selftest_sidecar.extend_from_slice(&selftest_signature);
         write!(
             output,
-            "static const u8 ksu_provenance_certificate_{index}[] = {{\n{}\n}};\n\n",
-            c_byte_lines(&der)
+            "static const u8 ksu_provenance_certificate_{index}[] = {{\n{}\n}};\n\nstatic const u8 ksu_provenance_selftest_image_{index}[] = {{\n{}\n}};\n\nstatic const u8 ksu_provenance_selftest_sidecar_{index}[] = {{\n{}\n}};\n\n",
+            c_byte_lines(&der),
+            c_byte_lines(KERNEL_SELFTEST_IMAGE),
+            c_byte_lines(&selftest_sidecar),
         )
         .expect("writing to a String cannot fail");
         entries.push((index, *epoch, key_id));
@@ -304,13 +320,30 @@ pub fn emit_kernel_key_header(options: &KernelKeyHeaderOptions) -> Result<()> {
     for (index, epoch, key_id) in &entries {
         write!(
             output,
-            "    {{ .certificate_der = ksu_provenance_certificate_{index}, .certificate_size = sizeof(ksu_provenance_certificate_{index}),\n      .key_id = {{ {} }}, .minimum_security_epoch = {epoch}ULL }},\n",
+            "    {{ .certificate_der = ksu_provenance_certificate_{index}, .certificate_size = sizeof(ksu_provenance_certificate_{index}),\n      .key_id = {{ {} }}, .minimum_security_epoch = {epoch}ULL,\n      .selftest_image = ksu_provenance_selftest_image_{index}, .selftest_image_size = sizeof(ksu_provenance_selftest_image_{index}),\n      .selftest_sidecar = ksu_provenance_selftest_sidecar_{index}, .selftest_sidecar_size = sizeof(ksu_provenance_selftest_sidecar_{index}) }},\n",
             c_byte_list(key_id)
         )
         .expect("writing to a String cannot fail");
     }
     output.push_str("};\n#define KSU_PROVENANCE_EMBEDDED_KEY_COUNT ");
     output.push_str(&entries.len().to_string());
+    output.push_str("\n#define KSU_PROVENANCE_EMBEDDED_KEY_IDS_HEX \"");
+    output.push_str(
+        &entries
+            .iter()
+            .map(|(_, _, key_id)| base16ct::lower::encode_string(key_id))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    output.push_str("\"\n#define KSU_PROVENANCE_EMBEDDED_MINIMUM_EPOCHS \"");
+    output.push_str(
+        &entries
+            .iter()
+            .map(|(_, epoch, _)| epoch.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    output.push('"');
     output.push_str("\n\n#endif /* __KSU_PROVENANCE_GENERATED_KEY_H */\n");
     write_atomic(&options.output, output.as_bytes())
 }
@@ -406,6 +439,29 @@ fn validate_rsa3072_certificate(path: &Path) -> Result<()> {
         }
     }
     bail!("openssl could not inspect {path} as a PEM or DER certificate")
+}
+
+fn sign_manifest(private_key: &Path, manifest: &[u8]) -> Result<Vec<u8>> {
+    let temporary_directory = tempfile::tempdir().context("create signing temporary directory")?;
+    let input_path = temporary_directory.path().join("manifest.input");
+    let signature_path = temporary_directory.path().join("manifest.signature");
+    fs::write(&input_path, signed_manifest_input(manifest)).context("write signing input")?;
+    run_openssl([
+        "dgst",
+        "-sha256",
+        "-sign",
+        path_text(private_key)?,
+        "-out",
+        path_text(&signature_path)?,
+        path_text(&input_path)?,
+    ])?;
+    let signature = fs::read(&signature_path).context("read generated signature")?;
+    ensure!(
+        signature.len() == SIGNATURE_SIZE,
+        "RSA signature is {} bytes, expected {SIGNATURE_SIZE}",
+        signature.len()
+    );
+    Ok(signature)
 }
 
 fn verify_signature(certificate: &Path, manifest: &[u8], signature: &[u8]) -> Result<()> {
@@ -671,6 +727,22 @@ mod tests {
             validity_days: 1,
         })
         .unwrap();
+        let header_path = directory.path().join("provenance-public-key.h");
+        emit_kernel_key_header(&KernelKeyHeaderOptions {
+            current_certificate: certificate_path.clone(),
+            current_private_key: key_path.clone(),
+            current_minimum_epoch: 7,
+            next_certificate: None,
+            next_private_key: None,
+            next_minimum_epoch: None,
+            output: header_path.clone(),
+        })
+        .unwrap();
+        let header = fs::read_to_string(header_path).unwrap();
+        assert!(header.contains("#define KSU_PROVENANCE_KEY_HEADER_FORMAT 2"));
+        assert!(header.contains("ksu_provenance_selftest_sidecar_0"));
+        assert!(header.contains("KSU_PROVENANCE_EMBEDDED_KEY_IDS_HEX"));
+        assert!(!header.contains("BEGIN PRIVATE KEY"));
         let sign_options = SignOptions {
             image: image_path.clone(),
             certificate: certificate_path.clone(),
