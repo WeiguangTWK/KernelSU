@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as FmtWrite;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -550,13 +550,14 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
         .as_file()
         .sync_all()
         .context("sync temporary output")?;
-    temporary
+    let output = temporary
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("replace {}", path.display()))?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("sync {}", parent.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("sync {}", path.display()))?;
+    sync_parent_directory(parent)?;
     Ok(())
 }
 
@@ -576,13 +577,29 @@ fn write_new_atomic(path: &Path, data: &[u8]) -> Result<()> {
         .as_file()
         .sync_all()
         .context("sync temporary output")?;
-    temporary
+    let output = temporary
         .persist_noclobber(path)
         .map_err(|error| error.error)
         .with_context(|| format!("create {}", path.display()))?;
-    File::open(parent)
+    output
+        .sync_all()
+        .with_context(|| format!("sync {}", path.display()))?;
+    sync_parent_directory(parent)?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .with_context(|| format!("sync {}", parent.display()))?;
+        .with_context(|| format!("sync {}", parent.display()))
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_parent_directory(_parent: &Path) -> Result<()> {
+    // Rust's standard Windows file API cannot open a directory for fsync-like
+    // durability. The persisted file handle is synced after the rename above.
     Ok(())
 }
 
@@ -678,6 +695,22 @@ mod tests {
             base16ct::lower::encode_string(&event_digest(&[0x44; 32], &[0x55; 128])),
             "b18737ddb8a84651c6fb878cf739239f3e7c75b9a91afbda20376b257dae2abe"
         );
+    }
+
+    #[test]
+    fn atomic_writes_round_trip_and_refuse_key_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let replaceable = directory.path().join("replaceable");
+        let create_only = directory.path().join("create-only");
+
+        write_atomic(&replaceable, b"first").unwrap();
+        write_atomic(&replaceable, b"second").unwrap();
+        assert_eq!(fs::read(&replaceable).unwrap(), b"second");
+
+        write_new_atomic(&create_only, b"private key").unwrap();
+        assert_eq!(fs::read(&create_only).unwrap(), b"private key");
+        assert!(write_new_atomic(&create_only, b"replacement").is_err());
+        assert_eq!(fs::read(&create_only).unwrap(), b"private key");
     }
 
     #[test]
