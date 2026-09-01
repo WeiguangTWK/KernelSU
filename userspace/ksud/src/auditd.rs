@@ -68,6 +68,7 @@ struct AuditdResumeGuard {
 pub struct AuditdShutdownGuard {
     _auditd_lock: AuditdLockGuard,
     _coordinator: AuditCoordinatorGuard,
+    services_to_resume: Vec<&'static str>,
 }
 
 pub struct AuditCoordinatorGuard {
@@ -124,12 +125,22 @@ impl AuditdLockGuard {
 
 impl Drop for AuditdResumeGuard {
     fn drop(&mut self) {
-        for service in &self.services {
-            match Command::new("start").arg(service).status() {
-                Ok(status) if status.success() => {}
-                Ok(status) => warn!("failed to restart auditd service {service}: {status}"),
-                Err(error) => warn!("failed to restart auditd service {service}: {error:#}"),
-            }
+        restart_auditd_services(&self.services);
+    }
+}
+
+impl AuditdShutdownGuard {
+    pub fn resume_after_failed_shutdown(self) {
+        restart_auditd_services(&self.services_to_resume);
+    }
+}
+
+fn restart_auditd_services(services: &[&str]) {
+    for service in services {
+        match Command::new("start").arg(service).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => warn!("failed to restart auditd service {service}: {status}"),
+            Err(error) => warn!("failed to restart auditd service {service}: {error:#}"),
         }
     }
 }
@@ -742,6 +753,7 @@ fn auditd_services_to_resume(outcome: &AuditdServiceStopOutcome) -> Vec<&'static
 pub fn stop_auditd_for_uninstall() -> Result<AuditdShutdownGuard> {
     let coordinator = AuditCoordinatorGuard::acquire_blocking()?;
     let outcome = request_auditd_services_stop();
+    let services_to_resume = outcome.active.clone();
     let lock_deadline = std::time::Instant::now() + INSTALL_SESSION_LOCK_TIMEOUT;
     loop {
         if let Some(auditd_lock) = AuditdLockGuard::acquire()? {
@@ -751,6 +763,7 @@ pub fn stop_auditd_for_uninstall() -> Result<AuditdShutdownGuard> {
             return Ok(AuditdShutdownGuard {
                 _auditd_lock: auditd_lock,
                 _coordinator: coordinator,
+                services_to_resume,
             });
         }
         ensure!(

@@ -195,7 +195,13 @@ pub fn unload() -> Result<()> {
     // 0. Switch cgroups so we don't get killed along with our parent shell
     utils::switch_cgroups();
 
-    // 1. stop (Android init stop command - stops all services)
+    // 1. Stop auditd explicitly. It is a disabled init service and is not
+    // covered reliably by Android's global stop/start commands.
+    info!("unload: stopping audit daemon...");
+    let auditd_shutdown = crate::auditd::stop_auditd_for_uninstall()
+        .context("stop audit daemon before unloading KernelSU")?;
+
+    // 2. stop (Android init stop command - stops all services)
     info!("unload: stopping Android services...");
     let unload_result = (|| -> Result<()> {
         set_android_services("stop")?;
@@ -215,16 +221,19 @@ pub fn unload() -> Result<()> {
 
     if let Err(error) = unload_result {
         recover_services();
+        auditd_shutdown.resume_after_failed_shutdown();
         return Err(error);
     }
 
-    // 5. start (Android init start command - restarts all services)
+    // 5. start (Android init start command - restarts all services). Auditd
+    // remains stopped because its disabled service is not part of global start.
     info!("unload: restarting Android services...");
     if let Err(error) = set_android_services("start") {
         warn!("unload: KernelSU was removed but Android services failed to restart: {error:#}");
     }
 
-    // 6. Exit
+    // 6. Exit without restarting auditd after the module has been removed.
+    drop(auditd_shutdown);
     info!("unload: done, exiting ksud");
     Ok(())
 }
