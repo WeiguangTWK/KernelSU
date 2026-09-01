@@ -157,6 +157,16 @@ struct PersistentQuarantineRecord {
     updated_at_unix_seconds: u64,
 }
 
+impl PersistentQuarantineRecord {
+    fn same_state(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.module_id == other.module_id
+            && self.uncertain_ownership == other.uncertain_ownership
+            && self.planned_paths == other.planned_paths
+            && self.completed_paths == other.completed_paths
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct PersistentContainmentResultRecord {
     schema_version: u32,
@@ -165,6 +175,16 @@ struct PersistentContainmentResultRecord {
     quarantined_paths: Vec<String>,
     failures: Vec<String>,
     updated_at_unix_seconds: u64,
+}
+
+impl PersistentContainmentResultRecord {
+    fn same_state(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.module_id == other.module_id
+            && self.uncertain_ownership == other.uncertain_ownership
+            && self.quarantined_paths == other.quarantined_paths
+            && self.failures == other.failures
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3034,7 +3054,7 @@ pub fn record_persistent_containment_result(
     let _lock = AuditLock::acquire(root, true)?;
     let key = load_key(root, false)?;
     let path = persistent_containment_result_path(root, module_id);
-    if path.exists() {
+    let existing = if path.exists() {
         let authenticated: AuthenticatedRecord<PersistentContainmentResultRecord> =
             read_json(&path)?;
         verify_record(&authenticated.record, &authenticated.hmac_sha256, &key)?;
@@ -3042,25 +3062,31 @@ pub fn record_persistent_containment_result(
             authenticated.record.module_id == module_id,
             "persistent containment result module id mismatch"
         );
-    }
+        Some(authenticated.record)
+    } else {
+        None
+    };
     let mut quarantined_paths = quarantined_paths.to_vec();
     quarantined_paths.sort();
     quarantined_paths.dedup();
     let mut failures = failures.to_vec();
     failures.sort();
     failures.dedup();
-    write_record(
-        &path,
-        PersistentContainmentResultRecord {
-            schema_version: SCHEMA_VERSION,
-            module_id: module_id.to_owned(),
-            uncertain_ownership,
-            quarantined_paths,
-            failures,
-            updated_at_unix_seconds: now(),
-        },
-        &key,
-    )
+    let next = PersistentContainmentResultRecord {
+        schema_version: SCHEMA_VERSION,
+        module_id: module_id.to_owned(),
+        uncertain_ownership,
+        quarantined_paths,
+        failures,
+        updated_at_unix_seconds: now(),
+    };
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.same_state(&next))
+    {
+        return Ok(());
+    }
+    write_record(&path, next, &key)
 }
 
 fn read_persistent_quarantine_summary(
@@ -3246,21 +3272,24 @@ fn quarantine_persistent_scripts_inner(
     let _lock = AuditLock::acquire(root, true)?;
     let key = load_key(root, false)?;
     let record_path = persistent_quarantine_record_path(root, record_id);
-    let mut record = if record_path.exists() {
+    let existing = if record_path.exists() {
         let authenticated: AuthenticatedRecord<PersistentQuarantineRecord> =
             read_json(&record_path)?;
         verify_record(&authenticated.record, &authenticated.hmac_sha256, &key)?;
-        authenticated.record
+        Some(authenticated.record)
     } else {
-        PersistentQuarantineRecord {
+        None
+    };
+    let mut record = existing
+        .clone()
+        .unwrap_or_else(|| PersistentQuarantineRecord {
             schema_version: SCHEMA_VERSION,
             module_id: record_id.to_owned(),
             uncertain_ownership,
             planned_paths: Vec::new(),
             completed_paths: Vec::new(),
             updated_at_unix_seconds: now(),
-        }
-    };
+        });
     ensure!(
         record.module_id == record_id,
         "containment module id mismatch"
@@ -3281,8 +3310,13 @@ fn quarantine_persistent_scripts_inner(
         }
     }
     record.planned_paths.sort();
-    record.updated_at_unix_seconds = now();
-    write_record(&record_path, record.clone(), &key)?;
+    if existing
+        .as_ref()
+        .is_none_or(|previous| !previous.same_state(&record))
+    {
+        record.updated_at_unix_seconds = now();
+        write_record(&record_path, record.clone(), &key)?;
+    }
 
     for path in record.planned_paths.clone() {
         if record.completed_paths.contains(&path) {
@@ -5613,6 +5647,67 @@ mod tests {
         value["record"]["failures"] = serde_json::json!([]);
         std::fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         assert!(verify_module(temp.path(), "contained.module", false).is_err());
+    }
+
+    #[test]
+    fn repeated_persistent_containment_is_byte_stable() {
+        let temp = TempDir::new().unwrap();
+        let module_id = "contained.module";
+        let script = "/data/adb/service.d/contained-module.sh".to_owned();
+        let failure = "startup entry changed while being isolated".to_owned();
+        record(temp.path(), module_id, "ab");
+        let key = load_key(temp.path(), false).unwrap();
+
+        let quarantine_path = persistent_quarantine_record_path(temp.path(), module_id);
+        write_record(
+            &quarantine_path,
+            PersistentQuarantineRecord {
+                schema_version: SCHEMA_VERSION,
+                module_id: module_id.to_owned(),
+                uncertain_ownership: true,
+                planned_paths: vec![script.clone()],
+                completed_paths: vec![script.clone()],
+                updated_at_unix_seconds: 1,
+            },
+            &key,
+        )
+        .unwrap();
+        let result_path = persistent_containment_result_path(temp.path(), module_id);
+        write_record(
+            &result_path,
+            PersistentContainmentResultRecord {
+                schema_version: SCHEMA_VERSION,
+                module_id: module_id.to_owned(),
+                uncertain_ownership: true,
+                quarantined_paths: vec![script.clone()],
+                failures: vec![failure.clone()],
+                updated_at_unix_seconds: 1,
+            },
+            &key,
+        )
+        .unwrap();
+        let quarantine_before = std::fs::read(&quarantine_path).unwrap();
+        let result_before = std::fs::read(&result_path).unwrap();
+
+        let outcome = quarantine_persistent_scripts(
+            temp.path(),
+            module_id,
+            std::slice::from_ref(&script),
+            true,
+        )
+        .unwrap();
+        assert_eq!(outcome.completed_paths, [script.clone()]);
+        record_persistent_containment_result(
+            temp.path(),
+            module_id,
+            true,
+            std::slice::from_ref(&script),
+            std::slice::from_ref(&failure),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(quarantine_path).unwrap(), quarantine_before);
+        assert_eq!(std::fs::read(result_path).unwrap(), result_before);
     }
 
     #[test]
