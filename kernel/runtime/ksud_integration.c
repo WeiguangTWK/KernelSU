@@ -475,6 +475,9 @@ static void ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *
 }
 
 static unsigned int volumedown_pressed_count = 0;
+static DEFINE_MUTEX(safe_mode_mutex);
+static bool safe_mode_checked;
+static bool safe_mode;
 
 static bool is_volumedown_enough(unsigned int count)
 {
@@ -500,28 +503,28 @@ int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *v
 
 bool ksu_is_safe_mode()
 {
-    static bool safe_mode = false;
-    if (safe_mode) {
-        // don't need to check again, userspace may call multiple times
-        return true;
-    }
-
     if (ksu_late_loaded) {
         return false;
     }
 
-    // stop hook first!
-    ksu_stop_input_hook_runtime();
+    mutex_lock(&safe_mode_mutex);
+    if (safe_mode_checked)
+        goto out;
+
+    /* Stop sampling before caching the immutable early-boot result. */
+    stop_input_hook_sync();
 
     pr_info("volumedown_pressed_count: %d\n", volumedown_pressed_count);
-    if (is_volumedown_enough(volumedown_pressed_count)) {
+    safe_mode = is_volumedown_enough(volumedown_pressed_count);
+    safe_mode_checked = true;
+    if (safe_mode) {
         // pressed over 3 times
         pr_info("KEY_VOLUMEDOWN pressed max times, safe mode detected!\n");
-        safe_mode = true;
-        return true;
     }
 
-    return false;
+out:
+    mutex_unlock(&safe_mode_mutex);
+    return safe_mode;
 }
 
 void ksu_execve_hook_ksud(const struct pt_regs *regs)
@@ -660,6 +663,8 @@ void __init ksu_ksud_init()
 
     INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
     atomic_set(&input_hook_stop_requested, 0);
+    safe_mode_checked = false;
+    safe_mode = false;
 
     ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
     ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
