@@ -2,7 +2,7 @@
 #include <linux/limits.h>
 #include <linux/rculist.h>
 #include <linux/mutex.h>
-#include <linux/task_work.h>
+#include <linux/workqueue.h>
 #include <linux/capability.h>
 #include <linux/compiler.h>
 #include <linux/fs.h>
@@ -32,6 +32,9 @@
 #define KSU_DEFAULT_SELINUX_DOMAIN "u:r:" KERNEL_SU_DOMAIN ":s0"
 
 static DEFINE_MUTEX(allowlist_mutex);
+static struct work_struct allowlist_persist_work;
+static bool allowlist_persist_dirty;
+static bool allowlist_exiting;
 
 // default profiles, these may be used frequently, so we cache it
 static struct root_profile default_root_profile;
@@ -411,8 +414,7 @@ bool ksu_get_allow_list(int *array, u16 length, u16 *out_length, u16 *out_total,
     return true;
 }
 
-// TODO: move to kernel thread or work queue
-static void do_persistent_allow_list(struct callback_head *_cb)
+static void do_persistent_allow_list(void)
 {
     u32 magic = FILE_MAGIC;
     u32 version = FILE_FORMAT_VERSION;
@@ -451,35 +453,33 @@ close_file:
     filp_close(fp, 0);
 out:
     revert_creds(saved);
-    kfree(_cb);
 }
 
-void ksu_persistent_allow_list()
+static void persistent_allow_list_work(struct work_struct *work)
 {
-    struct task_struct *tsk;
+    (void)work;
 
-    rcu_read_lock();
-    tsk = get_pid_task(find_vpid(1), PIDTYPE_PID);
-    if (!tsk) {
-        rcu_read_unlock();
-        pr_err("save_allow_list find init task err\n");
-        return;
-    }
-    rcu_read_unlock();
+    for (;;) {
+        mutex_lock(&allowlist_mutex);
+        if (!allowlist_persist_dirty) {
+            mutex_unlock(&allowlist_mutex);
+            return;
+        }
+        allowlist_persist_dirty = false;
+        mutex_unlock(&allowlist_mutex);
 
-    struct callback_head *cb = kzalloc(sizeof(struct callback_head), GFP_KERNEL);
-    if (!cb) {
-        pr_err("save_allow_list alloc cb err\b");
-        goto put_task;
+        do_persistent_allow_list();
     }
-    cb->func = do_persistent_allow_list;
-    if (task_work_add(tsk, cb, TWA_RESUME)) {
-        kfree(cb);
-        pr_warn("save_allow_list add task_work failed\n");
-    }
+}
 
-put_task:
-    put_task_struct(tsk);
+void ksu_persistent_allow_list(void)
+{
+    mutex_lock(&allowlist_mutex);
+    if (!allowlist_exiting) {
+        allowlist_persist_dirty = true;
+        schedule_work(&allowlist_persist_work);
+    }
+    mutex_unlock(&allowlist_mutex);
 }
 
 static void migrate_profile(u32 version, struct app_profile *profile)
@@ -613,6 +613,9 @@ void ksu_prune_allowlist(bool (*is_uid_valid)(uid_t, char *, void *), void *data
 
 void __init ksu_allowlist_init(void)
 {
+    INIT_WORK(&allowlist_persist_work, persistent_allow_list_work);
+    allowlist_persist_dirty = false;
+    allowlist_exiting = false;
     init_default_profiles();
 }
 
@@ -621,6 +624,13 @@ void __exit ksu_allowlist_exit(void)
     struct perm_data *np = NULL;
     struct hlist_node *tmp;
     int i;
+
+    mutex_lock(&allowlist_mutex);
+    allowlist_exiting = true;
+    mutex_unlock(&allowlist_mutex);
+
+    /* Persist the last accepted update before releasing its backing data. */
+    flush_work(&allowlist_persist_work);
 
     // free allowlist
     mutex_lock(&allowlist_mutex);

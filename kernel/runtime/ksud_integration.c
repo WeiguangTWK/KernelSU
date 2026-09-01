@@ -12,6 +12,7 @@
 #include <linux/version.h>
 #include <linux/input-event-codes.h>
 #include <linux/kprobes.h>
+#include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -51,8 +52,12 @@ static const char KERNEL_SU_RC[] =
 
 static void stop_init_rc_hook();
 static void stop_execve_hook();
+static void stop_input_hook_sync(void);
 
 static struct work_struct stop_input_hook_work;
+static DEFINE_MUTEX(input_hook_mutex);
+static atomic_t input_hook_stop_requested = ATOMIC_INIT(0);
+static bool input_hook_registered;
 
 #define MAX_ARG_STRINGS 0x7FFFFFFF
 struct user_arg_ptr {
@@ -609,9 +614,27 @@ static struct kprobe input_event_kp = {
     .pre_handler = input_handle_event_handler_pre,
 };
 
+static void stop_input_hook(void)
+{
+    mutex_lock(&input_hook_mutex);
+    if (input_hook_registered) {
+        unregister_kprobe(&input_event_kp);
+        input_hook_registered = false;
+    }
+    mutex_unlock(&input_hook_mutex);
+}
+
+static void stop_input_hook_sync(void)
+{
+    atomic_set(&input_hook_stop_requested, 1);
+    stop_input_hook();
+    cancel_work_sync(&stop_input_hook_work);
+}
+
 static void do_stop_input_hook(struct work_struct *work)
 {
-    unregister_kprobe(&input_event_kp);
+    (void)work;
+    stop_input_hook();
 }
 
 static void stop_init_rc_hook()
@@ -623,11 +646,9 @@ static void stop_init_rc_hook()
 
 void ksu_stop_input_hook_runtime(void)
 {
-    static bool input_hook_stopped = false;
-    if (input_hook_stopped) {
+    if (atomic_xchg(&input_hook_stop_requested, 1)) {
         return;
     }
-    input_hook_stopped = true;
     bool ret = schedule_work(&stop_input_hook_work);
     pr_info("unregister input kprobe: %d!\n", ret);
 }
@@ -637,13 +658,17 @@ void __init ksu_ksud_init()
 {
     int ret;
 
+    INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
+    atomic_set(&input_hook_stop_requested, 0);
+
     ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
     ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
 
+    mutex_lock(&input_hook_mutex);
     ret = register_kprobe(&input_event_kp);
+    input_hook_registered = ret == 0;
+    mutex_unlock(&input_hook_mutex);
     pr_info("ksud: input_event_kp: %d\n", ret);
-
-    INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
 }
 
 void __exit ksu_ksud_exit()
@@ -651,7 +676,8 @@ void __exit ksu_ksud_exit()
     // TODO:
     // this should be done before unregister vfs_read_kp
     // stop_init_rc_hook();
-    unregister_kprobe(&input_event_kp);
+    /* Block new stop requests, detach the hook, then drain queued work. */
+    stop_input_hook_sync();
 
     if (module_rc_buf) {
         free_module_rc();

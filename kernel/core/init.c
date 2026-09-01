@@ -187,7 +187,10 @@ int __init kernelsu_init(void)
 
 #ifdef MODULE
 #ifndef CONFIG_KSU_DEBUG
+#ifndef CONFIG_MODULE_UNLOAD
+    /* A deleted module kobject cannot be torn down safely by free_module(). */
     kobject_del(&THIS_MODULE->mkobj.kobj);
+#endif
 #endif
 #endif
     return 0;
