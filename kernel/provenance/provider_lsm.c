@@ -10,6 +10,7 @@
 #include <linux/wait.h>
 
 #include "hook/lsm_hook.h"
+#include "provenance/context.h"
 #include "provenance/eligibility.h"
 #include "provenance/image_verify.h"
 #include "provenance/provider_lsm.h"
@@ -49,72 +50,116 @@ static int ksu_provenance_bprm_check_security(struct linux_binprm *bprm)
     return 0;
 }
 
-static int ksu_provenance_task_alloc(struct task_struct *task, unsigned long clone_flags)
+static int ksu_provenance_task_alloc_callback(struct task_struct *task, unsigned long clone_flags)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
-    return 0;
+    int error;
+
+    if (!ksu_provenance_hook_enter())
+        return 0;
+    error = ksu_provenance_task_alloc(task);
+    ksu_provenance_hook_leave();
+    return error;
 }
 
-static void ksu_provenance_task_free(struct task_struct *task)
+static void ksu_provenance_task_free_callback(struct task_struct *task)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
+    if (!ksu_provenance_hook_enter())
+        return;
+    ksu_provenance_note_task_exit(task);
+    ksu_provenance_task_free(task);
+    ksu_provenance_hook_leave();
 }
 
-static int ksu_provenance_cred_alloc_blank(struct cred *cred, gfp_t gfp)
+static int ksu_provenance_cred_alloc_blank_callback(struct cred *cred, gfp_t gfp)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
-    return 0;
+    int error;
+
+    if (!ksu_provenance_hook_enter())
+        return 0;
+    error = ksu_provenance_cred_alloc_blank(cred, gfp);
+    ksu_provenance_hook_leave();
+    return error;
 }
 
-static int ksu_provenance_cred_prepare(struct cred *new, const struct cred *old, gfp_t gfp)
+static int ksu_provenance_cred_prepare_callback(struct cred *new, const struct cred *old, gfp_t gfp)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
-    return 0;
+    int error;
+
+    if (!ksu_provenance_hook_enter())
+        return 0;
+    error = ksu_provenance_cred_prepare(new, old, gfp);
+    ksu_provenance_hook_leave();
+    return error;
 }
 
-static void ksu_provenance_cred_transfer(struct cred *new, const struct cred *old)
+static void ksu_provenance_cred_transfer_callback(struct cred *new, const struct cred *old)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
+    if (!ksu_provenance_hook_enter())
+        return;
+    ksu_provenance_cred_transfer(new, old);
+    ksu_provenance_hook_leave();
 }
 
-static void ksu_provenance_cred_free(struct cred *cred)
+static void ksu_provenance_cred_free_callback(struct cred *cred)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
+    if (!ksu_provenance_hook_enter())
+        return;
+    ksu_provenance_cred_free(cred);
+    ksu_provenance_hook_leave();
 }
 
 static int ksu_provenance_ptrace_access_check(struct task_struct *child, unsigned int mode)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
-    return 0;
+    int error = 0;
+
+    if (!ksu_provenance_hook_enter())
+        return 0;
+    if (ksu_provenance_current_is_tagged() &&
+        ksu_provenance_task_is_supervisor(child))
+        error = -EPERM;
+    ksu_provenance_hook_leave();
+    return error;
 }
 
 static int ksu_provenance_ptrace_traceme(struct task_struct *parent)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
-    return 0;
+    int error = 0;
+
+    if (!ksu_provenance_hook_enter())
+        return 0;
+    if (ksu_provenance_current_is_tagged() &&
+        ksu_provenance_task_is_supervisor(parent))
+        error = -EPERM;
+    ksu_provenance_hook_leave();
+    return error;
 }
 
 static int ksu_provenance_task_kill(struct task_struct *task, struct kernel_siginfo *info,
                                     int sig, const struct cred *cred)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
-    return 0;
+    int error = 0;
+
+    if (!ksu_provenance_hook_enter())
+        return 0;
+    if (ksu_provenance_current_is_tagged() &&
+        ksu_provenance_task_is_supervisor(task))
+        error = -EPERM;
+    ksu_provenance_hook_leave();
+    return error;
 }
 
 static int ksu_provenance_file_receive(struct file *file)
 {
-    if (ksu_provenance_hook_enter())
-        ksu_provenance_hook_leave();
-    return 0;
+    int error = 0;
+
+    if (!ksu_provenance_hook_enter())
+        return 0;
+    if (ksu_provenance_is_control_file(file)) {
+        ksu_provenance_note_descriptor_receive(file);
+        error = -EPERM;
+    }
+    ksu_provenance_hook_leave();
+    return error;
 }
 
 static struct ksu_lsm_hook ksu_provenance_bprm_hook =
@@ -122,22 +167,22 @@ static struct ksu_lsm_hook ksu_provenance_bprm_hook =
                              "selinux_bprm_creds_for_exec", ksu_provenance_bprm_check_security);
 static struct ksu_lsm_hook ksu_provenance_task_alloc_hook =
     KSU_LSM_HOOK_APPEND_INIT(task_alloc, task_alloc, "selinux_task_alloc",
-                             ksu_provenance_task_alloc);
+                             ksu_provenance_task_alloc_callback);
 static struct ksu_lsm_hook ksu_provenance_task_free_hook =
     KSU_LSM_HOOK_APPEND_INIT(task_free, task_alloc, "selinux_task_alloc",
-                             ksu_provenance_task_free);
+                             ksu_provenance_task_free_callback);
 static struct ksu_lsm_hook ksu_provenance_cred_alloc_blank_hook =
     KSU_LSM_HOOK_APPEND_INIT(cred_alloc_blank, cred_prepare, "selinux_cred_prepare",
-                             ksu_provenance_cred_alloc_blank);
+                             ksu_provenance_cred_alloc_blank_callback);
 static struct ksu_lsm_hook ksu_provenance_cred_prepare_hook =
     KSU_LSM_HOOK_APPEND_INIT(cred_prepare, cred_prepare, "selinux_cred_prepare",
-                             ksu_provenance_cred_prepare);
+                             ksu_provenance_cred_prepare_callback);
 static struct ksu_lsm_hook ksu_provenance_cred_transfer_hook =
     KSU_LSM_HOOK_APPEND_INIT(cred_transfer, cred_transfer, "selinux_cred_transfer",
-                             ksu_provenance_cred_transfer);
+                             ksu_provenance_cred_transfer_callback);
 static struct ksu_lsm_hook ksu_provenance_cred_free_hook =
     KSU_LSM_HOOK_APPEND_INIT(cred_free, cred_prepare, "selinux_cred_prepare",
-                             ksu_provenance_cred_free);
+                             ksu_provenance_cred_free_callback);
 static struct ksu_lsm_hook ksu_provenance_ptrace_access_hook =
     KSU_LSM_HOOK_APPEND_INIT(ptrace_access_check, ptrace_access_check,
                              "selinux_ptrace_access_check", ksu_provenance_ptrace_access_check);
@@ -207,6 +252,7 @@ int ksu_provenance_provider_lsm_init(void)
     if (verifier_state != KSU_PROVENANCE_VERIFIER_READY) {
         ksu_provenance_core_hook_state = KSU_PROVENANCE_CORE_HOOK_FAILED;
         ksu_provenance_core_hook_error = KSU_PROVENANCE_CORE_HOOK_VERIFIER_NOT_READY;
+        ksu_provenance_begin_drain();
         return -EKEYREJECTED;
     }
 
@@ -216,15 +262,26 @@ int ksu_provenance_provider_lsm_init(void)
     if (error) {
         ksu_provenance_core_hook_state = KSU_PROVENANCE_CORE_HOOK_FAILED;
         ksu_provenance_core_hook_error = ksu_provenance_map_hook_error(error, true);
+        ksu_provenance_begin_drain();
         return error;
     }
     error = ksu_lsm_hook_group_install(&ksu_provenance_core_group);
     if (error) {
         ksu_provenance_core_hook_state = KSU_PROVENANCE_CORE_HOOK_FAILED;
         ksu_provenance_core_hook_error = ksu_provenance_map_hook_error(error, false);
+        ksu_provenance_begin_drain();
         return error;
     }
     smp_store_release(&ksu_provenance_hook_accepting, true);
+    error = ksu_provenance_context_selftest();
+    if (error) {
+        smp_store_release(&ksu_provenance_hook_accepting, false);
+        ksu_lsm_hook_group_uninstall(&ksu_provenance_core_group);
+        ksu_provenance_core_hook_state = KSU_PROVENANCE_CORE_HOOK_FAILED;
+        ksu_provenance_core_hook_error = KSU_PROVENANCE_CORE_HOOK_SELFTEST;
+        ksu_provenance_begin_drain();
+        return error;
+    }
     ksu_provenance_core_hook_state = KSU_PROVENANCE_CORE_HOOK_INSTALLED;
     ksu_provenance_core_hook_error = KSU_PROVENANCE_CORE_HOOK_OK;
     return 0;
@@ -234,6 +291,7 @@ void ksu_provenance_provider_lsm_exit(void)
 {
     int error;
 
+    ksu_provenance_begin_drain();
     smp_store_release(&ksu_provenance_hook_accepting, false);
     error = ksu_lsm_hook_group_uninstall(&ksu_provenance_core_group);
     wait_event(ksu_provenance_hook_wait,

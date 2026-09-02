@@ -21,6 +21,13 @@ pub fn on_post_data_fs() -> Result<()> {
 
     ksucalls::report_post_fs_data();
 
+    let provenance_failed = if let Err(e) = crate::provenance_supervisor::wait_for_ready() {
+        error!("Phase 3 provenance readiness failed: {e:#}");
+        true
+    } else {
+        false
+    };
+
     utils::umask(0);
 
     // Clear all temporary module configs early
@@ -54,12 +61,14 @@ pub fn on_post_data_fs() -> Result<()> {
         false
     };
 
-    let safe_mode = crate::utils::is_safe_mode() || audit_containment_failed;
+    let safe_mode = crate::utils::is_safe_mode() || provenance_failed || audit_containment_failed;
 
     if safe_mode {
         // we should still ensure module directory exists in safe mode
         // because we may need to operate the module dir in safe mode
-        warn!("safe mode or failed audit containment, skip common post-fs-data.d scripts");
+        warn!(
+            "safe mode or failed provenance/audit containment, skip common post-fs-data.d scripts"
+        );
     } else {
         // Then exec common post-fs-data scripts
         if let Err(e) = crate::module::exec_common_scripts("post-fs-data.d", true) {
@@ -74,7 +83,7 @@ pub fn on_post_data_fs() -> Result<()> {
     // if we are in safe mode, we should disable all modules
     if safe_mode {
         warn!(
-            "safe mode or failed audit containment, skip startup scripts and disable all modules!"
+            "safe mode or failed provenance/audit containment, skip startup scripts and disable all modules!"
         );
         if let Err(e) = crate::module::disable_all_modules() {
             warn!("disable all modules failed: {e}");

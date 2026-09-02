@@ -70,11 +70,28 @@ fn driver_fd() -> std::io::Result<RawFd> {
     }
 }
 
+pub fn provenance_probe_fd() -> std::io::Result<RawFd> {
+    driver_fd()
+}
+
 // ioctl wrapper using libc
 fn ksuctl<T>(request: u32, arg: *mut T) -> std::io::Result<i32> {
     use std::io;
 
     let fd = driver_fd()?;
+    unsafe {
+        let ret = libc::ioctl(fd as libc::c_int, request as i32, arg);
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(ret)
+        }
+    }
+}
+
+fn ksuctl_fd<T>(fd: RawFd, request: u32, arg: *mut T) -> std::io::Result<i32> {
+    use std::io;
+
     unsafe {
         let ret = libc::ioctl(fd as libc::c_int, request as i32, arg);
         if ret < 0 {
@@ -143,21 +160,26 @@ pub fn grant_root() -> std::io::Result<()> {
     Ok(())
 }
 
-fn report_event(event: u32) {
+fn report_event(event: u32) -> std::io::Result<()> {
     let mut cmd = ksu_uapi::ksu_report_event_cmd { event };
-    let _ = ksuctl(ksu_uapi::KSU_IOCTL_REPORT_EVENT, &raw mut cmd);
+    ksuctl(ksu_uapi::KSU_IOCTL_REPORT_EVENT, &raw mut cmd)?;
+    Ok(())
 }
 
 pub fn report_post_fs_data() {
-    report_event(ksu_uapi::EVENT_POST_FS_DATA);
+    let _ = report_event(ksu_uapi::EVENT_POST_FS_DATA);
+}
+
+pub fn report_post_fs_data_checked() -> std::io::Result<()> {
+    report_event(ksu_uapi::EVENT_POST_FS_DATA)
 }
 
 pub fn report_boot_complete() {
-    report_event(ksu_uapi::EVENT_BOOT_COMPLETED);
+    let _ = report_event(ksu_uapi::EVENT_BOOT_COMPLETED);
 }
 
 pub fn report_module_mounted() {
-    report_event(ksu_uapi::EVENT_MODULE_MOUNTED);
+    let _ = report_event(ksu_uapi::EVENT_MODULE_MOUNTED);
 }
 
 pub fn try_check_kernel_safemode() -> std::io::Result<bool> {
@@ -198,6 +220,235 @@ pub fn get_provenance_eligibility_info()
     Ok(info)
 }
 
+pub fn get_provenance_context_status() -> std::io::Result<ksu_uapi::ksu_provenance_context_status_v1>
+{
+    let mut status = unsafe { std::mem::zeroed::<ksu_uapi::ksu_provenance_context_status_v1>() };
+    ksuctl(
+        ksu_uapi::KSU_IOCTL_PROVENANCE_GET_CONTEXT_STATUS,
+        &raw mut status,
+    )?;
+    if usize::from(status.size) != std::mem::size_of_val(&status)
+        || status.version != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid audit provenance context status response",
+        ));
+    }
+    Ok(status)
+}
+
+pub fn get_current_provenance_context()
+-> std::io::Result<ksu_uapi::ksu_provenance_current_context_v1> {
+    let mut current = unsafe { std::mem::zeroed::<ksu_uapi::ksu_provenance_current_context_v1>() };
+    ksuctl(
+        ksu_uapi::KSU_IOCTL_PROVENANCE_GET_CURRENT_CONTEXT,
+        &raw mut current,
+    )?;
+    if usize::from(current.size) != std::mem::size_of_val(&current)
+        || current.version != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid current provenance context response",
+        ));
+    }
+    Ok(current)
+}
+
+fn provenance_control_on_fd(
+    fd: RawFd,
+    command: &mut ksu_uapi::ksu_provenance_control_cmd_v1,
+) -> std::io::Result<i32> {
+    ksuctl_fd(
+        fd,
+        ksu_uapi::KSU_IOCTL_PROVENANCE_CONTROL,
+        std::ptr::from_mut(command),
+    )
+}
+
+pub fn claim_provenance_supervisor(
+    eligibility_generation: u64,
+    boot_claim_nonce: [u8; 16],
+) -> std::io::Result<ksu_uapi::ksu_provenance_claim_result_v1> {
+    let mut request = ksu_uapi::ksu_provenance_claim_supervisor_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_claim_supervisor_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        flags: 0,
+        eligibility_generation,
+        boot_claim_nonce,
+        reserved: [0; 32],
+    };
+    let mut result = unsafe { std::mem::zeroed::<ksu_uapi::ksu_provenance_claim_result_v1>() };
+    result.size = std::mem::size_of_val(&result) as u16;
+    result.version = ksu_uapi::KSU_PROVENANCE_UAPI_VERSION;
+    result.endpoint_fd = -1;
+    let mut command = ksu_uapi::ksu_provenance_control_cmd_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_control_cmd_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        operation:
+            ksu_uapi::ksu_provenance_control_operation_KSU_PROVENANCE_CONTROL_CLAIM_SUPERVISOR
+                as u16,
+        flags: 0,
+        request_size: std::mem::size_of_val(&request) as u32,
+        response_size: std::mem::size_of_val(&result) as u32,
+        request: std::ptr::from_mut(&mut request) as u64,
+        response: std::ptr::from_mut(&mut result) as u64,
+        reserved: [0; 4],
+    };
+    let fd = driver_fd()?;
+    provenance_control_on_fd(fd, &mut command)?;
+    if usize::from(result.size) != std::mem::size_of_val(&result)
+        || result.version != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
+        || result.result != ksu_uapi::ksu_provenance_claim_result_KSU_PROVENANCE_CLAIM_RESULT_OK
+        || result.endpoint_fd < 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid successful provenance supervisor claim",
+        ));
+    }
+    Ok(result)
+}
+
+pub fn create_provenance_launch(
+    supervisor_fd: RawFd,
+    descriptor: ksu_uapi::ksu_provenance_context_descriptor_v1,
+    timeout_ms: u32,
+) -> std::io::Result<ksu_uapi::ksu_provenance_create_launch_result_v1> {
+    let mut request = ksu_uapi::ksu_provenance_create_launch_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_create_launch_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        flags: 0,
+        descriptor,
+        timeout_ms,
+        reserved0: 0,
+        reserved: [0; 16],
+    };
+    let mut result =
+        unsafe { std::mem::zeroed::<ksu_uapi::ksu_provenance_create_launch_result_v1>() };
+    let mut command = ksu_uapi::ksu_provenance_control_cmd_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_control_cmd_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        operation: ksu_uapi::ksu_provenance_control_operation_KSU_PROVENANCE_CONTROL_CREATE_LAUNCH
+            as u16,
+        flags: 0,
+        request_size: std::mem::size_of_val(&request) as u32,
+        response_size: std::mem::size_of_val(&result) as u32,
+        request: std::ptr::from_mut(&mut request) as u64,
+        response: std::ptr::from_mut(&mut result) as u64,
+        reserved: [0; 4],
+    };
+    provenance_control_on_fd(supervisor_fd, &mut command)?;
+    if usize::from(result.size) != std::mem::size_of_val(&result)
+        || result.version != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
+        || result.endpoint_fd < 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid provenance launch response",
+        ));
+    }
+    Ok(result)
+}
+
+pub fn activate_provenance_launch(
+    launch_fd: RawFd,
+    supervisor_generation: u64,
+    context_cookie: u64,
+) -> std::io::Result<ksu_uapi::ksu_provenance_activate_result_v1> {
+    let mut request = ksu_uapi::ksu_provenance_activate_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_activate_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        flags: 0,
+        supervisor_generation,
+        context_cookie,
+        reserved: [0; 8],
+    };
+    let mut result = unsafe { std::mem::zeroed::<ksu_uapi::ksu_provenance_activate_result_v1>() };
+    let mut command = ksu_uapi::ksu_provenance_control_cmd_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_control_cmd_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        operation: ksu_uapi::ksu_provenance_control_operation_KSU_PROVENANCE_CONTROL_ACTIVATE
+            as u16,
+        flags: 0,
+        request_size: std::mem::size_of_val(&request) as u32,
+        response_size: std::mem::size_of_val(&result) as u32,
+        request: std::ptr::from_mut(&mut request) as u64,
+        response: std::ptr::from_mut(&mut result) as u64,
+        reserved: [0; 4],
+    };
+    provenance_control_on_fd(launch_fd, &mut command)?;
+    if usize::from(result.size) != std::mem::size_of_val(&result)
+        || result.version != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
+        || result.context_cookie != context_cookie
+        || result.supervisor_generation != supervisor_generation
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid provenance activation response",
+        ));
+    }
+    Ok(result)
+}
+
+pub fn close_provenance_context(
+    supervisor_fd: RawFd,
+    supervisor_generation: u64,
+    context_cookie: u64,
+) -> std::io::Result<()> {
+    let mut request = ksu_uapi::ksu_provenance_close_context_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_close_context_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        flags: 0,
+        supervisor_generation,
+        context_cookie,
+        reserved: [0; 8],
+    };
+    let mut command = ksu_uapi::ksu_provenance_control_cmd_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_control_cmd_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        operation: ksu_uapi::ksu_provenance_control_operation_KSU_PROVENANCE_CONTROL_CLOSE_CONTEXT
+            as u16,
+        flags: 0,
+        request_size: std::mem::size_of_val(&request) as u32,
+        response_size: 0,
+        request: std::ptr::from_mut(&mut request) as u64,
+        response: 0,
+        reserved: [0; 4],
+    };
+    provenance_control_on_fd(supervisor_fd, &mut command)?;
+    Ok(())
+}
+
+pub fn mark_provenance_supervisor_ready(
+    supervisor_fd: RawFd,
+    supervisor_generation: u64,
+) -> std::io::Result<()> {
+    let mut request = ksu_uapi::ksu_provenance_supervisor_ready_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_supervisor_ready_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        flags: ksu_uapi::KSU_PROVENANCE_READY_IO_URING_TESTED,
+        supervisor_generation,
+        reserved: [0; 16],
+    };
+    let mut command = ksu_uapi::ksu_provenance_control_cmd_v1 {
+        size: std::mem::size_of::<ksu_uapi::ksu_provenance_control_cmd_v1>() as u16,
+        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
+        operation:
+            ksu_uapi::ksu_provenance_control_operation_KSU_PROVENANCE_CONTROL_SUPERVISOR_READY
+                as u16,
+        flags: 0,
+        request_size: std::mem::size_of_val(&request) as u32,
+        response_size: 0,
+        request: std::ptr::from_mut(&mut request) as u64,
+        response: 0,
+        reserved: [0; 4],
+    };
+    provenance_control_on_fd(supervisor_fd, &mut command)?;
+    Ok(())
+}
+
 pub fn expect_provenance_claim_not_ready(
     eligibility_generation: u64,
 ) -> std::io::Result<ksu_uapi::ksu_provenance_claim_result_v1> {
@@ -209,15 +460,10 @@ pub fn expect_provenance_claim_not_ready(
         boot_claim_nonce: [0; 16],
         reserved: [0; 32],
     };
-    let mut result = ksu_uapi::ksu_provenance_claim_result_v1 {
-        size: std::mem::size_of::<ksu_uapi::ksu_provenance_claim_result_v1>() as u16,
-        version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
-        flags: 0,
-        result: 0,
-        eligibility_state: 0,
-        eligibility_generation: 0,
-        reserved: [0; 8],
-    };
+    let mut result = unsafe { std::mem::zeroed::<ksu_uapi::ksu_provenance_claim_result_v1>() };
+    result.size = std::mem::size_of_val(&result) as u16;
+    result.version = ksu_uapi::KSU_PROVENANCE_UAPI_VERSION;
+    result.endpoint_fd = -1;
     let mut command = ksu_uapi::ksu_provenance_control_cmd_v1 {
         size: std::mem::size_of::<ksu_uapi::ksu_provenance_control_cmd_v1>() as u16,
         version: ksu_uapi::KSU_PROVENANCE_UAPI_VERSION,
@@ -233,23 +479,22 @@ pub fn expect_provenance_claim_not_ready(
     };
 
     match ksuctl(ksu_uapi::KSU_IOCTL_PROVENANCE_CONTROL, &raw mut command) {
-        Err(error) if error.raw_os_error() == Some(libc::EAGAIN) => {}
+        Err(error) if error.raw_os_error() == Some(libc::EKEYREJECTED) => {}
         Err(error) => return Err(error),
         Ok(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Phase 2 supervisor claim was unexpectedly accepted",
+                "zero-nonce supervisor claim was unexpectedly accepted",
             ));
         }
     }
     if usize::from(result.size) != std::mem::size_of_val(&result)
         || result.version != ksu_uapi::KSU_PROVENANCE_UAPI_VERSION
-        || result.result
-            != ksu_uapi::ksu_provenance_claim_result_KSU_PROVENANCE_CLAIM_CORE_PROVIDER_NOT_READY
+        || result.result != ksu_uapi::ksu_provenance_claim_result_KSU_PROVENANCE_CLAIM_WRONG_NONCE
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "invalid Phase 2 supervisor claim rejection",
+            "invalid zero-nonce supervisor claim rejection",
         ));
     }
     Ok(result)

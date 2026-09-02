@@ -16,6 +16,7 @@ void ksu_provenance_consider_exec(struct linux_binprm *bprm);
 void ksu_provenance_note_post_fs_data(struct task_struct *task);
 void ksu_provenance_get_eligibility_info(struct ksu_provenance_eligibility_info_v1 *info);
 int ksu_provenance_handle_control(struct ksu_provenance_control_cmd_v1 *command);
+bool ksu_provenance_get_boot_claim_nonce_hex(char output[33]);
 #else
 static inline void ksu_provenance_note_post_fs_data(struct task_struct *task)
 {
@@ -33,6 +34,11 @@ static inline void ksu_provenance_get_eligibility_info(struct ksu_provenance_eli
 static inline int ksu_provenance_handle_control(struct ksu_provenance_control_cmd_v1 *command)
 {
     return -EOPNOTSUPP;
+}
+
+static inline bool ksu_provenance_get_boot_claim_nonce_hex(char output[33])
+{
+    return false;
 }
 #endif
 

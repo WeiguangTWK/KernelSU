@@ -29,9 +29,10 @@
 #include "selinux/selinux.h"
 #include "hook/syscall_hook.h"
 #include "hook/syscall_event_bridge.h"
+#include "provenance/eligibility.h"
 
 // clang-format off
-static const char KERNEL_SU_RC[] =
+static const char KERNEL_SU_RC_BASE[] =
     "\n"
     "on post-fs-data\n"
     "    start logd\n"
@@ -48,7 +49,36 @@ static const char KERNEL_SU_RC[] =
     "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " boot-completed\n"
     "\n"
     "\n";
+
+static const char KERNEL_SU_RC_PROVENANCE[] =
+    "\n"
+    "service ksu_provenance " KSUD_PATH " provenance-supervisor --boot-claim-nonce %s\n"
+    "    user root\n"
+    "    group root\n"
+    "    seclabel u:r:" KERNEL_SU_DOMAIN ":s0\n"
+    "    disabled\n"
+    "    oneshot\n"
+    "\n"
+    "on post-fs-data\n"
+    "    start logd\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " provenance-stage\n"
+    "    start ksu_provenance\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " post-fs-data\n"
+    "\n"
+    "on nonencrypted\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " services\n"
+    "\n"
+    "on property:vold.decrypt=trigger_restart_framework\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " services\n"
+    "\n"
+    "on property:sys.boot_completed=1\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " boot-completed\n"
+    "\n"
+    "\n";
 // clang-format on
+
+#define KSU_RC_MAX_SIZE 2048
+static char KERNEL_SU_RC[KSU_RC_MAX_SIZE];
 
 static void stop_init_rc_hook();
 static void stop_execve_hook();
@@ -188,7 +218,7 @@ static ssize_t (*orig_read)(struct file *, char __user *, size_t, loff_t *);
 static ssize_t (*orig_read_iter)(struct kiocb *, struct iov_iter *);
 static struct file_operations fops_proxy;
 static ssize_t ksu_rc_pos = 0;
-const size_t ksu_rc_len = sizeof(KERNEL_SU_RC) - 1;
+static size_t ksu_rc_len;
 
 // Prefer /metadata/watchdog/ when present, else /metadata.
 #define MODULE_RC_PATH_WATCHDOG "/metadata/watchdog/ksu/modules.rc"
@@ -659,7 +689,22 @@ void ksu_stop_input_hook_runtime(void)
 // ksud: module support
 void __init ksu_ksud_init()
 {
+    char nonce[33];
     int ret;
+
+    if (ksu_provenance_get_boot_claim_nonce_hex(nonce)) {
+        ret = snprintf(KERNEL_SU_RC, sizeof(KERNEL_SU_RC),
+                       KERNEL_SU_RC_PROVENANCE, nonce);
+        if (ret < 0 || (size_t)ret >= sizeof(KERNEL_SU_RC)) {
+            pr_err("ksud: provenance rc exceeds fixed buffer\n");
+            strscpy(KERNEL_SU_RC, KERNEL_SU_RC_BASE,
+                    sizeof(KERNEL_SU_RC));
+        }
+    } else {
+        strscpy(KERNEL_SU_RC, KERNEL_SU_RC_BASE,
+                sizeof(KERNEL_SU_RC));
+    }
+    ksu_rc_len = strlen(KERNEL_SU_RC);
 
     INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
     atomic_set(&input_hook_stop_requested, 0);

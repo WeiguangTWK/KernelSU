@@ -52,7 +52,11 @@ mod module_config;
 mod module_response;
 #[cfg(target_os = "android")]
 mod profile;
+#[cfg(target_os = "android")]
+mod provenance_io_uring;
 mod provenance_manifest;
+#[cfg(target_os = "android")]
+mod provenance_supervisor;
 #[cfg(target_os = "android")]
 mod resetprop;
 #[cfg(target_os = "android")]

@@ -43,7 +43,14 @@ fn find_su_domain_pids() -> Vec<i32> {
     pids
 }
 
-/// Find PIDs of processes holding ksu_driver or ksu_fdwrapper file descriptors.
+fn is_ksu_control_fd(target: &str) -> bool {
+    target.contains("[ksu_driver]")
+        || target.contains("[ksu_fdwrapper]")
+        || target.contains("[ksu_provenance_supervisor]")
+        || target.contains("[ksu_provenance_launch]")
+}
+
+/// Find PIDs of processes holding KernelSU control file descriptors.
 /// Returns a list of PIDs excluding our own.
 fn find_ksu_fd_holders() -> Vec<i32> {
     let my_pid = std::process::id() as i32;
@@ -71,7 +78,7 @@ fn find_ksu_fd_holders() -> Vec<i32> {
             let link_path = fd_entry.path();
             if let Ok(target) = fs::read_link(&link_path) {
                 let target_str = target.to_string_lossy();
-                if target_str.contains("[ksu_driver]") || target_str.contains("[ksu_fdwrapper]") {
+                if is_ksu_control_fd(&target_str) {
                     pids.push(pid);
                     break;
                 }
@@ -121,7 +128,7 @@ fn terminate_ksu_clients() -> Result<()> {
     }
 }
 
-/// Close all ksu_driver and ksu_fdwrapper fds held by the current process.
+/// Close all KernelSU control fds held by the current process.
 fn close_ksu_fds() {
     let Ok(entries) = fs::read_dir("/proc/self/fd") else {
         return;
@@ -133,7 +140,7 @@ fn close_ksu_fds() {
         };
         if let Ok(target) = fs::read_link(entry.path()) {
             let target_str = target.to_string_lossy();
-            if target_str.contains("[ksu_driver]") || target_str.contains("[ksu_fdwrapper]") {
+            if is_ksu_control_fd(&target_str) {
                 info!("unload: closing fd {fd} -> {target_str}");
                 unsafe {
                     libc::close(fd);
@@ -152,17 +159,17 @@ fn delete_kernelsu_module() -> Result<()> {
             Ok(()) => return Ok(()),
             Err(error) if error == rustix::io::Errno::AGAIN && Instant::now() < deadline => {
                 let pids = remaining_ksu_client_pids();
-                if !pids.is_empty() {
+                if pids.is_empty() {
+                    warn!(
+                        "unload: module is still referenced with no visible client; retrying attempt {}",
+                        attempt + 1
+                    );
+                } else {
                     warn!(
                         "unload: module is still referenced; terminating clients before attempt {}: {pids:?}",
                         attempt + 1
                     );
                     kill_pids(&pids, libc::SIGKILL);
-                } else {
-                    warn!(
-                        "unload: module is still referenced with no visible client; retrying attempt {}",
-                        attempt + 1
-                    );
                 }
                 attempt += 1;
                 thread::sleep(UNLOAD_POLL_INTERVAL);

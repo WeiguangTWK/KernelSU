@@ -4,6 +4,8 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 
+struct file;
+
 // IOCTL handler types
 typedef int (*ksu_ioctl_handler_t)(void __user *arg);
 typedef bool (*ksu_perm_check_t)(void);
@@ -18,6 +20,7 @@ struct ksu_ioctl_cmd_map {
 
 // Install KSU fd to current process
 int ksu_install_fd(void);
+bool ksu_is_driver_file(const struct file *file);
 
 void ksu_supercalls_init(void);
 void ksu_supercalls_exit(void);

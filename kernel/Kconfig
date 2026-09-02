@@ -25,8 +25,9 @@ config KSU_PROVENANCE
 	default n
 	help
 	  Build the versioned audit provenance UAPI, canonical hashing, and
-	  signed ksud image verifier. The phase 1 implementation exposes only
-	  read-only diagnostics and no operational provenance capability.
+	  signed ksud image verifier. Phase 3 additionally enables the
+	  authenticated supervisor and bounded task/credential context provider;
+	  P1 test mode is published only after its lifecycle self-tests pass.
 
 config KSU_DISABLE_MANAGER
 	bool "Disable KernelSU manager integration"

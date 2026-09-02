@@ -12,7 +12,7 @@ use crate::module::regenerate_preinit_rc;
 use crate::{
     apk_sign, assets, auditd, debug, defs, init_event, ksu_uapi, ksucalls, module,
     module_audit_action::{self, AuditAction},
-    module_config, sulog, utils,
+    module_config, provenance_supervisor, sulog, utils,
 };
 
 /// KernelSU userspace cli
@@ -33,6 +33,30 @@ enum Commands {
 
     /// Trigger `post-fs-data` event
     PostFsData,
+
+    /// Report the authenticated post-fs-data provenance stage. Init only.
+    #[command(hide = true)]
+    ProvenanceStage,
+
+    /// Run the authenticated boot provenance supervisor. Init only.
+    #[command(hide = true)]
+    ProvenanceSupervisor {
+        #[arg(long)]
+        boot_claim_nonce: String,
+    },
+
+    /// Run one Phase 3 lifecycle self-test payload. Supervisor only.
+    #[command(hide = true)]
+    ProvenancePayload {
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        cookie: u64,
+        #[arg(long, default_value_t = 0)]
+        depth: u8,
+        #[arg(long)]
+        supervisor_pid: i32,
+    },
 
     /// Trigger `service` event
     Services,
@@ -279,7 +303,10 @@ enum Debug {
     /// Get read-only Phase 2 hook and signed-exec eligibility diagnostics
     ProvenanceEligibility,
 
-    /// Verify that a Phase 2 supervisor claim is rejected as not ready
+    /// Get read-only Phase 3 supervisor and context-map diagnostics
+    ProvenanceContext,
+
+    /// Verify that a zero-nonce supervisor claim is rejected
     ProvenanceClaimTest {
         /// Eligibility generation to place in the rejected request
         #[arg(long)]
@@ -952,6 +979,16 @@ pub fn run() -> Result<()> {
 
     let result = match cli.command {
         Commands::PostFsData => init_event::on_post_data_fs(),
+        Commands::ProvenanceStage => provenance_supervisor::report_eligible_stage(),
+        Commands::ProvenanceSupervisor { boot_claim_nonce } => {
+            provenance_supervisor::run_supervisor(&boot_claim_nonce)
+        }
+        Commands::ProvenancePayload {
+            generation,
+            cookie,
+            depth,
+            supervisor_pid,
+        } => provenance_supervisor::run_payload(generation, cookie, depth, supervisor_pid),
         Commands::BootCompleted => {
             init_event::on_boot_completed();
             Ok(())
@@ -1654,6 +1691,33 @@ pub fn run() -> Result<()> {
                     base16ct::lower::encode_string(&info.signing_key_id)
                 );
                 println!("uapi: {}..={}", info.uapi_min, info.uapi_max);
+                Ok(())
+            }
+            Debug::ProvenanceContext => {
+                let status = ksucalls::get_provenance_context_status()?;
+                println!("supervisor_state: {}", status.supervisor_state);
+                println!("last_gap_reason: {}", status.last_gap_reason);
+                println!("supervisor_generation: {}", status.supervisor_generation);
+                println!("active_contexts: {}", status.active_contexts);
+                println!("task_bindings: {}", status.task_bindings);
+                println!("credential_bindings: {}", status.credential_bindings);
+                println!("pending_launches: {}", status.pending_launches);
+                println!(
+                    "limits: contexts={} tasks={} credentials={} launches={}",
+                    status.max_contexts,
+                    status.max_task_bindings,
+                    status.max_credential_bindings,
+                    status.max_pending_launches
+                );
+                println!(
+                    "reconciliation_failures: {}",
+                    status.reconciliation_failures
+                );
+                println!("allocation_failures: {}", status.allocation_failures);
+                println!(
+                    "boot_epoch: {}",
+                    base16ct::lower::encode_string(&status.boot_epoch)
+                );
                 Ok(())
             }
             Debug::ProvenanceClaimTest { generation } => {

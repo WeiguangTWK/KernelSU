@@ -37,6 +37,12 @@ static const __u64 KSU_PROVENANCE_CAP_SIGNED_EXEC_ELIGIBILITY_V1 = (1ULL << 5);
 static const __u64 KSU_PROVENANCE_CAP_SUPERVISOR_CLAIM = (1ULL << 8);
 static const __u64 KSU_PROVENANCE_CAP_TASK_CONTEXT = (1ULL << 9);
 static const __u64 KSU_PROVENANCE_CAP_CREDENTIAL_CONTEXT = (1ULL << 10);
+static const __u64 KSU_PROVENANCE_CAP_LAUNCH_ENDPOINT = (1ULL << 11);
+static const __u64 KSU_PROVENANCE_CAP_CONTROL_ISOLATION = (1ULL << 12);
+static const __u64 KSU_PROVENANCE_CAP_SCHED_RECONCILIATION = (1ULL << 13);
+static const __u64 KSU_PROVENANCE_CAP_IO_URING_CREDENTIAL = (1ULL << 14);
+
+static const __u32 KSU_PROVENANCE_READY_IO_URING_TESTED = (1U << 0);
 static const __u64 KSU_PROVENANCE_CAP_INTENT_FILE = (1ULL << 16);
 static const __u64 KSU_PROVENANCE_CAP_INTENT_INODE = (1ULL << 17);
 static const __u64 KSU_PROVENANCE_CAP_INTENT_MOUNT = (1ULL << 18);
@@ -160,6 +166,30 @@ enum ksu_provenance_eligibility_error {
 enum ksu_provenance_claim_result {
     KSU_PROVENANCE_CLAIM_RESULT_OK = 0,
     KSU_PROVENANCE_CLAIM_CORE_PROVIDER_NOT_READY = 1,
+    KSU_PROVENANCE_CLAIM_NO_ELIGIBLE_TASK = 2,
+    KSU_PROVENANCE_CLAIM_WRONG_GENERATION = 3,
+    KSU_PROVENANCE_CLAIM_WRONG_NONCE = 4,
+    KSU_PROVENANCE_CLAIM_NONCE_CONSUMED = 5,
+    KSU_PROVENANCE_CLAIM_ALREADY_CLAIMED = 6,
+    KSU_PROVENANCE_CLAIM_LATE_LOAD = 7,
+    KSU_PROVENANCE_CLAIM_INTERNAL = 8,
+};
+
+enum ksu_provenance_supervisor_state {
+    KSU_PROVENANCE_SUPERVISOR_NONE = 0,
+    KSU_PROVENANCE_SUPERVISOR_CLAIMED = 1,
+    KSU_PROVENANCE_SUPERVISOR_READY = 2,
+    KSU_PROVENANCE_SUPERVISOR_LOST = 3,
+    KSU_PROVENANCE_SUPERVISOR_DRAINING = 4,
+    KSU_PROVENANCE_SUPERVISOR_FAILED = 5,
+};
+
+enum ksu_provenance_context_state {
+    KSU_PROVENANCE_CONTEXT_PENDING = 0,
+    KSU_PROVENANCE_CONTEXT_ACTIVE = 1,
+    KSU_PROVENANCE_CONTEXT_CLOSED = 2,
+    KSU_PROVENANCE_CONTEXT_INCOMPLETE = 3,
+    KSU_PROVENANCE_CONTEXT_DRAINED = 4,
 };
 
 enum ksu_provenance_gap_reason {
@@ -230,7 +260,7 @@ enum ksu_provenance_stage {
     KSU_PROVENANCE_STAGE_INIT_EXEC = 7,
 };
 
-/* Semantic operations carried by the future versioned control envelope. */
+/* Semantic operations carried by the versioned control envelope. */
 enum ksu_provenance_control_operation {
     KSU_PROVENANCE_CONTROL_CLAIM_SUPERVISOR = 1,
     KSU_PROVENANCE_CONTROL_CREATE_LAUNCH = 2,
@@ -245,6 +275,8 @@ enum ksu_provenance_control_operation {
     KSU_PROVENANCE_CONTROL_BEGIN_RESPONSE_GUARD = 11,
     KSU_PROVENANCE_CONTROL_QUERY_RESPONSE_GUARD = 12,
     KSU_PROVENANCE_CONTROL_END_RESPONSE_GUARD = 13,
+    KSU_PROVENANCE_CONTROL_QUERY_CONTEXT = 14,
+    KSU_PROVENANCE_CONTROL_SUPERVISOR_READY = 15,
 };
 
 /* Exactly 128 canonical bytes before the variable payload. */
@@ -301,7 +333,7 @@ struct ksu_provenance_barrier_result_v1 {
     __u8 reserved[24];
 };
 
-/* Exactly 64 bytes. Phase 2 handles only a fixed-reject supervisor claim. */
+/* Exactly 64 bytes. */
 struct ksu_provenance_control_cmd_v1 {
     __u16 size;
     __u16 version;
@@ -314,7 +346,7 @@ struct ksu_provenance_control_cmd_v1 {
     __aligned_u64 reserved[4];
 };
 
-/* Exactly 64 bytes. Phase 2 defines the shape but does not issue a nonce. */
+/* Exactly 64 bytes. Phase 3 consumes the matching boot nonce once. */
 struct ksu_provenance_claim_supervisor_v1 {
     __u16 size;
     __u16 version;
@@ -324,7 +356,7 @@ struct ksu_provenance_claim_supervisor_v1 {
     __u8 reserved[32];
 };
 
-/* Exactly 32 bytes. */
+/* Exactly 32 bytes. endpoint_fd is an owned CLOEXEC supervisor endpoint. */
 struct ksu_provenance_claim_result_v1 {
     __u16 size;
     __u16 version;
@@ -332,13 +364,111 @@ struct ksu_provenance_claim_result_v1 {
     __u32 result;
     __u32 eligibility_state;
     __aligned_u64 eligibility_generation;
+    __s32 endpoint_fd;
+    __u32 supervisor_state;
+};
+
+/* Exactly 256 bytes. */
+struct ksu_provenance_create_launch_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    struct ksu_provenance_context_descriptor_v1 descriptor;
+    __u32 timeout_ms;
+    __u32 reserved0;
+    __u8 reserved[16];
+};
+
+/* Exactly 32 bytes. */
+struct ksu_provenance_create_launch_result_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __s32 endpoint_fd;
+    __u32 context_state;
+    __aligned_u64 supervisor_generation;
+    __aligned_u64 context_cookie;
+};
+
+/* Exactly 32 bytes. Sent to the one-use launch endpoint. */
+struct ksu_provenance_activate_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __aligned_u64 supervisor_generation;
+    __aligned_u64 context_cookie;
     __u8 reserved[8];
+};
+
+/* Exactly 32 bytes. */
+struct ksu_provenance_activate_result_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __u32 context_state;
+    __u32 gap_reason;
+    __aligned_u64 supervisor_generation;
+    __aligned_u64 context_cookie;
+};
+
+/* Exactly 32 bytes. */
+struct ksu_provenance_close_context_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __aligned_u64 supervisor_generation;
+    __aligned_u64 context_cookie;
+    __u8 reserved[8];
+};
+
+/* Exactly 32 bytes. */
+struct ksu_provenance_supervisor_ready_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __aligned_u64 supervisor_generation;
+    __u8 reserved[16];
+};
+
+/* Exactly 64 bytes. Read-only identity of the calling task/credential. */
+struct ksu_provenance_current_context_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __u32 context_state;
+    __u32 gap_reason;
+    __aligned_u64 supervisor_generation;
+    __aligned_u64 context_cookie;
+    __u8 boot_epoch[16];
+    __u8 reserved[16];
+};
+
+/* Exactly 128 bytes. Read-only Phase 3 state and bounded-map diagnostics. */
+struct ksu_provenance_context_status_v1 {
+    __u16 size;
+    __u16 version;
+    __u32 flags;
+    __u32 supervisor_state;
+    __u32 last_gap_reason;
+    __aligned_u64 supervisor_generation;
+    __u32 active_contexts;
+    __u32 task_bindings;
+    __u32 credential_bindings;
+    __u32 pending_launches;
+    __u32 max_contexts;
+    __u32 max_task_bindings;
+    __u32 max_credential_bindings;
+    __u32 max_pending_launches;
+    __aligned_u64 reconciliation_failures;
+    __aligned_u64 allocation_failures;
+    __u8 boot_epoch[16];
+    __u8 reserved[40];
 };
 
 /*
  * Exactly 192 bytes of read-only Phase 2 hook and exec diagnostics.
- * eligibility_generation advances only when an authenticated candidate is
- * recorded; rejected exec attempts never replace a pending or eligible one.
+ * eligibility_generation advances for each authenticated candidate record.
+ * A caller sees its own record when several init children race at the stage.
  */
 struct ksu_provenance_eligibility_info_v1 {
     __u16 size;
@@ -362,7 +492,7 @@ struct ksu_provenance_eligibility_info_v1 {
     __u8 reserved[32];
 };
 
-/* Exactly 192 bytes. operational_capabilities remains zero through phase 2. */
+/* Exactly 192 bytes. */
 struct ksu_provenance_info_v1 {
     __u16 size;
     __u16 version;
@@ -411,5 +541,9 @@ static const __u32 KSU_IOCTL_PROVENANCE_CONTROL =
     _IOWR('K', 33, struct ksu_provenance_control_cmd_v1);
 static const __u32 KSU_IOCTL_PROVENANCE_GET_ELIGIBILITY =
     _IOR('K', 34, struct ksu_provenance_eligibility_info_v1);
+static const __u32 KSU_IOCTL_PROVENANCE_GET_CONTEXT_STATUS =
+    _IOR('K', 35, struct ksu_provenance_context_status_v1);
+static const __u32 KSU_IOCTL_PROVENANCE_GET_CURRENT_CONTEXT =
+    _IOR('K', 36, struct ksu_provenance_current_context_v1);
 
 #endif /* __KSU_UAPI_PROVENANCE_H */

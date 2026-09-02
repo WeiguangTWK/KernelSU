@@ -3,6 +3,7 @@
 #include <linux/string.h>
 
 #include "provenance/canonical.h"
+#include "provenance/context.h"
 #include "provenance/eligibility.h"
 #include "provenance/image_verify.h"
 #include "provenance/provider_lsm.h"
@@ -98,6 +99,14 @@ int ksu_provenance_init(void)
     BUILD_BUG_ON(sizeof(struct ksu_provenance_control_cmd_v1) != 64);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_claim_supervisor_v1) != 64);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_claim_result_v1) != 32);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_create_launch_v1) != 256);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_create_launch_result_v1) != 32);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_activate_v1) != 32);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_activate_result_v1) != 32);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_close_context_v1) != 32);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_supervisor_ready_v1) != 32);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_current_context_v1) != 64);
+    BUILD_BUG_ON(sizeof(struct ksu_provenance_context_status_v1) != 128);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_eligibility_info_v1) != 192);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_info_v1) != 192);
     BUILD_BUG_ON(sizeof(struct ksu_provenance_image_manifest_v1) != 192);
@@ -116,6 +125,8 @@ int ksu_provenance_init(void)
     if (!error)
         error = ksu_provenance_eligibility_init();
     if (!error)
+        error = ksu_provenance_context_init();
+    if (!error)
         error = ksu_provenance_provider_lsm_init();
 #endif
     ksu_provenance_initialization_error = error;
@@ -126,6 +137,7 @@ void ksu_provenance_exit(void)
 {
 #ifdef CONFIG_KSU_PROVENANCE
     ksu_provenance_provider_lsm_exit();
+    ksu_provenance_context_exit();
     ksu_provenance_eligibility_exit();
 #endif
     ksu_provenance_image_verifier_exit();
@@ -167,8 +179,45 @@ void ksu_provenance_get_info(struct ksu_provenance_info_v1 *info)
     info->diagnostic_capabilities |= core_capabilities;
 #endif
 
-    /* Phase 2 invariant: no operational capability may be advertised. */
-    info->operational_capabilities = 0;
+#ifdef CONFIG_KSU_PROVENANCE
+    info->operational_capabilities =
+        ksu_provenance_operational_capabilities();
+    ksu_provenance_get_boot_epoch(info->boot_epoch);
+    if (info->operational_capabilities) {
+        info->provider_state = KSU_PROVENANCE_PROVIDER_READY;
+        if (ksu_provenance_supervisor_state() ==
+                KSU_PROVENANCE_SUPERVISOR_READY &&
+            ksu_provenance_last_gap_reason() == KSU_PROVENANCE_GAP_NONE)
+            info->trust_tier = KSU_PROVENANCE_TIER_P1;
+    }
+#endif
     info->intent_operation_classes = 0;
     info->result_operation_classes = 0;
+}
+
+void ksu_provenance_get_context_status(
+    struct ksu_provenance_context_status_v1 *status)
+{
+#ifdef CONFIG_KSU_PROVENANCE
+    ksu_provenance_fill_context_status(status);
+#else
+    memset(status, 0, sizeof(*status));
+    status->size = sizeof(*status);
+    status->version = KSU_PROVENANCE_UAPI_VERSION;
+    status->supervisor_state = KSU_PROVENANCE_SUPERVISOR_NONE;
+    status->last_gap_reason = KSU_PROVENANCE_GAP_PROVIDER_LOSS;
+#endif
+}
+
+int ksu_provenance_get_current_context(
+    struct ksu_provenance_current_context_v1 *current_context)
+{
+#ifdef CONFIG_KSU_PROVENANCE
+    return ksu_provenance_fill_current_context(current_context);
+#else
+    memset(current_context, 0, sizeof(*current_context));
+    current_context->size = sizeof(*current_context);
+    current_context->version = KSU_PROVENANCE_UAPI_VERSION;
+    return -EOPNOTSUPP;
+#endif
 }
