@@ -8,6 +8,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import android.webkit.JsPromptResult
 import android.webkit.JsResult
 import android.webkit.ValueCallback
@@ -16,8 +17,12 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.lifecycle.lifecycleScope
 import androidx.webkit.WebViewAssetLoader
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.data.repository.ModuleRepositoryImpl
@@ -26,6 +31,8 @@ import me.weishu.kernelsu.ui.util.createRootShell
 import me.weishu.kernelsu.ui.util.withMainUserUid
 import me.weishu.kernelsu.ui.viewmodel.SuperUserViewModel
 import java.io.File
+
+private const val TAG = "WebViewHelper"
 
 fun Activity.setTaskDescription(label: String) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
@@ -39,9 +46,26 @@ fun Activity.setTaskDescription(label: String) {
     }
 }
 
-@SuppressLint("SetJavaScriptEnabled")
 internal suspend fun prepareWebView(
-    activity: Activity,
+    activity: ComponentActivity,
+    moduleId: String,
+    webUIState: WebUIState,
+) {
+    try {
+        prepareWebViewInternal(activity, moduleId, webUIState)
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Throwable) {
+        Log.e(TAG, "Failed to prepare WebUI for module $moduleId", error)
+        withContext(Dispatchers.Main) {
+            webUIState.uiEvent = WebUIEvent.Error(activity.getString(R.string.webui_failed_to_load))
+        }
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+private suspend fun prepareWebViewInternal(
+    activity: ComponentActivity,
     moduleId: String,
     webUIState: WebUIState,
 ) {
@@ -68,7 +92,9 @@ internal suspend fun prepareWebView(
         webUIState.modDir = "/data/adb/modules/${moduleId}"
 
         if (SuperUserViewModel.apps.isEmpty()) {
-            SuperUserViewModel().fetchAppList()
+            activity.lifecycleScope.launch {
+                SuperUserViewModel.preloadAppList()
+            }
         }
         val shell = createRootShell(true)
         webUIState.rootShell = shell

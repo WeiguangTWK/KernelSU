@@ -4,13 +4,16 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/kprobes.h>
+#include <linux/module.h>
 #include <linux/pid.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/task_work.h>
 #include <linux/uaccess.h>
+#include <linux/uio.h>
 #include <linux/version.h>
 
+#include "provenance/provenance.h"
 #include "uapi/supercall.h"
 #include "supercall/internal.h"
 #include "arch.h"
@@ -33,12 +36,35 @@ static long anon_ksu_ioctl(struct file *filp, unsigned int cmd, unsigned long ar
     return ksu_supercall_handle_ioctl(cmd, (void __user *)arg);
 }
 
+static ssize_t anon_ksu_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+    struct ksu_provenance_current_context_v1 current_context;
+    int error;
+
+    (void)iocb;
+    if (iov_iter_count(to) != sizeof(current_context))
+        return -EMSGSIZE;
+    error = ksu_provenance_get_current_context(&current_context);
+    if (error)
+        return error;
+    if (copy_to_iter(&current_context, sizeof(current_context), to) !=
+        sizeof(current_context))
+        return -EFAULT;
+    return sizeof(current_context);
+}
+
 static const struct file_operations anon_ksu_fops = {
     .owner = THIS_MODULE,
+    .read_iter = anon_ksu_read_iter,
     .unlocked_ioctl = anon_ksu_ioctl,
     .compat_ioctl = anon_ksu_ioctl,
     .release = anon_ksu_release,
 };
+
+bool ksu_is_driver_file(const struct file *file)
+{
+    return file && file->f_op == &anon_ksu_fops;
+}
 
 int ksu_install_fd(void)
 {
@@ -75,6 +101,7 @@ static void ksu_install_fd_tw_func(struct callback_head *cb)
     }
 
     kfree(tw);
+    module_put(THIS_MODULE);
 }
 
 static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
@@ -87,15 +114,21 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
         struct ksu_install_fd_tw *tw;
         unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);
 
-        tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
-        if (!tw)
+        if (!try_module_get(THIS_MODULE))
             return 0;
+
+        tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+        if (!tw) {
+            module_put(THIS_MODULE);
+            return 0;
+        }
 
         tw->outp = (int __user *)arg4;
         tw->cb.func = ksu_install_fd_tw_func;
 
         if (task_work_add(current, &tw->cb, TWA_RESUME)) {
             kfree(tw);
+            module_put(THIS_MODULE);
             pr_warn("install fd add task_work failed\n");
         }
     }

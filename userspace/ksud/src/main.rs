@@ -12,6 +12,8 @@
 
 mod apk_sign;
 mod assets;
+#[cfg(target_os = "android")]
+mod auditd;
 mod boot_patch;
 #[cfg(target_os = "android")]
 mod cli;
@@ -23,21 +25,38 @@ mod defs;
 #[cfg(target_os = "android")]
 mod feature;
 #[cfg(target_os = "android")]
+mod global_audit;
+#[cfg(target_os = "android")]
 mod init_event;
 #[cfg(target_os = "android")]
 mod ksucalls;
 #[cfg(target_os = "android")]
 mod late_load;
+mod lkm_image;
+mod lkm_image_btf;
 #[cfg(target_os = "android")]
 mod magica;
 #[cfg(target_os = "android")]
 mod metamodule;
 #[cfg(target_os = "android")]
 mod module;
+mod module_audit;
+mod module_audit_action;
+#[cfg(any(target_os = "android", test))]
+mod module_audit_assessment;
+mod module_audit_log;
+mod module_audit_transaction;
 #[cfg(target_os = "android")]
 mod module_config;
 #[cfg(target_os = "android")]
+mod module_response;
+#[cfg(target_os = "android")]
 mod profile;
+#[cfg(target_os = "android")]
+mod provenance_io_uring;
+mod provenance_manifest;
+#[cfg(target_os = "android")]
+mod provenance_supervisor;
 #[cfg(target_os = "android")]
 mod resetprop;
 #[cfg(target_os = "android")]

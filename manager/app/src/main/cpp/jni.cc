@@ -36,6 +36,130 @@ Java_me_weishu_kernelsu_Natives_getManagerUAPIVersion(JNIEnv *env, jobject) {
 }
 
 extern "C"
+JNIEXPORT jobject JNICALL
+Java_me_weishu_kernelsu_Natives_getProvenanceInfo(JNIEnv *env, jobject) {
+    struct ksu_provenance_info_v1 info = {};
+    if (!get_provenance_info(&info)) {
+        return nullptr;
+    }
+
+    auto clazz = env->FindClass("me/weishu/kernelsu/Natives$ProvenanceInfo");
+    if (!clazz) {
+        return nullptr;
+    }
+    auto constructor = env->GetMethodID(clazz, "<init>", "()V");
+    if (!constructor) {
+        return nullptr;
+    }
+    auto result = env->NewObject(clazz, constructor);
+    if (!result) {
+        return nullptr;
+    }
+
+    const auto set_int = [&](const char *name, uint32_t value) {
+        env->SetIntField(result, env->GetFieldID(clazz, name, "I"),
+                         static_cast<jint>(value));
+    };
+    const auto set_long = [&](const char *name, uint64_t value) {
+        env->SetLongField(result, env->GetFieldID(clazz, name, "J"),
+                          static_cast<jlong>(value));
+    };
+    const auto set_bytes = [&](const char *name, const uint8_t *value, size_t size) {
+        auto bytes = env->NewByteArray(static_cast<jsize>(size));
+        if (!bytes) {
+            return;
+        }
+        env->SetByteArrayRegion(bytes, 0, static_cast<jsize>(size),
+                                reinterpret_cast<const jbyte *>(value));
+        env->SetObjectField(result, env->GetFieldID(clazz, name, "[B"), bytes);
+        env->DeleteLocalRef(bytes);
+    };
+
+    set_int("size", info.size);
+    set_int("version", info.version);
+    set_int("flags", info.flags);
+    set_int("providerState", info.provider_state);
+    set_int("trustTier", info.trust_tier);
+    set_long("diagnosticCapabilities", info.diagnostic_capabilities);
+    set_long("operationalCapabilities", info.operational_capabilities);
+    set_long("intentOperationClasses", info.intent_operation_classes);
+    set_long("resultOperationClasses", info.result_operation_classes);
+    set_long("currentSequence", info.current_sequence);
+    set_bytes("currentDigest", info.current_digest, sizeof(info.current_digest));
+    set_bytes("bootEpoch", info.boot_epoch, sizeof(info.boot_epoch));
+    set_int("eventSchemaVersion", info.event_schema_version);
+    set_int("manifestFormatVersion", info.manifest_format_version);
+    set_int("uapiMin", info.uapi_min);
+    set_int("uapiMax", info.uapi_max);
+    set_int("verifierState", info.verifier_state);
+    set_int("verifierError", info.verifier_error);
+    set_long("minimumSecurityEpoch", info.minimum_security_epoch);
+    set_bytes("signingKeyId", info.signing_key_id, sizeof(info.signing_key_id));
+    return env->ExceptionCheck() ? nullptr : result;
+}
+
+extern "C"
+JNIEXPORT jobject JNICALL
+Java_me_weishu_kernelsu_Natives_getProvenanceEligibilityInfo(JNIEnv *env, jobject) {
+    struct ksu_provenance_eligibility_info_v1 info = {};
+    if (!get_provenance_eligibility_info(&info)) {
+        return nullptr;
+    }
+
+    auto clazz = env->FindClass("me/weishu/kernelsu/Natives$ProvenanceEligibilityInfo");
+    if (!clazz) {
+        return nullptr;
+    }
+    auto constructor = env->GetMethodID(clazz, "<init>", "()V");
+    if (!constructor) {
+        return nullptr;
+    }
+    auto result = env->NewObject(clazz, constructor);
+    if (!result) {
+        return nullptr;
+    }
+
+    const auto set_int = [&](const char *name, uint32_t value) {
+        env->SetIntField(result, env->GetFieldID(clazz, name, "I"),
+                         static_cast<jint>(value));
+    };
+    const auto set_long = [&](const char *name, uint64_t value) {
+        env->SetLongField(result, env->GetFieldID(clazz, name, "J"),
+                          static_cast<jlong>(value));
+    };
+    const auto set_bytes = [&](const char *name, const uint8_t *value, size_t size) {
+        auto bytes = env->NewByteArray(static_cast<jsize>(size));
+        if (!bytes) {
+            return;
+        }
+        env->SetByteArrayRegion(bytes, 0, static_cast<jsize>(size),
+                                reinterpret_cast<const jbyte *>(value));
+        env->SetObjectField(result, env->GetFieldID(clazz, name, "[B"), bytes);
+        env->DeleteLocalRef(bytes);
+    };
+
+    set_int("size", info.size);
+    set_int("version", info.version);
+    set_int("flags", info.flags);
+    set_int("coreHookState", info.core_hook_state);
+    set_int("coreHookError", info.core_hook_error);
+    set_int("eligibilityState", info.eligibility_state);
+    set_int("eligibilityError", info.eligibility_error);
+    set_long("eligibilityGeneration", info.eligibility_generation);
+    set_int("candidatePid", info.candidate_pid);
+    set_int("candidateTgid", info.candidate_tgid);
+    set_int("roles", info.roles);
+    set_int("verifierError", info.verifier_error);
+    set_long("securityEpoch", info.security_epoch);
+    set_bytes("imageSha256", info.image_sha256, sizeof(info.image_sha256));
+    set_bytes("buildId", info.build_id, sizeof(info.build_id));
+    set_bytes("signingKeyId", info.signing_key_id, sizeof(info.signing_key_id));
+    set_int("uapiMin", info.uapi_min);
+    set_int("uapiMax", info.uapi_max);
+    return env->ExceptionCheck() ? nullptr : result;
+}
+
+extern "C"
 JNIEXPORT jint JNICALL
 Java_me_weishu_kernelsu_Natives_getSuperuserCount(JNIEnv *env, jobject) {
     struct ksu_new_get_allow_list_cmd cmd = {

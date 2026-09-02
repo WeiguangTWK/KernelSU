@@ -63,6 +63,7 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonColors
 import androidx.compose.material3.ButtonDefaults
@@ -135,6 +136,7 @@ import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.data.model.Module
 import me.weishu.kernelsu.data.model.ModuleUpdateInfo
+import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.ui.component.ObserveAsEvents
 import me.weishu.kernelsu.ui.component.ScrollToTopOnChange
 import me.weishu.kernelsu.ui.component.dialog.rememberConfirmDialog
@@ -282,13 +284,19 @@ fun ModulePagerMaterial(
                 onClearClick = actions.onClearSearch,
                 snackbarHostState = snackBarHost,
                 navigationIcon = {
-                    IconButton(
-                        onClick = { actions.onOpenRepo() }
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Cloud,
-                            contentDescription = stringResource(id = R.string.module_repos)
-                        )
+                    Row {
+                        IconButton(onClick = actions.onOpenSecurityAudit) {
+                            Icon(
+                                imageVector = Icons.Outlined.Shield,
+                                contentDescription = stringResource(R.string.security_audit_center),
+                            )
+                        }
+                        IconButton(onClick = actions.onOpenRepo) {
+                            Icon(
+                                imageVector = Icons.Outlined.Cloud,
+                                contentDescription = stringResource(id = R.string.module_repos)
+                            )
+                        }
                     }
                 },
                 actions = {
@@ -356,6 +364,11 @@ fun ModulePagerMaterial(
                         listState = searchListState,
                         displayModules = uiState.searchResults,
                         updateInfoMap = uiState.updateInfo,
+                        secureRemovalModuleIds = uiState.secureRemovalModuleIds,
+                        secureRemovalStates = uiState.secureRemovalStates,
+                        isSafeMode = uiState.isSafeMode,
+                        auditResponseAvailable = uiState.auditResponseAvailable,
+                        auditEmergencyStatus = uiState.auditEmergencyStatus,
                         actions = actions,
                         onClickModule = { module ->
                             if (module.hasWebUi) {
@@ -467,6 +480,11 @@ fun ModulePagerMaterial(
                 listState = listState,
                 displayModules = uiState.moduleList,
                 updateInfoMap = uiState.updateInfo,
+                secureRemovalModuleIds = uiState.secureRemovalModuleIds,
+                secureRemovalStates = uiState.secureRemovalStates,
+                isSafeMode = uiState.isSafeMode,
+                auditResponseAvailable = uiState.auditResponseAvailable,
+                auditEmergencyStatus = uiState.auditEmergencyStatus,
                 actions = actions,
                 onClickModule = { module ->
                     if (module.hasWebUi) {
@@ -501,6 +519,11 @@ private fun ModuleList(
     listState: LazyListState = rememberLazyListState(),
     displayModules: List<Module>,
     updateInfoMap: Map<String, ModuleUpdateInfo>,
+    secureRemovalModuleIds: Set<String>,
+    secureRemovalStates: Map<String, String>,
+    isSafeMode: Boolean,
+    auditResponseAvailable: Boolean,
+    auditEmergencyStatus: AuditEmergencyStatus?,
     actions: ModuleActions,
     onClickModule: (Module) -> Unit,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
@@ -517,15 +540,33 @@ private fun ModuleList(
             bottom = 16.dp + bottomInnerPadding + 56.dp + 16.dp
         ),
     ) {
+        if (!auditResponseAvailable || auditEmergencyStatus?.active == true) {
+            item(key = "audit-emergency") {
+                ModuleEmergencyCardMaterial(
+                    auditResponseAvailable = auditResponseAvailable,
+                    status = auditEmergencyStatus,
+                    onClick = actions.onOpenSecurityAudit,
+                )
+            }
+        }
         items(displayModules, key = { it.id }, contentType = { "module" }) { module ->
             val scope = rememberCoroutineScope()
             val moduleUpdateInfo = updateInfoMap[module.id] ?: ModuleUpdateInfo.Empty
 
             ModuleItem(
                 module = module,
+                requiresSecureRemoval = module.id in secureRemovalModuleIds,
+                containmentState = secureRemovalStates[module.id],
+                secureRemovalAvailable = isSafeMode,
                 updateUrl = moduleUpdateInfo.downloadUrl,
                 onUninstallClicked = {
-                    if (module.remove) {
+                    if (module.id in secureRemovalModuleIds) {
+                        if (isSafeMode) {
+                            actions.onRequestSecureRemoval(module.id)
+                        } else {
+                            actions.onOpenModuleAudit(module.id)
+                        }
+                    } else if (module.remove) {
                         actions.onUndoUninstallModule(module)
                     } else {
                         actions.onRequestUninstallConfirmation(module)
@@ -546,6 +587,37 @@ private fun ModuleList(
                 onExecuteAction = { actions.onExecuteModuleAction(module) },
                 closeSearch = { closeSearch() }
             )
+        }
+    }
+}
+
+@Composable
+private fun ModuleEmergencyCardMaterial(
+    auditResponseAvailable: Boolean,
+    status: AuditEmergencyStatus?,
+    onClick: () -> Unit,
+) {
+    val message = if (auditResponseAvailable && status?.active == true) {
+        stringResource(
+            R.string.module_audit_emergency_banner,
+            status.affectedModuleIds.size,
+        )
+    } else {
+        stringResource(R.string.module_audit_status_unavailable_banner)
+    }
+    TonalCard(
+        modifier = Modifier.fillMaxWidth(),
+        containerColor = MaterialTheme.colorScheme.errorContainer,
+        onClick = onClick,
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                stringResource(R.string.security_audit_emergency_title),
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(message, color = MaterialTheme.colorScheme.onErrorContainer)
         }
     }
 }
@@ -708,6 +780,9 @@ private fun ModuleShortcutSheet(
 @Composable
 private fun ModuleItem(
     module: Module,
+    requiresSecureRemoval: Boolean,
+    containmentState: String?,
+    secureRemovalAvailable: Boolean,
     updateUrl: String,
     onUninstallClicked: () -> Unit,
     onCheckChanged: (Boolean) -> Unit,
@@ -733,7 +808,7 @@ private fun ModuleItem(
                     if (module.hasWebUi) {
                         toggleable(
                             value = module.enabled,
-                            enabled = !module.remove && module.enabled,
+                            enabled = !module.remove && module.enabled && !requiresSecureRemoval,
                             interactionSource = interactionSource,
                             role = Role.Button,
                             indication = indication,
@@ -785,7 +860,7 @@ private fun ModuleItem(
                     horizontalArrangement = Arrangement.End,
                 ) {
                     ExpressiveSwitch(
-                        enabled = !module.update,
+                        enabled = !module.update && !requiresSecureRemoval,
                         checked = module.enabled,
                         onCheckedChange = {
                             haptic.performHapticFeedback(HapticFeedbackType.VirtualKey)
@@ -842,6 +917,25 @@ private fun ModuleItem(
                 }
             }
 
+            if (requiresSecureRemoval) {
+                Text(
+                    text = stringResource(
+                        when (containmentState) {
+                            "pending_reboot" -> R.string.security_audit_containment_pending
+                            "persistent_scripts_incomplete" ->
+                                R.string.security_audit_containment_incomplete
+                            "contained" -> R.string.security_audit_module_contained
+                            else -> R.string.security_audit_integrity_compromised
+                        }
+                    ),
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.labelMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(bottom = 6.dp),
+                )
+            }
+
             HorizontalDivider(thickness = Dp.Hairline)
 
             Spacer(modifier = Modifier.height(4.dp))
@@ -851,7 +945,7 @@ private fun ModuleItem(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 val hasUpdate = updateUrl.isNotEmpty()
-                val actionButtonsEnabled = !module.remove && module.enabled
+                val actionButtonsEnabled = !module.remove && module.enabled && !requiresSecureRemoval
 
                 AnimatedVisibility(
                     visible = actionButtonsEnabled,
@@ -933,7 +1027,7 @@ private fun ModuleItem(
                     Row {
                         Button(
                             modifier = Modifier.defaultMinSize(52.dp, 32.dp),
-                            enabled = !module.remove,
+                            enabled = !module.remove && !requiresSecureRemoval,
                             onClick = onUpdate,
                             shape = ButtonDefaults.textShape,
                             contentPadding = ButtonDefaults.TextButtonContentPadding
@@ -962,7 +1056,13 @@ private fun ModuleItem(
                     onClick = onUninstallClicked,
                     contentPadding = ButtonDefaults.TextButtonContentPadding
                 ) {
-                    if (!module.remove) {
+                    if (requiresSecureRemoval) {
+                        Icon(
+                            modifier = Modifier.size(20.dp),
+                            imageVector = Icons.Outlined.Shield,
+                            contentDescription = null,
+                        )
+                    } else if (!module.remove) {
                         Icon(
                             modifier = Modifier.size(20.dp),
                             imageVector = Icons.Outlined.Delete,
@@ -982,7 +1082,15 @@ private fun ModuleItem(
                             modifier = Modifier.padding(start = 7.dp),
                             fontFamily = MaterialTheme.typography.labelMedium.fontFamily,
                             fontSize = MaterialTheme.typography.labelMedium.fontSize,
-                            text = stringResource(if (module.remove) R.string.undo else R.string.uninstall)
+                            text = stringResource(
+                                when {
+                                    requiresSecureRemoval && secureRemovalAvailable ->
+                                        R.string.security_audit_secure_remove_confirm
+                                    requiresSecureRemoval -> R.string.security_audit_view_audit
+                                    module.remove -> R.string.undo
+                                    else -> R.string.uninstall
+                                }
+                            )
                         )
                     }
                 }

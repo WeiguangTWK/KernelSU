@@ -121,6 +121,11 @@ fun ModulePager(
             viewModel.dismissConfirmRequest()
         },
         onOpenRepo = { navigator.push(Route.ModuleRepo) },
+        onOpenSecurityAudit = { navigator.push(Route.SecurityAudit) },
+        onOpenModuleAudit = { moduleId -> navigator.push(Route.SecurityAuditModule(moduleId)) },
+        onRequestSecureRemoval = { moduleId ->
+            navigator.push(Route.SecurityAuditModule(moduleId, requestSecureRemoval = true))
+        },
         onToggleSortActionFirst = {
             viewModel.toggleSortActionFirst()
         },

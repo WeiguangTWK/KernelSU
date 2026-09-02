@@ -63,6 +63,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
@@ -112,6 +113,7 @@ import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.data.model.Module
 import me.weishu.kernelsu.data.model.ModuleUpdateInfo
+import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.ui.component.ListPopupDefaults
 import me.weishu.kernelsu.ui.component.ObserveAsEvents
 import me.weishu.kernelsu.ui.component.ScrollToTopOnChange
@@ -130,6 +132,7 @@ import me.weishu.kernelsu.ui.util.reboot
 import me.weishu.kernelsu.ui.util.rememberBlurBackdrop
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
+import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.DropdownImpl
 import top.yukonga.miuix.kmp.basic.FloatingActionButton
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
@@ -359,14 +362,21 @@ fun ModulePagerMiuix(
                             )
                         },
                         navigationIcon = {
-                            IconButton(
-                                onClick = actions.onOpenRepo,
-                            ) {
-                                Icon(
-                                    imageVector = MiuixIcons.Download,
-                                    tint = colorScheme.onSurface,
-                                    contentDescription = null
-                                )
+                            Row {
+                                IconButton(onClick = actions.onOpenSecurityAudit) {
+                                    Icon(
+                                        imageVector = Icons.Outlined.Shield,
+                                        tint = colorScheme.onSurface,
+                                        contentDescription = stringResource(R.string.security_audit_center),
+                                    )
+                                }
+                                IconButton(onClick = actions.onOpenRepo) {
+                                    Icon(
+                                        imageVector = MiuixIcons.Download,
+                                        tint = colorScheme.onSurface,
+                                        contentDescription = stringResource(R.string.module_repos),
+                                    )
+                                }
                             }
                         },
                         scrollBehavior = scrollBehavior,
@@ -480,6 +490,11 @@ fun ModulePagerMiuix(
                         .overScrollVertical(),
                     modules = uiState.searchResults,
                     updateInfoMap = uiState.updateInfo,
+                    secureRemovalModuleIds = uiState.secureRemovalModuleIds,
+                    secureRemovalStates = uiState.secureRemovalStates,
+                    isSafeMode = uiState.isSafeMode,
+                    auditResponseAvailable = uiState.auditResponseAvailable,
+                    auditEmergencyStatus = uiState.auditEmergencyStatus,
                     actions = actions,
                     onModuleAddShortcut = ::onModuleAddShortcut,
                     contentPadding = PaddingValues(
@@ -585,6 +600,11 @@ fun ModulePagerMiuix(
                                 .nestedScroll(nestedScrollConnection),
                             modules = modules,
                             updateInfoMap = uiState.updateInfo,
+                            secureRemovalModuleIds = uiState.secureRemovalModuleIds,
+                            secureRemovalStates = uiState.secureRemovalStates,
+                            isSafeMode = uiState.isSafeMode,
+                            auditResponseAvailable = uiState.auditResponseAvailable,
+                            auditEmergencyStatus = uiState.auditEmergencyStatus,
                             actions = actions,
                             onModuleAddShortcut = { module, type ->
                                 onModuleAddShortcut(module, type)
@@ -740,6 +760,11 @@ private fun ModuleList(
     modifier: Modifier = Modifier,
     modules: List<Module>,
     updateInfoMap: Map<String, ModuleUpdateInfo>,
+    secureRemovalModuleIds: Set<String>,
+    secureRemovalStates: Map<String, String>,
+    isSafeMode: Boolean,
+    auditResponseAvailable: Boolean,
+    auditEmergencyStatus: AuditEmergencyStatus?,
     actions: ModuleActions,
     onModuleAddShortcut: (Module, ShortcutType) -> Unit,
     contentPadding: PaddingValues,
@@ -753,6 +778,15 @@ private fun ModuleList(
         contentPadding = contentPadding,
         overscrollEffect = null,
     ) {
+        if (!auditResponseAvailable || auditEmergencyStatus?.active == true) {
+            item(key = "audit-emergency") {
+                ModuleEmergencyCardMiuix(
+                    auditResponseAvailable = auditResponseAvailable,
+                    status = auditEmergencyStatus,
+                    onClick = actions.onOpenSecurityAudit,
+                )
+            }
+        }
         items(
             items = modules,
             key = { it.id },
@@ -763,9 +797,20 @@ private fun ModuleList(
             val content: @Composable () -> Unit = {
                 ModuleItem(
                     module = module,
+                    requiresSecureRemoval = module.id in secureRemovalModuleIds,
+                    containmentState = secureRemovalStates[module.id],
+                    secureRemovalAvailable = isSafeMode,
                     updateUrl = moduleUpdateInfo.downloadUrl,
                     onUninstall = {
-                        actions.onRequestUninstallConfirmation(currentModuleState.value)
+                        if (module.id in secureRemovalModuleIds) {
+                            if (isSafeMode) {
+                                actions.onRequestSecureRemoval(module.id)
+                            } else {
+                                actions.onOpenModuleAudit(module.id)
+                            }
+                        } else {
+                            actions.onRequestUninstallConfirmation(currentModuleState.value)
+                        }
                     },
                     onUndoUninstall = {
                         scope.launch {
@@ -805,10 +850,47 @@ private fun ModuleList(
     }
 }
 
+@Composable
+private fun ModuleEmergencyCardMiuix(
+    auditResponseAvailable: Boolean,
+    status: AuditEmergencyStatus?,
+    onClick: () -> Unit,
+) {
+    val message = if (auditResponseAvailable && status?.active == true) {
+        stringResource(
+            R.string.module_audit_emergency_banner,
+            status.affectedModuleIds.size,
+        )
+    } else {
+        stringResource(R.string.module_audit_status_unavailable_banner)
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+        colors = CardDefaults.defaultColors(
+            color = colorScheme.errorContainer,
+            contentColor = colorScheme.onErrorContainer,
+        ),
+        onClick = onClick,
+    ) {
+        Column {
+            Text(
+                stringResource(R.string.security_audit_emergency_title),
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.heightIn(min = 4.dp))
+            Text(message)
+        }
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ModuleItem(
     module: Module,
+    requiresSecureRemoval: Boolean,
+    containmentState: String?,
+    secureRemovalAvailable: Boolean,
     updateUrl: String,
     onUndoUninstall: () -> Unit,
     onUninstall: () -> Unit,
@@ -911,7 +993,7 @@ fun ModuleItem(
                 )
             }
             Switch(
-                enabled = !module.update,
+                enabled = !module.update && !requiresSecureRemoval,
                 checked = module.enabled,
                 onCheckedChange = {
                     if (it != module.enabled) onCheckChanged(it)
@@ -941,6 +1023,27 @@ fun ModuleItem(
             }
         }
 
+
+        if (requiresSecureRemoval) {
+            Text(
+                text = stringResource(
+                    when (containmentState) {
+                        "pending_reboot" -> R.string.security_audit_containment_pending
+                        "persistent_scripts_incomplete" ->
+                            R.string.security_audit_containment_incomplete
+                        "contained" -> R.string.security_audit_module_contained
+                        else -> R.string.security_audit_integrity_compromised
+                    }
+                ),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Medium,
+                color = colorScheme.error,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+
         HorizontalDivider(
             modifier = Modifier.padding(vertical = 8.dp),
             thickness = 0.5.dp,
@@ -949,7 +1052,7 @@ fun ModuleItem(
 
         Row {
             AnimatedVisibility(
-                visible = module.enabled && !module.remove && !module.update,
+                visible = module.enabled && !module.remove && !module.update && !requiresSecureRemoval,
                 enter = fadeIn(),
                 exit = fadeOut()
             ) {
@@ -1034,7 +1137,7 @@ fun ModuleItem(
                 IconButton(
                     modifier = Modifier.padding(end = 8.dp),
                     backgroundColor = updateBg,
-                    enabled = !module.remove,
+                    enabled = !module.remove && !requiresSecureRemoval,
                     minHeight = 35.dp,
                     minWidth = 35.dp,
                     onClick = onUpdate,
@@ -1063,7 +1166,13 @@ fun ModuleItem(
             IconButton(
                 minHeight = 35.dp,
                 minWidth = 35.dp,
-                onClick = if (module.remove) onUndoUninstall else onUninstall,
+                onClick = if (requiresSecureRemoval) {
+                    onUninstall
+                } else if (module.remove) {
+                    onUndoUninstall
+                } else {
+                    onUninstall
+                },
                 backgroundColor = if (module.remove) {
                     secondaryContainer.copy(alpha = 0.8f)
                 } else {
@@ -1080,7 +1189,9 @@ fun ModuleItem(
                 ) {
                     Icon(
                         modifier = Modifier.size(20.dp),
-                        imageVector = if (module.remove) {
+                        imageVector = if (requiresSecureRemoval) {
+                            Icons.Outlined.Shield
+                        } else if (module.remove) {
                             MiuixIcons.Undo
                         } else {
                             MiuixIcons.Delete
@@ -1096,7 +1207,13 @@ fun ModuleItem(
                         Text(
                             modifier = Modifier.padding(start = 4.dp, end = 3.dp),
                             text = stringResource(
-                                if (module.remove) R.string.undo else R.string.uninstall
+                                when {
+                                    requiresSecureRemoval && secureRemovalAvailable ->
+                                        R.string.security_audit_secure_remove_confirm
+                                    requiresSecureRemoval -> R.string.security_audit_view_audit
+                                    module.remove -> R.string.undo
+                                    else -> R.string.uninstall
+                                }
                             ),
                             color = actionIconTint,
                             fontWeight = FontWeight.Medium,

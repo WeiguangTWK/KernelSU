@@ -122,6 +122,58 @@ object Natives {
     val managerUAPIVersion: Int
         external get
 
+    /** Read-only audit provenance and provider diagnostics through Phase 2. */
+    external fun getProvenanceInfo(): ProvenanceInfo?
+
+    /** Phase 2 read-only LSM hook and authenticated exec eligibility diagnostics. */
+    external fun getProvenanceEligibilityInfo(): ProvenanceEligibilityInfo?
+
+    @Keep
+    class ProvenanceInfo {
+        @JvmField var size: Int = 0
+        @JvmField var version: Int = 0
+        @JvmField var flags: Int = 0
+        @JvmField var providerState: Int = 0
+        @JvmField var trustTier: Int = 0
+        @JvmField var diagnosticCapabilities: Long = 0
+        @JvmField var operationalCapabilities: Long = 0
+        @JvmField var intentOperationClasses: Long = 0
+        @JvmField var resultOperationClasses: Long = 0
+        @JvmField var currentSequence: Long = 0
+        @JvmField var currentDigest: ByteArray = ByteArray(32)
+        @JvmField var bootEpoch: ByteArray = ByteArray(16)
+        @JvmField var eventSchemaVersion: Int = 0
+        @JvmField var manifestFormatVersion: Int = 0
+        @JvmField var uapiMin: Int = 0
+        @JvmField var uapiMax: Int = 0
+        @JvmField var verifierState: Int = 0
+        @JvmField var verifierError: Int = 0
+        @JvmField var minimumSecurityEpoch: Long = 0
+        @JvmField var signingKeyId: ByteArray = ByteArray(32)
+    }
+
+    @Keep
+    class ProvenanceEligibilityInfo {
+        @JvmField var size: Int = 0
+        @JvmField var version: Int = 0
+        @JvmField var flags: Int = 0
+        @JvmField var coreHookState: Int = 0
+        @JvmField var coreHookError: Int = 0
+        @JvmField var eligibilityState: Int = 0
+        @JvmField var eligibilityError: Int = 0
+        @JvmField var eligibilityGeneration: Long = 0
+        @JvmField var candidatePid: Int = 0
+        @JvmField var candidateTgid: Int = 0
+        @JvmField var roles: Int = 0
+        @JvmField var verifierError: Int = 0
+        @JvmField var securityEpoch: Long = 0
+        @JvmField var imageSha256: ByteArray = ByteArray(32)
+        @JvmField var buildId: ByteArray = ByteArray(32)
+        @JvmField var signingKeyId: ByteArray = ByteArray(32)
+        @JvmField var uapiMin: Int = 0
+        @JvmField var uapiMax: Int = 0
+    }
+
     fun checkUAPIMismatch(): Boolean {
         return kernelUAPIVersion != managerUAPIVersion
     }

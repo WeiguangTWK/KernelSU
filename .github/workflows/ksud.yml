@@ -46,6 +46,9 @@ jobs:
         workspaces: userspace/ksud
         cache-targets: false
 
+    - name: Test module static audit
+      run: cargo test --package ksu-module-audit
+
     - uses: nttld/setup-ndk@v1
       id: setup-ndk
       with:

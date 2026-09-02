@@ -14,6 +14,14 @@ Builds ksuinit, ksud, and a v2-signed KernelSU Manager APK on Windows.
     -AndroidSdk E:\AndroidSDK `
     -OutputApk dist\KernelSU-custom.apk
 
+.EXAMPLE
+.\build-release.ps1 `
+    -Keystore C:\keys\kernelsu-release.jks `
+    -KeyAlias kernelsu-release `
+    -ProvenanceCertificate \\wsl.localhost\Ubuntu\secure\provenance\provenance-certificate.pem `
+    -ProvenancePrivateKey \\wsl.localhost\Ubuntu\secure\provenance\provenance-private-key.pem `
+    -ProvenanceSecurityEpoch 1
+
 .NOTES
 The script never accepts keystore passwords as arguments. keytool and
 apksigner request them interactively so they are not stored in command history.
@@ -30,9 +38,13 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$KeyAlias,
 
-    [string]$PackageName = "me.weishu.kernelsu",
+    [string]$PackageName = "",
     [string]$AndroidSdk = "",
     [string]$NdkRoot = "",
+    [string]$ProvenanceCertificate = "",
+    [string]$ProvenancePrivateKey = "",
+    [uint64]$ProvenanceSecurityEpoch = 0,
+    [string]$ProvenanceBuildIdentity = "",
     [string]$OutputApk = ""
 )
 
@@ -60,36 +72,107 @@ function Require-Command {
     return $command
 }
 
-function Test-ByteSequence {
+function Read-DecimalCDefine {
     param(
-        [Parameter(Mandatory = $true)][byte[]]$Data,
-        [Parameter(Mandatory = $true)][byte[]]$Needle
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
     )
 
-    if ($Needle.Length -eq 0 -or $Data.Length -lt $Needle.Length) {
-        return $false
+    $text = Get-Content -LiteralPath $Path -Raw
+    $pattern = '(?m)^\s*#define\s+{0}\s+([0-9]+)\s*$' -f [regex]::Escape($Name)
+    $match = [regex]::Match($text, $pattern)
+    if (-not $match.Success) {
+        throw "Unable to read $Name from $Path"
+    }
+    return [int]::Parse($match.Groups[1].Value)
+}
+
+function Read-LkmMetadataValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModuleText,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$ModulePath
+    )
+
+    $pattern = '(?:^|\x00){0}=([^\x00]*)\x00' -f [regex]::Escape($Name)
+    $match = [regex]::Match($ModuleText, $pattern)
+    if (-not $match.Success) {
+        throw "LKM is missing metadata '$Name': $ModulePath"
+    }
+    return $match.Groups[1].Value
+}
+
+function Find-LkmMetadataValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$ModuleText,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $pattern = '(?:^|\x00){0}=([^\x00]*)\x00' -f [regex]::Escape($Name)
+    $match = [regex]::Match($ModuleText, $pattern)
+    if ($match.Success) {
+        return $match.Groups[1].Value
+    }
+    return $null
+}
+
+function ConvertTo-LowerHex {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+
+    return -join ($Bytes | ForEach-Object { $_.ToString("x2") })
+}
+
+function Get-ProvenanceBuildIdentity {
+    $temporaryIndex = Join-Path `
+        ([IO.Path]::GetTempPath()) `
+        ("kernelsu-build-identity-{0}.index" -f [guid]::NewGuid())
+    $savedIndex = $env:GIT_INDEX_FILE
+    try {
+        $env:GIT_INDEX_FILE = $temporaryIndex
+        & git read-tree HEAD
+        Assert-LastExitCode "temporary Git index initialization"
+        & git add -A -- .
+        Assert-LastExitCode "source snapshot staging"
+        $treeId = (& git write-tree).Trim()
+        Assert-LastExitCode "source snapshot tree generation"
+        if ($treeId -notmatch '^[0-9a-fA-F]{40,64}$') {
+            throw "Invalid source snapshot tree ID: $treeId"
+        }
+    } finally {
+        if ($null -eq $savedIndex) {
+            Remove-Item Env:GIT_INDEX_FILE -ErrorAction SilentlyContinue
+        } else {
+            $env:GIT_INDEX_FILE = $savedIndex
+        }
+        Remove-Item $temporaryIndex -Force -ErrorAction SilentlyContinue
+        Remove-Item "$temporaryIndex.lock" -Force -ErrorAction SilentlyContinue
     }
 
-    $lastStart = $Data.Length - $Needle.Length
-    for ($i = 0; $i -le $lastStart; $i++) {
-        if ($Data[$i] -ne $Needle[0]) {
-            continue
-        }
+    $domain = "KSU-PROVENANCE-BUILD-IDENTITY-V1`n$($treeId.ToLowerInvariant())`n"
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha256.ComputeHash([Text.Encoding]::ASCII.GetBytes($domain))
+        return ConvertTo-LowerHex -Bytes $digest
+    } finally {
+        $sha256.Dispose()
+    }
+}
 
-        $matched = $true
-        for ($j = 1; $j -lt $Needle.Length; $j++) {
-            if ($Data[$i + $j] -ne $Needle[$j]) {
-                $matched = $false
-                break
-            }
-        }
+function Convert-CUnsignedLiteral {
+    param(
+        [Parameter(Mandatory = $true)][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
 
-        if ($matched) {
-            return $true
-        }
+    if ($Value -match '^0[xX]([0-9a-fA-F]+)$') {
+        return [Convert]::ToUInt32($Matches[1], 16)
     }
 
-    return $false
+    $parsed = [uint32]0
+    if ([uint32]::TryParse($Value, [ref]$parsed)) {
+        return $parsed
+    }
+    throw "Invalid C unsigned literal for ${Description}: $Value"
 }
 
 function Read-RepoVersion {
@@ -107,6 +190,21 @@ function Read-RepoVersion {
     return $match.Groups[1].Value
 }
 
+function Read-GradleProperty {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    $value = $null
+    foreach ($line in Get-Content $Path) {
+        if ($line -match ('^\s*{0}\s*=\s*(.*?)\s*$' -f [regex]::Escape($Name))) {
+            $value = $Matches[1]
+        }
+    }
+    return $value
+}
+
 Write-Host "=== Resolve build environment ==="
 
 Require-Command git | Out-Null
@@ -114,6 +212,58 @@ Require-Command cargo | Out-Null
 Require-Command rustup | Out-Null
 Require-Command java | Out-Null
 $KeytoolCommand = Require-Command keytool.exe
+
+$provenanceValues = @(
+    $ProvenanceCertificate,
+    $ProvenancePrivateKey,
+    $ProvenanceBuildIdentity
+)
+$ProvenanceSigningEnabled = (($provenanceValues | Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_)
+}).Count -gt 0) -or ($ProvenanceSecurityEpoch -ne 0)
+$ProvenanceCertificateKeyId = ""
+if ($ProvenanceSigningEnabled) {
+    if ([string]::IsNullOrWhiteSpace($ProvenanceCertificate) -or
+        [string]::IsNullOrWhiteSpace($ProvenancePrivateKey) -or
+        $ProvenanceSecurityEpoch -eq 0) {
+        throw "Provenance signing requires -ProvenanceCertificate, -ProvenancePrivateKey, and -ProvenanceSecurityEpoch"
+    }
+    if (-not (Test-Path $ProvenanceCertificate -PathType Leaf)) {
+        throw "Provenance certificate not found: $ProvenanceCertificate"
+    }
+    if (-not (Test-Path $ProvenancePrivateKey -PathType Leaf)) {
+        throw "Provenance private key not found: $ProvenancePrivateKey"
+    }
+    $ProvenanceCertificate = (Resolve-Path $ProvenanceCertificate).Path
+    $ProvenancePrivateKey = (Resolve-Path $ProvenancePrivateKey).Path
+    $OpenSslCommand = Require-Command openssl
+
+    if ([string]::IsNullOrWhiteSpace($ProvenanceBuildIdentity)) {
+        $ProvenanceBuildIdentity = Get-ProvenanceBuildIdentity
+    } elseif ($ProvenanceBuildIdentity -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "Provenance build identity must contain exactly 64 hexadecimal characters"
+    } else {
+        $ProvenanceBuildIdentity = $ProvenanceBuildIdentity.ToLowerInvariant()
+    }
+
+    $provenanceDer = Join-Path `
+        ([IO.Path]::GetTempPath()) `
+        ("kernelsu-provenance-{0}.der" -f [guid]::NewGuid())
+    try {
+        & $OpenSslCommand.Source x509 `
+            -in $ProvenanceCertificate `
+            -outform DER `
+            -out $provenanceDer
+        Assert-LastExitCode "provenance certificate conversion"
+        $ProvenanceCertificateKeyId = (Get-FileHash $provenanceDer -Algorithm SHA256).Hash.ToLowerInvariant()
+    } finally {
+        Remove-Item $provenanceDer -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "Provenance key ID : $ProvenanceCertificateKeyId"
+    Write-Host "Provenance epoch  : $ProvenanceSecurityEpoch"
+    Write-Host "Provenance build  : $ProvenanceBuildIdentity"
+}
 
 $isShallow = (& git rev-parse --is-shallow-repository).Trim()
 Assert-LastExitCode "Git shallow-repository check"
@@ -130,6 +280,25 @@ if (-not [int]::TryParse($gitCommitCountText, [ref]$gitCommitCount)) {
 $KernelSuVersion = 30000 + $gitCommitCount
 Write-Host "Git commits: $gitCommitCount"
 Write-Host "KernelSU version: $KernelSuVersion"
+
+$PackageNameSource = "-PackageName parameter"
+if ([string]::IsNullOrWhiteSpace($PackageName)) {
+    $ManagerGradleProperties = Join-Path $RepoRoot "manager\gradle.properties"
+    $PackageName = Read-GradleProperty `
+        -Path $ManagerGradleProperties `
+        -Name "KSU_PACKAGE_NAME"
+    if ([string]::IsNullOrWhiteSpace($PackageName)) {
+        $PackageName = "me.weishu.kernelsu"
+        $PackageNameSource = "built-in fallback"
+    } else {
+        $PackageName = $PackageName.Trim()
+        $PackageNameSource = "manager\gradle.properties"
+    }
+}
+$PackageName = $PackageName.Trim()
+if ($PackageName -notmatch '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$') {
+    throw "Invalid Android package name: $PackageName"
+}
 
 $NdkVersion = Read-RepoVersion `
     -Path "$RepoRoot\manager\gradle\libs.versions.toml" `
@@ -164,6 +333,7 @@ $NdkRoot = (Resolve-Path $NdkRoot).Path
 
 $LlvmRoot = Join-Path $NdkRoot "toolchains\llvm\prebuilt\windows-x86_64"
 $LlvmBin = Join-Path $LlvmRoot "bin"
+$LlvmStrip = Join-Path $LlvmBin "llvm-strip.exe"
 $BuildTools = Join-Path $AndroidSdk "build-tools\$BuildToolsVersion"
 $ZipAlign = Join-Path $BuildTools "zipalign.exe"
 $ApkSigner = Join-Path $BuildTools "apksigner.bat"
@@ -171,6 +341,7 @@ $ApkSigner = Join-Path $BuildTools "apksigner.bat"
 foreach ($requiredPath in @(
     $LlvmBin,
     (Join-Path $LlvmBin "libclang.dll"),
+    $LlvmStrip,
     $ZipAlign,
     $ApkSigner
 )) {
@@ -194,7 +365,12 @@ if (-not ($pathEntries -contains $LlvmBin)) {
 Write-Host "Android SDK : $AndroidSdk"
 Write-Host "Android NDK : $NdkRoot"
 Write-Host "Build tools: $BuildTools"
-Write-Host "Package name: $PackageName"
+Write-Host "Package name: $PackageName ($PackageNameSource)"
+
+Write-Host "`n=== Test module static audit ==="
+
+& cargo test --package ksu-module-audit
+Assert-LastExitCode "module static audit tests"
 
 $requiredTargets = @(
     "aarch64-unknown-linux-musl",
@@ -223,7 +399,14 @@ try {
 
     $CertFile = Get-Item $CertDer
     $CertHash = (Get-FileHash $CertDer -Algorithm SHA256).Hash.ToLowerInvariant()
-    Write-Host ("Certificate size  : 0x{0:x4} ({0} bytes)" -f $CertFile.Length)
+    $CertSizeHex = "0x{0:x4}" -f $CertFile.Length
+    $ManagerCertificateMaxLength = Read-DecimalCDefine `
+        -Path (Join-Path $RepoRoot "kernel\manager\apk_sign.h") `
+        -Name "KSU_MANAGER_CERT_MAX_LENGTH"
+    if ($CertFile.Length -gt $ManagerCertificateMaxLength) {
+        throw "Manager certificate is $($CertFile.Length) bytes; kernel maximum is $ManagerCertificateMaxLength bytes"
+    }
+    Write-Host ("Certificate size  : $CertSizeHex ({0} bytes)" -f $CertFile.Length)
     Write-Host "Certificate SHA256: $CertHash"
 
     $Kmis = @(
@@ -235,7 +418,7 @@ try {
         "android15-6.6",
         "android16-6.12"
     )
-    $CertHashBytes = [Text.Encoding]::ASCII.GetBytes($CertHash)
+    $LkmProvenanceEnabled = $null
     foreach ($kmi in $Kmis) {
         $modulePath = Join-Path $RepoRoot "kernel\dist\${kmi}_kernelsu.ko"
         if (-not (Test-Path $modulePath -PathType Leaf)) {
@@ -243,11 +426,86 @@ try {
         }
 
         $moduleBytes = [IO.File]::ReadAllBytes($modulePath)
-        if (-not (Test-ByteSequence -Data $moduleBytes -Needle $CertHashBytes)) {
-            throw "LKM does not contain the selected certificate hash: $modulePath"
+        $moduleText = [Text.Encoding]::ASCII.GetString($moduleBytes)
+        $identityVersion = Read-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_manager_identity_version" `
+            -ModulePath $modulePath
+        if ($identityVersion -ne "1") {
+            throw "Unsupported LKM Manager identity version '$identityVersion': $modulePath"
+        }
+
+        $moduleCertSizeText = Read-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_manager_cert_size" `
+            -ModulePath $modulePath
+        $moduleCertSize = Convert-CUnsignedLiteral `
+            -Value $moduleCertSizeText `
+            -Description "LKM Manager certificate size"
+        if ($moduleCertSize -ne $CertFile.Length) {
+            throw "LKM Manager certificate size is $moduleCertSizeText, expected ${CertSizeHex}: $modulePath"
+        }
+
+        $moduleCertHash = Read-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_manager_cert_sha256" `
+            -ModulePath $modulePath
+        if (-not [string]::Equals($moduleCertHash, $CertHash, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "LKM Manager certificate hash is $moduleCertHash, expected ${CertHash}: $modulePath"
+        }
+
+        $modulePackage = Read-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_manager_package" `
+            -ModulePath $modulePath
+        if (-not [string]::Equals($modulePackage, $PackageName, [StringComparison]::Ordinal)) {
+            throw "LKM Manager package is $modulePackage, expected ${PackageName}: $modulePath"
+        }
+
+        $provenanceHeaderFormat = Find-LkmMetadataValue `
+            -ModuleText $moduleText `
+            -Name "ksu_provenance_key_header_format"
+        $moduleHasProvenance = $null -ne $provenanceHeaderFormat
+        if ($null -eq $LkmProvenanceEnabled) {
+            $LkmProvenanceEnabled = $moduleHasProvenance
+        } elseif ($LkmProvenanceEnabled -ne $moduleHasProvenance) {
+            throw "LKM provenance configuration differs across KMI builds: $modulePath"
+        }
+
+        if ($moduleHasProvenance) {
+            if ($provenanceHeaderFormat -ne "2") {
+                throw "Unsupported LKM provenance key header format '$provenanceHeaderFormat': $modulePath"
+            }
+            $moduleKeyIds = (Read-LkmMetadataValue `
+                -ModuleText $moduleText `
+                -Name "ksu_provenance_key_ids" `
+                -ModulePath $modulePath).Split(',')
+            $moduleEpochTexts = (Read-LkmMetadataValue `
+                -ModuleText $moduleText `
+                -Name "ksu_provenance_minimum_epochs" `
+                -ModulePath $modulePath).Split(',')
+            if ($moduleKeyIds.Count -ne $moduleEpochTexts.Count -or $moduleKeyIds.Count -eq 0) {
+                throw "Malformed LKM provenance key metadata: $modulePath"
+            }
+            if (-not $ProvenanceSigningEnabled) {
+                throw "LKM enables provenance; supply the provenance signing parameters to build-release.ps1"
+            }
+            $keyIndex = [Array]::IndexOf($moduleKeyIds, $ProvenanceCertificateKeyId)
+            if ($keyIndex -lt 0) {
+                throw "LKM does not trust the selected provenance certificate: $modulePath"
+            }
+            $minimumEpoch = [uint64]0
+            if (-not [uint64]::TryParse($moduleEpochTexts[$keyIndex], [ref]$minimumEpoch)) {
+                throw "Invalid LKM provenance minimum epoch '$($moduleEpochTexts[$keyIndex])': $modulePath"
+            }
+            if ($ProvenanceSecurityEpoch -lt $minimumEpoch) {
+                throw "Signing epoch $ProvenanceSecurityEpoch is below LKM minimum ${minimumEpoch}: $modulePath"
+            }
+        } elseif ($ProvenanceSigningEnabled) {
+            throw "Provenance signing was requested but LKM provenance is disabled: $modulePath"
         }
     }
-    Write-Host "All LKM files recognize the selected certificate."
+    Write-Host "All LKM files match the selected Manager and provenance configuration."
 } finally {
     Remove-Item $CertDer -Force -ErrorAction SilentlyContinue
 }
@@ -346,6 +604,9 @@ $KsudByAbi = @{
 }
 
 $JniRoot = Join-Path $RepoRoot "manager\app\src\main\jniLibs"
+$ProvenanceAssetRoot = Join-Path $RepoRoot "manager\app\src\main\assets\provenance"
+$PackagedKsudByAbi = @{}
+$ProvenanceSidecars = @{}
 foreach ($abi in $KsudByAbi.Keys) {
     $ksud = $KsudByAbi[$abi]
     if (-not (Test-Path $ksud -PathType Leaf)) {
@@ -354,7 +615,49 @@ foreach ($abi in $KsudByAbi.Keys) {
 
     $abiDir = Join-Path $JniRoot $abi
     New-Item -ItemType Directory $abiDir -Force | Out-Null
-    Copy-Item $ksud (Join-Path $abiDir "libksud.so") -Force
+    $packagedKsud = Join-Path $abiDir "libksud.so"
+    Copy-Item $ksud $packagedKsud -Force
+    & $LlvmStrip --strip-unneeded $packagedKsud
+    Assert-LastExitCode "$abi ksud strip"
+    if ((Get-Item $packagedKsud).Length -le 0) {
+        throw "Stripped $abi ksud is empty: $packagedKsud"
+    }
+    $PackagedKsudByAbi[$abi] = $packagedKsud
+
+    $provenanceAbiDir = Join-Path $ProvenanceAssetRoot $abi
+    New-Item -ItemType Directory $provenanceAbiDir -Force | Out-Null
+    $packagedSidecar = Join-Path $provenanceAbiDir "ksud.provenance"
+    Remove-Item $packagedSidecar -Force -ErrorAction SilentlyContinue
+    if ($ProvenanceSigningEnabled) {
+        Write-Host "Signing provenance manifest for $abi"
+        & cargo run --quiet --release `
+            --manifest-path "$RepoRoot\userspace\ksud\Cargo.toml" `
+            -- provenance-manifest sign `
+            --image $packagedKsud `
+            --certificate $ProvenanceCertificate `
+            --private-key $ProvenancePrivateKey `
+            --output $packagedSidecar `
+            --build-id $ProvenanceBuildIdentity `
+            --roles 1 `
+            --security-epoch $ProvenanceSecurityEpoch `
+            --uapi-min 1 `
+            --uapi-max 1
+        Assert-LastExitCode "$abi provenance signing"
+
+        & cargo run --quiet --release `
+            --manifest-path "$RepoRoot\userspace\ksud\Cargo.toml" `
+            -- provenance-manifest verify `
+            --image $packagedKsud `
+            --certificate $ProvenanceCertificate `
+            --sidecar $packagedSidecar `
+            --required-role 1 `
+            --minimum-security-epoch $ProvenanceSecurityEpoch
+        Assert-LastExitCode "$abi provenance verification"
+        if ((Get-Item $packagedSidecar).Length -ne 576) {
+            throw "Unexpected $abi provenance sidecar size: $packagedSidecar"
+        }
+        $ProvenanceSidecars[$abi] = $packagedSidecar
+    }
 }
 
 Write-Host "`n=== Build Manager release APK ==="
@@ -379,6 +682,12 @@ Write-Host "`n=== Align and sign Manager APK ==="
 
 $DistDir = Join-Path $RepoRoot "dist"
 New-Item -ItemType Directory $DistDir -Force | Out-Null
+foreach ($abi in $ProvenanceSidecars.Keys) {
+    Copy-Item `
+        $ProvenanceSidecars[$abi] `
+        (Join-Path $DistDir "ksud-${abi}.provenance") `
+        -Force
+}
 if (-not $OutputApk) {
     $OutputApk = Join-Path $DistDir "KernelSU-release-signed.apk"
 } elseif (-not [IO.Path]::IsPathRooted($OutputApk)) {
@@ -412,6 +721,60 @@ Assert-LastExitCode "APK signing"
 & $ApkSigner verify --verbose --print-certs $OutputApk
 Assert-LastExitCode "APK signature verification"
 
+if ($ProvenanceSigningEnabled) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [IO.Compression.ZipFile]::OpenRead($OutputApk)
+    try {
+        foreach ($abi in $ProvenanceSidecars.Keys) {
+            $libEntryName = "lib/$abi/libksud.so"
+            $libEntry = $archive.GetEntry($libEntryName)
+            if ($null -eq $libEntry) {
+                throw "Signed APK is missing ksud executable: $libEntryName"
+            }
+            $packagedKsud = $PackagedKsudByAbi[$abi]
+            $packagedKsudSize = (Get-Item $packagedKsud).Length
+            if ($libEntry.Length -ne $packagedKsudSize) {
+                throw "Signed APK changed $abi ksud size ($($libEntry.Length), expected $packagedKsudSize)"
+            }
+            $libStream = $libEntry.Open()
+            $libSha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+                $libEntryHash = ConvertTo-LowerHex ($libSha256.ComputeHash($libStream))
+            } finally {
+                $libSha256.Dispose()
+                $libStream.Dispose()
+            }
+            $packagedKsudHash = (Get-FileHash $packagedKsud -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($libEntryHash -ne $packagedKsudHash) {
+                throw "Signed APK changed $abi ksud bytes: $libEntryName"
+            }
+
+            $entryName = "assets/provenance/$abi/ksud.provenance"
+            $entry = $archive.GetEntry($entryName)
+            if ($null -eq $entry) {
+                throw "Signed APK is missing provenance sidecar: $entryName"
+            }
+            if ($entry.Length -ne 576) {
+                throw "Signed APK provenance sidecar has wrong size ($($entry.Length)): $entryName"
+            }
+            $stream = $entry.Open()
+            $sha256 = [Security.Cryptography.SHA256]::Create()
+            try {
+                $entryHash = ConvertTo-LowerHex ($sha256.ComputeHash($stream))
+            } finally {
+                $sha256.Dispose()
+                $stream.Dispose()
+            }
+            $sourceHash = (Get-FileHash $ProvenanceSidecars[$abi] -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($entryHash -ne $sourceHash) {
+                throw "Signed APK changed provenance sidecar bytes: $entryName"
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
 Remove-Item $AlignedApk -Force -ErrorAction SilentlyContinue
 
 $FinalApk = Get-Item $OutputApk
@@ -420,3 +783,10 @@ Write-Host "`n=== Release completed ==="
 Write-Host "APK   : $($FinalApk.FullName)"
 Write-Host "Size  : $($FinalApk.Length) bytes"
 Write-Host "SHA256: $FinalHash"
+if ($ProvenanceSigningEnabled) {
+    Write-Host "Provenance build identity: $ProvenanceBuildIdentity"
+    foreach ($abi in ($ProvenanceSidecars.Keys | Sort-Object)) {
+        $sidecarOutput = Join-Path $DistDir "ksud-${abi}.provenance"
+        Write-Host "Provenance $abi : $sidecarOutput"
+    }
+}

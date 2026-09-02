@@ -28,6 +28,7 @@ import me.weishu.kernelsu.ui.webui.WebUIActivity
 private const val SCHEME_KSU = "ksu"
 private const val HOST_ACTION = "action"
 private const val HOST_WEBUI = "webui"
+private const val HOST_SECURITY_AUDIT = "audit"
 private const val PARAM_ID = "id"
 private const val PARAM_TOKEN = "token"
 
@@ -74,11 +75,15 @@ private sealed interface PendingAction {
 
     /** Open a module's WebUI — triggered by shortcut. */
     data class OpenWebUI(val moduleId: String) : PendingAction
+
+    /** Open the Security & Audit center. */
+    data object OpenSecurityAudit : PendingAction
 }
 
 private sealed interface KsuDeepLink {
     data class Action(val moduleId: String) : KsuDeepLink
     data class WebUi(val moduleId: String) : KsuDeepLink
+    data object SecurityAudit : KsuDeepLink
 }
 
 private fun buildInternalWebUiUri(moduleId: String): Uri {
@@ -126,12 +131,14 @@ private fun resolveIntent(intent: Intent): PendingAction? {
     return when (val deepLink = parseValidatedDeepLink(intent.data)) {
         is KsuDeepLink.Action -> PendingAction.ExecuteAction(deepLink.moduleId)
         is KsuDeepLink.WebUi -> PendingAction.OpenWebUI(deepLink.moduleId)
+        KsuDeepLink.SecurityAudit -> PendingAction.OpenSecurityAudit
         null -> null
     }
 }
 
 private fun parseValidatedDeepLink(uri: Uri?): KsuDeepLink? {
     if (uri?.scheme != SCHEME_KSU) return null
+    if (uri.host == HOST_SECURITY_AUDIT) return KsuDeepLink.SecurityAudit
 
     val moduleId = uri.getQueryParameter(PARAM_ID)?.takeIf { it.isNotBlank() } ?: return null
     val token = uri.getQueryParameter(PARAM_TOKEN)?.takeIf { it.isNotBlank() } ?: return null
@@ -200,6 +207,10 @@ fun IntentDispatcher(intentChannel: ReceiveChannel<Intent>) {
                 val webIntent = Intent(context, WebUIActivity::class.java)
                     .setData(buildInternalWebUiUri(action.moduleId))
                 context.startActivity(webIntent)
+            }
+
+            PendingAction.OpenSecurityAudit -> {
+                navigator.push(Route.SecurityAudit)
             }
         }
     }

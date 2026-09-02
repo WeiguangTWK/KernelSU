@@ -12,6 +12,7 @@ use std::{
     path::Path,
     process::Command,
 };
+use tempfile::NamedTempFile;
 
 use crate::defs::KSU_TEMP_BACKUP_DIR_NAME;
 use crate::{assets, boot_patch, defs, ksucalls, module, restorecon};
@@ -143,7 +144,7 @@ pub fn getprop(name: &str) -> Option<String> {
         __system_property_read_callback(
             property_info,
             property_read_callback,
-            std::ptr::from_mut(&mut value).cast(),
+            std::ptr::addr_of_mut!(value).cast(),
         );
     }
     value
@@ -231,16 +232,88 @@ fn link_ksud_to_bin() -> Result<()> {
     Ok(())
 }
 
-pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Result<()> {
+fn prepare_install_file(source: &Path, expected_size: Option<u64>) -> Result<NamedTempFile> {
+    let metadata = source
+        .metadata()
+        .with_context(|| format!("stat install source {}", source.display()))?;
+    if !metadata.is_file() {
+        bail!("install source is not a regular file: {}", source.display());
+    }
+    if let Some(expected_size) = expected_size.filter(|size| metadata.len() != *size) {
+        bail!(
+            "install source {} has size {}, expected {}",
+            source.display(),
+            metadata.len(),
+            expected_size
+        );
+    }
+
+    let mut input =
+        File::open(source).with_context(|| format!("open install source {}", source.display()))?;
+    let mut output = NamedTempFile::new_in(defs::ADB_DIR).context("create install temp file")?;
+    std::io::copy(&mut input, output.as_file_mut())
+        .with_context(|| format!("copy install source {}", source.display()))?;
+    output
+        .as_file()
+        .set_permissions(metadata.permissions())
+        .context("set install temp permissions")?;
+    output
+        .as_file()
+        .sync_all()
+        .context("sync install temp file")?;
+    restorecon::lsetfilecon(output.path(), restorecon::KSU_CON)?;
+    Ok(output)
+}
+
+fn persist_install_file(file: NamedTempFile, target: &Path) -> Result<()> {
+    file.persist(target)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replace {}", target.display()))?;
+    Ok(())
+}
+
+fn sync_adb_directory() -> Result<()> {
+    File::open(defs::ADB_DIR)?
+        .sync_all()
+        .context("sync /data/adb directory")
+}
+
+pub fn install(
+    libadbroot: Option<PathBuf>,
+    data_path: Option<PathBuf>,
+    provenance_sidecar: Option<&Path>,
+) -> Result<()> {
     ensure_dir_exists(defs::ADB_DIR)?;
-    let _ = std::fs::remove_file(defs::DAEMON_PATH);
-    std::fs::copy(
+    let daemon = prepare_install_file(
         // We should use /proc/self/exe, DO NOT resolve the real path
         // So that if someone execute /data/adb/ksud install, ksud won't be removed unexpectedly
-        "/proc/self/exe",
-        defs::DAEMON_PATH,
+        Path::new("/proc/self/exe"),
+        None,
     )?;
+    let sidecar = provenance_sidecar
+        .map(|path| {
+            prepare_install_file(path, Some(crate::provenance_manifest::SIDECAR_SIZE as u64))
+        })
+        .transpose()?;
+
+    if let Some(sidecar) = sidecar {
+        persist_install_file(sidecar, Path::new(defs::DAEMON_PROVENANCE_PATH))?;
+    } else {
+        match std::fs::remove_file(defs::DAEMON_PROVENANCE_PATH) {
+            std::result::Result::Ok(()) => {}
+            Err(error) if error.kind() == NotFound => {}
+            Err(error) => return Err(error).context("remove stale provenance sidecar"),
+        }
+    }
+    // Establish the detached manifest before switching the executable. A crash
+    // at any earlier point leaves either the old pair or a verifier mismatch.
+    sync_adb_directory()?;
+    persist_install_file(daemon, Path::new(defs::DAEMON_PATH))?;
+    sync_adb_directory()?;
     restorecon::lsetfilecon(defs::DAEMON_PATH, restorecon::KSU_CON)?;
+    if provenance_sidecar.is_some() {
+        restorecon::lsetfilecon(defs::DAEMON_PROVENANCE_PATH, restorecon::KSU_CON)?;
+    }
     // install binary assets
     assets::ensure_binaries(false).with_context(|| "Failed to extract assets")?;
 
@@ -278,17 +351,15 @@ pub fn install(libadbroot: Option<PathBuf>, data_path: Option<PathBuf>) -> Resul
 }
 
 pub fn uninstall(package_name: &str) -> Result<()> {
+    println!("- Stopping audit daemon..");
+    let _auditd_shutdown =
+        crate::auditd::stop_auditd_for_uninstall().context("stop audit daemon before uninstall")?;
+
     if Path::new(defs::MODULE_DIR).exists() {
         println!("- Uninstall modules..");
         module::uninstall_all_modules()?;
         module::prune_modules()?;
     }
-    println!("- Removing directories..");
-    std::fs::remove_dir_all(defs::WORKING_DIR).ok();
-    std::fs::remove_file(defs::DAEMON_PATH).ok();
-    std::fs::remove_dir_all(defs::MODULE_DIR).ok();
-    std::fs::remove_dir_all(defs::PREINIT_DIR_WATCHDOG).ok();
-    std::fs::remove_dir_all(defs::PREINIT_DIR_DEFAULT).ok();
     println!("- Restore boot image..");
     boot_patch::restore(BootRestoreArgs {
         boot: None,
@@ -296,6 +367,16 @@ pub fn uninstall(package_name: &str) -> Result<()> {
         out: None,
         out_name: None,
     })?;
+
+    println!("- Removing directories..");
+    remove_uninstall_path(Path::new(defs::MODULE_UPDATE_DIR))?;
+    remove_uninstall_path(Path::new(defs::MODULE_DIR))?;
+    remove_uninstall_path(Path::new(defs::METAMODULE_DIR))?;
+    remove_uninstall_path(Path::new(defs::PREINIT_DIR_WATCHDOG))?;
+    remove_uninstall_path(Path::new(defs::PREINIT_DIR_DEFAULT))?;
+    remove_uninstall_path(Path::new(defs::WORKING_DIR))?;
+    remove_uninstall_path(Path::new(defs::DAEMON_PATH))?;
+
     println!("- Uninstall KernelSU manager..");
     Command::new("pm")
         .args(["uninstall", package_name])
@@ -304,6 +385,24 @@ pub fn uninstall(package_name: &str) -> Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(5));
     Command::new("reboot").spawn()?;
     Ok(())
+}
+
+fn remove_uninstall_path(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        std::result::Result::Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect uninstall path {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path)
+            .with_context(|| format!("remove uninstall directory {}", path.display()))
+    } else {
+        std::fs::remove_file(path)
+            .with_context(|| format!("remove uninstall file {}", path.display()))
+    }
 }
 
 pub fn reset_std() -> Result<()> {

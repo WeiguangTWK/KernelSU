@@ -22,6 +22,57 @@ fi
 
 : "${KSU_EXPECTED_SIZE:?Please export KSU_EXPECTED_SIZE}"
 : "${KSU_EXPECTED_HASH:?Please export KSU_EXPECTED_HASH}"
+: "${KSU_MANAGER_PACKAGE:?Please export KSU_MANAGER_PACKAGE}"
+
+if [[ ! "$KSU_EXPECTED_SIZE" =~ ^(0[xX][0-9a-fA-F]+|0|[1-9][0-9]*)$ ]]; then
+    echo "Error: KSU_EXPECTED_SIZE must be a hexadecimal or decimal integer" >&2
+    exit 2
+fi
+if [[ ! "$KSU_EXPECTED_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "Error: KSU_EXPECTED_HASH must contain exactly 64 hexadecimal characters" >&2
+    exit 2
+fi
+if [[ ! "$KSU_MANAGER_PACKAGE" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]]; then
+    echo "Error: KSU_MANAGER_PACKAGE is not a valid Android package name" >&2
+    exit 2
+fi
+
+KSU_MANAGER_CERT_MAX_LENGTH="$({
+    sed -n 's/^#define KSU_MANAGER_CERT_MAX_LENGTH \([0-9][0-9]*\)$/\1/p' manager/apk_sign.h || true
+} | head -n 1)"
+if [[ ! "$KSU_MANAGER_CERT_MAX_LENGTH" =~ ^[0-9]+$ ]]; then
+    echo "Error: unable to read KSU_MANAGER_CERT_MAX_LENGTH" >&2
+    exit 2
+fi
+if (( KSU_EXPECTED_SIZE == 0 || KSU_EXPECTED_SIZE > KSU_MANAGER_CERT_MAX_LENGTH )); then
+    echo "Error: KSU_EXPECTED_SIZE must be between 1 and $KSU_MANAGER_CERT_MAX_LENGTH bytes" >&2
+    exit 2
+fi
+
+KSU_PROVENANCE_BUILD="${CONFIG_KSU_PROVENANCE:-n}"
+case "$KSU_PROVENANCE_BUILD" in
+    y)
+        : "${KSU_PROVENANCE_KEY_HEADER:?Please export KSU_PROVENANCE_KEY_HEADER when CONFIG_KSU_PROVENANCE=y}"
+        if [[ "$KSU_PROVENANCE_KEY_HEADER" != /* ]]; then
+            echo "Error: KSU_PROVENANCE_KEY_HEADER must be an absolute path" >&2
+            exit 2
+        fi
+        if [[ ! -f "$KSU_PROVENANCE_KEY_HEADER" || ! -r "$KSU_PROVENANCE_KEY_HEADER" ]]; then
+            echo "Error: provenance public key header is not a readable regular file: $KSU_PROVENANCE_KEY_HEADER" >&2
+            exit 2
+        fi
+        ;;
+    n)
+        if [[ -n "${KSU_PROVENANCE_KEY_HEADER:-}" ]]; then
+            echo "Error: KSU_PROVENANCE_KEY_HEADER is set but CONFIG_KSU_PROVENANCE is not y" >&2
+            exit 2
+        fi
+        ;;
+    *)
+        echo "Error: CONFIG_KSU_PROVENANCE must be y or n" >&2
+        exit 2
+        ;;
+esac
 
 DDK_BIN="${DDK_BIN:-ddk}"
 DDK_ROOT="${DDK_ROOT:-/opt/ddk}"
@@ -98,8 +149,13 @@ for kmi in "${KMIS[@]}"; do
         "KSU_EXPECTED_HASH=$KSU_EXPECTED_HASH"
     )
 
-    if [[ -n "${KSU_MANAGER_PACKAGE:-}" ]]; then
-        make_args+=("KSU_MANAGER_PACKAGE=$KSU_MANAGER_PACKAGE")
+    make_args+=("KSU_MANAGER_PACKAGE=$KSU_MANAGER_PACKAGE")
+
+    if [[ "$KSU_PROVENANCE_BUILD" == "y" ]]; then
+        make_args+=(
+            "CONFIG_KSU_PROVENANCE=y"
+            "KSU_PROVENANCE_KEY_HEADER=$KSU_PROVENANCE_KEY_HEADER"
+        )
     fi
 
     if "$DDK_BIN" build --target "$kmi" -- "${make_args[@]}"; then

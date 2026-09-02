@@ -7,7 +7,15 @@ mod android {
     pub const BINARY_DIR: &str = concatcp!(WORKING_DIR, "bin/");
     pub const LIBRARY_DIR: &str = concatcp!(WORKING_DIR, "lib/");
     pub const LOG_DIR: &str = concatcp!(WORKING_DIR, "log/");
+    pub const MODULE_AUDIT_DIR: &str = concatcp!(WORKING_DIR, "module_audit/");
+    pub const GLOBAL_AUDIT_DIR: &str = concatcp!(WORKING_DIR, "global_audit/");
+    pub const AUDIT_EMERGENCY_DIR: &str = concatcp!(WORKING_DIR, "audit_emergency/");
+    pub const AUDIT_EMERGENCY_STATUS_FILE: &str = concatcp!(AUDIT_EMERGENCY_DIR, "status.json");
     pub const SULOGD_LOCK_PATH: &str = concatcp!(WORKING_DIR, "sulogd.lock");
+    pub const AUDITD_LOCK_PATH: &str = concatcp!(WORKING_DIR, "auditd.lock");
+    pub const AUDITD_RESTART_LOG_PATH: &str = concatcp!(WORKING_DIR, "auditd.restart.log");
+    pub const AUDIT_COORD_LOCK_PATH: &str = concatcp!(WORKING_DIR, "audit-coord.lock");
+    pub const AUDIT_INSTALL_SESSION_DIR: &str = concatcp!(WORKING_DIR, "audit_install_sessions/");
 
     pub const PROFILE_DIR: &str = concatcp!(WORKING_DIR, "profile/");
     pub const PROFILE_SELINUX_DIR: &str = concatcp!(PROFILE_DIR, "selinux/");
@@ -15,6 +23,7 @@ mod android {
 
     pub const KSURC_PATH: &str = concatcp!(WORKING_DIR, ".ksurc");
     pub const DAEMON_PATH: &str = concatcp!(ADB_DIR, "ksud");
+    pub const DAEMON_PROVENANCE_PATH: &str = concatcp!(ADB_DIR, "ksud.provenance");
     pub const LIBADBROOT_PATH: &str = concatcp!(LIBRARY_DIR, "libadbroot.so");
 
     pub const DAEMON_LINK_PATH: &str = concatcp!(BINARY_DIR, "ksud");

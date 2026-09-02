@@ -4,6 +4,7 @@ import android.content.ContentResolver
 import android.content.Context
 import android.database.Cursor
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.Parcelable
 import android.os.SystemClock
@@ -14,13 +15,20 @@ import com.topjohnwu.superuser.CallbackList
 import com.topjohnwu.superuser.Shell
 import com.topjohnwu.superuser.ShellUtils
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.BuildConfig
 import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.ksuApp
+import me.weishu.kernelsu.security.AuditTransactionReceipt
+import me.weishu.kernelsu.security.parseAuditTransactionReceipt
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.Executor
+import java.util.UUID
 
 /**
  * @author weishu
@@ -101,6 +109,45 @@ fun execKsud(args: String, newShell: Boolean = false, globalMnt: Boolean = false
     }
 }
 
+suspend fun beginAuditInstallSession(timeoutSeconds: Int = 180): String = withContext(Dispatchers.IO) {
+    require(timeoutSeconds in 1..600) { "Invalid audit installation session timeout" }
+    val id = UUID.randomUUID().toString().replace("-", "")
+    check(execKsud("audit-install-session begin $id --timeout-seconds $timeoutSeconds", newShell = true)) {
+        "Unable to start the audit installation session"
+    }
+    repeat(100) {
+        val stdout = ArrayList<String>()
+        val stderr = ArrayList<String>()
+        val result = getRootShell().newJob()
+            .add("${getKsuDaemonPath()} audit-install-session status $id")
+            .to(stdout, stderr)
+            .exec()
+        if (result.isSuccess) {
+            val status = stdout.firstOrNull()?.let { JSONObject(it) }
+            val error = status
+                ?.takeUnless { it.isNull("error") }
+                ?.optString("error")
+                ?.takeIf(String::isNotBlank)
+            if (error != null) {
+                runCatching { releaseAuditInstallSession(id) }
+                throw IllegalStateException(error)
+            }
+            if (status?.optBoolean("ready") == true) return@withContext id
+        }
+        delay(100)
+    }
+    error("Timed out waiting for the audit installation session")
+}
+
+suspend fun releaseAuditInstallSession(id: String) = withContext(Dispatchers.IO) {
+    check(id.length == 32 && id.all { it in '0'..'9' || it in 'a'..'f' }) {
+        "Invalid audit installation session id"
+    }
+    check(execKsud("audit-install-session release $id", newShell = true)) {
+        "Unable to release the audit installation session"
+    }
+}
+
 suspend fun getFeatureStatus(feature: String): String = withContext(Dispatchers.IO) {
     val shell = getRootShell()
     val out = shell.newJob()
@@ -119,7 +166,35 @@ suspend fun getFeaturePersistValue(feature: String): Long? = withContext(Dispatc
 fun install() {
     val start = SystemClock.elapsedRealtime()
     val libadbroot = File(ksuApp.applicationInfo.nativeLibraryDir, "libadbroot.so").absolutePath
-    val result = execKsud("install --libadbroot $libadbroot --data-path ${ksuApp.applicationInfo.deviceProtectedDataDir}", true)
+    val provenanceAbi = Build.SUPPORTED_ABIS.firstOrNull {
+        it == "arm64-v8a" || it == "x86_64"
+    }
+    val provenanceSidecar = provenanceAbi?.let { abi ->
+        runCatching {
+            ksuApp.assets.open("provenance/$abi/ksud.provenance").use { input ->
+                File.createTempFile("ksud-", ".provenance", ksuApp.cacheDir).also { outputFile ->
+                    FileOutputStream(outputFile).use { output ->
+                        input.copyTo(output)
+                        output.fd.sync()
+                    }
+                    check(outputFile.length() == 576L) {
+                        "Invalid ksud provenance sidecar size: ${outputFile.length()}"
+                    }
+                }
+            }
+        }.onFailure {
+            Log.w(TAG, "No usable provenance sidecar for $abi", it)
+        }.getOrNull()
+    }
+    val provenanceArg = provenanceSidecar?.let { " --provenance-sidecar ${it.absolutePath}" }.orEmpty()
+    val result = try {
+        execKsud(
+            "install --libadbroot $libadbroot --data-path ${ksuApp.applicationInfo.deviceProtectedDataDir}$provenanceArg",
+            true
+        )
+    } finally {
+        provenanceSidecar?.delete()
+    }
     Log.w(TAG, "install result: $result, cost: ${SystemClock.elapsedRealtime() - start}ms")
 }
 
@@ -130,6 +205,360 @@ fun listModules(): String {
         .add("${getKsuDaemonPath()} module list").to(ArrayList(), null).exec().out
     return out.joinToString("\n").ifBlank { "[]" }
 }
+
+suspend fun getModuleAuditHistories(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} module audit-history --json")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read module audit history" }
+    }
+    stdout.joinToString("\n").ifBlank { "[]" }
+}
+
+suspend fun getGlobalAuditHistory(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} global-audit history")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read global audit history" }
+    }
+    stdout.joinToString("\n").ifBlank { "{}" }
+}
+
+suspend fun getGlobalAuditStatus(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} global-audit status")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read global audit status" }
+    }
+    stdout.joinToString("\n").also { check(it.isNotBlank()) }
+}
+
+suspend fun getGlobalAuditRevision(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} global-audit store-revision")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read global audit revision" }
+    }
+    stdout.firstOrNull()?.trim().also { check(!it.isNullOrBlank()) } ?: ""
+}
+
+suspend fun waitForGlobalAuditChange(baseline: String): Boolean = withContext(Dispatchers.IO) {
+    check(baseline.length == 64 && baseline.all { it.isLowerHexDigit() }) {
+        "Invalid global audit dashboard revision"
+    }
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = withNewRootShell {
+        newJob()
+            .add(
+                "${getKsuDaemonPath()} global-audit watch " +
+                    "--baseline $baseline --timeout-seconds 30"
+            )
+            .to(stdout, stderr)
+            .exec()
+    }
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to watch global audit state" }
+    }
+    stdout.any { line ->
+        runCatching { JSONObject(line).optString("type") == "changed" }.getOrDefault(false)
+    }
+}
+
+suspend fun streamModuleAuditDashboard(
+    installSession: String? = null,
+    onLine: (String) -> Unit,
+): Unit =
+    withContext(Dispatchers.IO) {
+        check(
+            installSession == null ||
+                (installSession.length == 32 && installSession.all { it.isLowerHexDigit() })
+        ) { "Invalid audit installation session id" }
+        val stderr = ArrayList<String>()
+        val stdout = object : CallbackList<String?>(Executor { command -> command.run() }) {
+            override fun onAddElement(value: String?) {
+                value?.takeIf(String::isNotBlank)?.let(onLine)
+            }
+        }
+        val result = withNewRootShell {
+            newJob()
+                .add(
+                    "${getKsuDaemonPath()} module audit-dashboard" +
+                        (installSession?.let { " --install-session $it" } ?: "")
+                )
+                .to(stdout, stderr)
+                .exec()
+        }
+        check(result.isSuccess) {
+            stderr.joinToString("\n").ifBlank { "Unable to refresh module audit dashboard" }
+        }
+    }
+
+suspend fun reconcileModuleAuditResponse(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-reconcile-response",
+        "Unable to reconcile module audit emergency response",
+    )
+}
+
+suspend fun getModuleAuditCheckpoint(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} module audit-checkpoint")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to read module audit checkpoint" }
+    }
+    stdout.joinToString("\n").also { check(it.isNotBlank()) }
+}
+
+suspend fun getModuleAuditAuthorizationStatus(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-auth status",
+        "Unable to read Manager audit authorization status",
+    )
+}
+
+suspend fun registerModuleAuditAuthorizationKey(
+    publicKeyHex: String,
+    recover: Boolean,
+): String = withContext(Dispatchers.IO) {
+    check(publicKeyHex.length == 130 && publicKeyHex.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization public key"
+    }
+    val operation = if (recover) "recover" else "register"
+    runModuleAuditCommand(
+        "audit-auth $operation --public-key $publicKeyHex",
+        "Unable to register Manager audit authorization key",
+    )
+}
+
+suspend fun getModuleAuditAuthorizationChallenge(
+    action: String,
+    moduleId: String? = null,
+    incidentId: String? = null,
+): String =
+    withContext(Dispatchers.IO) {
+        check(
+            action.isNotEmpty() && action.length <= 64 &&
+                action.all { it in 'a'..'z' || it == '-' }
+        ) { "Invalid audit authorization action" }
+        check(moduleId == null || moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) {
+            "Invalid module id"
+        }
+        check(incidentId == null || incidentId.length == 64 && incidentId.all { it.isLowerHexDigit() }) {
+            "Invalid audit incident id"
+        }
+        runModuleAuditCommand(
+            "audit-auth challenge $action" +
+                (moduleId?.let { " --id $it" } ?: "") +
+                (incidentId?.let { " --incident $it" } ?: ""),
+            "Unable to obtain Manager audit authorization challenge",
+        )
+    }
+
+suspend fun getModuleAuditRecoveryStatus(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-recovery-status --json",
+        "Unable to diagnose Manager-sealed audit history",
+    )
+}
+
+suspend fun recoverManagerSealedAudit(
+    moduleId: String,
+    authorization: String,
+): AuditTransactionReceipt =
+    withContext(Dispatchers.IO) {
+        check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
+        check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+            "Invalid Manager audit authorization token"
+        }
+        runAuditTransactionCommand(
+            "audit-recover-sealed $moduleId --json --authorization $authorization",
+            "Unable to recover Manager-sealed audit history",
+        )
+    }
+
+suspend fun getModuleAuditSealStatus(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-seal status",
+        "Unable to read Manager audit seal status",
+    )
+}
+
+suspend fun commitModuleAuditSeal(envelopeHex: String): String = withContext(Dispatchers.IO) {
+    check(envelopeHex.isNotEmpty() && envelopeHex.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit seal envelope"
+    }
+    val input = File.createTempFile("module-audit-seal-", ".hex", ksuApp.cacheDir)
+    try {
+        input.writeText(envelopeHex, Charsets.US_ASCII)
+        check(input.absolutePath.all { it.isLetterOrDigit() || it in "/._-" }) {
+            "Unsafe Manager audit seal path"
+        }
+        runModuleAuditCommand(
+            "audit-seal commit --file ${input.absolutePath}",
+            "Unable to commit Manager audit seal",
+        )
+    } finally {
+        input.delete()
+    }
+}
+
+suspend fun rescanInstalledModules(
+    authorization: String,
+): AuditTransactionReceipt = withContext(Dispatchers.IO) {
+    check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization token"
+    }
+    runAuditTransactionCommand(
+        "audit-rescan --json --authorization $authorization",
+        "Unable to rescan installed modules",
+    )
+}
+
+suspend fun getStaleModuleAuditHistories(): String = withContext(Dispatchers.IO) {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} module audit-prune --dry-run --json")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) {
+        stderr.joinToString("\n").ifBlank { "Unable to list stale module audit histories" }
+    }
+    stdout.joinToString("\n").ifBlank { "[]" }
+}
+
+suspend fun pruneStaleModuleAuditHistories(
+    authorization: String,
+): AuditTransactionReceipt =
+    withContext(Dispatchers.IO) {
+        check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+            "Invalid Manager audit authorization token"
+        }
+        runAuditTransactionCommand(
+            "audit-prune --json --authorization $authorization",
+            "Unable to clear stale module audit histories",
+        )
+    }
+
+suspend fun containModuleForSecureRemoval(moduleId: String): String = withContext(Dispatchers.IO) {
+    check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
+    runModuleAuditCommand(
+        "audit-contain $moduleId",
+        "Unable to contain untrusted module",
+    )
+}
+
+suspend fun securelyRemoveModule(
+    moduleId: String,
+    authorization: String,
+): AuditTransactionReceipt =
+    withContext(Dispatchers.IO) {
+        check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
+        check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+            "Invalid Manager audit authorization token"
+        }
+        runAuditTransactionCommand(
+            "audit-secure-remove $moduleId --json --authorization $authorization",
+            "Unable to securely remove untrusted module",
+        )
+    }
+
+suspend fun getModuleAuditResponseStatus(): String = withContext(Dispatchers.IO) {
+    runModuleAuditCommand(
+        "audit-response-status",
+        "Unable to read module audit response prerequisites",
+    )
+}
+
+suspend fun closeModuleAuditIncident(
+    moduleId: String,
+    incidentId: String,
+    authorization: String,
+): AuditTransactionReceipt = withContext(Dispatchers.IO) {
+    check(moduleId.matches(Regex("^[A-Za-z][A-Za-z0-9._-]+$"))) { "Invalid module id" }
+    check(incidentId.length == 64 && incidentId.all { it.isLowerHexDigit() }) {
+        "Invalid audit incident id"
+    }
+    check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization token"
+    }
+    runAuditTransactionCommand(
+        "audit-close-incident $moduleId --incident $incidentId --authorization $authorization",
+        "Unable to close module audit incident",
+    )
+}
+
+suspend fun deleteQuarantinedAuditScript(
+    entryId: String,
+    authorization: String,
+): AuditTransactionReceipt = withContext(Dispatchers.IO) {
+    check(entryId.length == 64 && entryId.all { it.isLowerHexDigit() }) {
+        "Invalid quarantined script entry id"
+    }
+    check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization token"
+    }
+    runAuditTransactionCommand(
+        "audit-delete-quarantined-script $entryId --authorization $authorization",
+        "Unable to delete quarantined startup script",
+    )
+}
+
+suspend fun retryQuarantinedAuditScriptContainment(
+    entryId: String,
+    authorization: String,
+): AuditTransactionReceipt = withContext(Dispatchers.IO) {
+    check(entryId.length == 64 && entryId.all { it.isLowerHexDigit() }) {
+        "Invalid quarantined script entry id"
+    }
+    check(authorization.isNotEmpty() && authorization.all { it.isLowerHexDigit() }) {
+        "Invalid Manager audit authorization token"
+    }
+    runAuditTransactionCommand(
+        "audit-retry-script-containment $entryId --authorization $authorization",
+        "Unable to retry startup script containment",
+    )
+}
+
+private fun runModuleAuditCommand(command: String, fallbackError: String): String {
+    val stdout = ArrayList<String>()
+    val stderr = ArrayList<String>()
+    val result = getRootShell().newJob()
+        .add("${getKsuDaemonPath()} module $command")
+        .to(stdout, stderr)
+        .exec()
+    check(result.isSuccess) { stderr.joinToString("\n").ifBlank { fallbackError } }
+    return stdout.joinToString("\n").also { check(it.isNotBlank()) }
+}
+
+private fun runAuditTransactionCommand(
+    command: String,
+    fallbackError: String,
+): AuditTransactionReceipt =
+    parseAuditTransactionReceipt(runModuleAuditCommand(command, fallbackError))
+
+private fun Char.isLowerHexDigit(): Boolean = this in '0'..'9' || this in 'a'..'f'
 
 fun getModuleCount(): Int {
     val result = listModules()

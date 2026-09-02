@@ -74,6 +74,9 @@ import me.weishu.kernelsu.ui.screen.install.InstallScreen
 import me.weishu.kernelsu.ui.screen.module.ModulePager
 import me.weishu.kernelsu.ui.screen.modulerepo.ModuleRepoDetailScreen
 import me.weishu.kernelsu.ui.screen.modulerepo.ModuleRepoScreen
+import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditScreen
+import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditCategoryScreen
+import me.weishu.kernelsu.ui.screen.securityaudit.SecurityAuditModuleScreen
 import me.weishu.kernelsu.ui.screen.settings.SettingPager
 import me.weishu.kernelsu.ui.screen.sulog.SulogScreen
 import me.weishu.kernelsu.ui.screen.superuser.SuperUserPager
@@ -188,6 +191,15 @@ class MainActivity : ComponentActivity() {
                                 entry<Route.TemplateEditor> { key -> TemplateEditorScreen(key.template, key.readOnly) }
                                 entry<Route.AppProfile> { key -> AppProfileScreen(key.uid) }
                                 entry<Route.ModuleRepo> { ModuleRepoScreen() }
+                                entry<Route.SecurityAudit> { SecurityAuditScreen() }
+                                entry<Route.SecurityAuditCategory> { key -> SecurityAuditCategoryScreen(key.category) }
+                                entry<Route.SecurityAuditModule> { key ->
+                                    SecurityAuditModuleScreen(
+                                        key.moduleId,
+                                        key.focusCategory,
+                                        key.requestSecureRemoval,
+                                    )
+                                }
                                 entry<Route.ModuleRepoDetail> { key -> ModuleRepoDetailScreen(key.module) }
                                 entry<Route.Install> { InstallScreen() }
                                 entry<Route.Flash> { key -> FlashScreen(key.flashIt) }

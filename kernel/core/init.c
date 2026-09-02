@@ -26,6 +26,7 @@
 #include "feature/adb_root.h"
 #include "feature/selinux_hide.h"
 #include "infra/symbol_resolver.h"
+#include "provenance/provenance.h"
 
 #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
 #include <asm/cpufeature.h>
@@ -85,6 +86,8 @@ module_param_named(norc, ksu_no_custom_rc, bool, 0);
 
 int __init kernelsu_init(void)
 {
+    int provenance_error;
+
 #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
     // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set
     if (!boot_cpu_has(X86_FEATURE_INDIRECT_SAFE)) {
@@ -135,6 +138,10 @@ int __init kernelsu_init(void)
     ksu_lsm_hook_init();
     ksu_selinux_hide_init();
 
+    provenance_error = ksu_provenance_init();
+    if (provenance_error)
+        pr_warn("provenance diagnostics initialization failed: %d\n", provenance_error);
+
     ksu_supercalls_init();
 
     if (ksu_late_loaded) {
@@ -180,7 +187,10 @@ int __init kernelsu_init(void)
 
 #ifdef MODULE
 #ifndef CONFIG_KSU_DEBUG
+#ifndef CONFIG_MODULE_UNLOAD
+    /* A deleted module kobject cannot be torn down safely by free_module(). */
     kobject_del(&THIS_MODULE->mkobj.kobj);
+#endif
 #endif
 #endif
     return 0;
@@ -206,6 +216,7 @@ void __exit kernelsu_exit(void)
 
     ksu_allowlist_exit();
 
+    ksu_provenance_exit();
     ksu_selinux_hide_exit();
     ksu_lsm_hook_exit();
     ksu_adb_root_exit();
@@ -225,6 +236,12 @@ module_exit(kernelsu_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("weishu");
 MODULE_DESCRIPTION("Android KernelSU");
+MODULE_INFO(ksu_manager_identity_version, "1");
+MODULE_INFO(ksu_manager_cert_size, __stringify(EXPECTED_SIZE));
+MODULE_INFO(ksu_manager_cert_sha256, EXPECTED_HASH);
+#ifdef KSU_MANAGER_PACKAGE
+MODULE_INFO(ksu_manager_package, KSU_MANAGER_PACKAGE);
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
 #else

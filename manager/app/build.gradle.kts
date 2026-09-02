@@ -94,6 +94,8 @@ android {
         jniLibs {
             useLegacyPackaging = true
             excludes += "lib/*/libandroidx.graphics.path.so"
+            // build-release.ps1 strips and signs these exact bytes before Gradle runs.
+            keepDebugSymbols += "**/libksud.so"
         }
     }
 
@@ -167,6 +169,8 @@ base {
 }
 
 dependencies {
+    testImplementation(kotlin("test"))
+
     implementation(libs.androidx.activity.compose)
 
     implementation(platform(libs.androidx.compose.bom))

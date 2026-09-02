@@ -21,6 +21,9 @@
 #include "sulog/event.h"
 #include "sulog/fd.h"
 #include "supercall/supercall.h"
+#include "provenance/provenance.h"
+#include "provenance/eligibility.h"
+#include "provenance/context.h"
 
 static int do_grant_root(void __user *arg)
 {
@@ -92,6 +95,64 @@ static int do_get_info_legacy(void __user *arg)
     return 0;
 }
 
+static int do_get_provenance_info(void __user *arg)
+{
+    struct ksu_provenance_info_v1 info;
+
+    ksu_provenance_get_info(&info);
+    if (copy_to_user(arg, &info, sizeof(info))) {
+        pr_err("get_provenance_info: copy_to_user failed\n");
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static int do_get_provenance_eligibility(void __user *arg)
+{
+    struct ksu_provenance_eligibility_info_v1 info;
+
+    ksu_provenance_get_eligibility_info(&info);
+    if (copy_to_user(arg, &info, sizeof(info))) {
+        pr_err("get_provenance_eligibility: copy_to_user failed\n");
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static int do_get_provenance_context_status(void __user *arg)
+{
+    struct ksu_provenance_context_status_v1 status;
+
+    ksu_provenance_get_context_status(&status);
+    if (copy_to_user(arg, &status, sizeof(status))) {
+        pr_err("get_provenance_context_status: copy_to_user failed\n");
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static int do_get_provenance_current_context(void __user *arg)
+{
+    struct ksu_provenance_current_context_v1 current_context;
+    int error;
+
+    error = ksu_provenance_get_current_context(&current_context);
+    if (error)
+        return error;
+    if (copy_to_user(arg, &current_context, sizeof(current_context)))
+        return -EFAULT;
+    return 0;
+}
+
+static int do_provenance_control(void __user *arg)
+{
+    struct ksu_provenance_control_cmd_v1 command;
+
+    if (copy_from_user(&command, arg, sizeof(command)))
+        return -EFAULT;
+    return ksu_provenance_handle_control(&command);
+}
+
 static int do_report_event(void __user *arg)
 {
     struct ksu_report_event_cmd cmd;
@@ -105,6 +166,7 @@ static int do_report_event(void __user *arg)
         static bool post_fs_data_lock = false;
         if (!post_fs_data_lock) {
             post_fs_data_lock = true;
+            ksu_provenance_note_post_fs_data(current);
             if (ksu_late_loaded) {
                 pr_info("post-fs-data skipped (late load)\n");
             } else {
@@ -710,6 +772,36 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
         .perm_check = always_allow
     },
     {
+        .cmd = KSU_IOCTL_PROVENANCE_GET_INFO,
+        .name = "PROVENANCE_GET_INFO",
+        .handler = do_get_provenance_info,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_PROVENANCE_GET_ELIGIBILITY,
+        .name = "PROVENANCE_GET_ELIGIBILITY",
+        .handler = do_get_provenance_eligibility,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_PROVENANCE_CONTROL,
+        .name = "PROVENANCE_CONTROL",
+        .handler = do_provenance_control,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_PROVENANCE_GET_CONTEXT_STATUS,
+        .name = "PROVENANCE_GET_CONTEXT_STATUS",
+        .handler = do_get_provenance_context_status,
+        .perm_check = always_allow
+    },
+    {
+        .cmd = KSU_IOCTL_PROVENANCE_GET_CURRENT_CONTEXT,
+        .name = "PROVENANCE_GET_CURRENT_CONTEXT",
+        .handler = do_get_provenance_current_context,
+        .perm_check = always_allow
+    },
+    {
         .cmd = KSU_IOCTL_REPORT_EVENT,
         .name = "REPORT_EVENT",
         .handler = do_report_event,
@@ -847,6 +939,23 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
 long ksu_supercall_handle_ioctl(unsigned int cmd, void __user *argp)
 {
     int i;
+
+#ifdef CONFIG_KSU_PROVENANCE
+    if (ksu_provenance_current_is_tagged()) {
+        switch (cmd) {
+        case KSU_IOCTL_GET_INFO:
+        case KSU_IOCTL_GET_INFO_LEGACY:
+        case KSU_IOCTL_CHECK_SAFEMODE:
+        case KSU_IOCTL_PROVENANCE_GET_INFO:
+        case KSU_IOCTL_PROVENANCE_GET_ELIGIBILITY:
+        case KSU_IOCTL_PROVENANCE_GET_CONTEXT_STATUS:
+        case KSU_IOCTL_PROVENANCE_GET_CURRENT_CONTEXT:
+            break;
+        default:
+            return -EPERM;
+        }
+    }
+#endif
 
 #ifdef CONFIG_KSU_DEBUG
     pr_info("ksu ioctl: cmd=0x%x from uid=%d\n", cmd, current_uid().val);

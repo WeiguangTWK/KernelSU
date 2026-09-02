@@ -29,12 +29,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.parcelize.Parcelize
 import me.weishu.kernelsu.R
+import me.weishu.kernelsu.ksuApp
 import me.weishu.kernelsu.ui.util.FlashResult
 import me.weishu.kernelsu.ui.util.LkmSelection
 import me.weishu.kernelsu.ui.util.flashModule
 import me.weishu.kernelsu.ui.util.installBoot
+import me.weishu.kernelsu.ui.util.listModules
 import me.weishu.kernelsu.ui.util.restoreBoot
+import me.weishu.kernelsu.ui.util.toggleModule
 import me.weishu.kernelsu.ui.util.uninstallPermanently
+import org.json.JSONArray
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -89,22 +93,59 @@ sealed class FlashIt : Parcelable {
     data object FlashUninstall : FlashIt()
 }
 
-fun flashModulesSequentially(
+suspend fun flashModulesSequentially(
     uris: List<Uri>,
     onStdout: (String) -> Unit,
     onStderr: (String) -> Unit
 ): FlashResult {
-    for (uri in uris) {
-        flashModule(uri, onStdout, onStderr).apply {
-            if (code != 0) {
-                return FlashResult(code, err, showReboot)
+    return try {
+        onStdout("- Waiting for the audit coordinator")
+        ksuApp.auditCoordinator.withInstallationSession {
+            var result = FlashResult(0, "", true)
+            // Establish and seal a Manager-trusted baseline before the first
+            // installation operation is written. The coordinator keeps the
+            // same checkpoint state through the final seal and HMAC rotation.
+            onStdout("- Verifying the module audit baseline")
+            seal()
+            val before = moduleEnabledStates()
+            for (uri in uris) {
+                val installed = flashModule(uri, onStdout, onStderr)
+                if (installed.code != 0) {
+                    result = installed
+                    break
+                }
             }
+            if (result.code == 0) {
+                onStdout("- Verifying and sealing the installed modules")
+                val after = moduleEnabledStates()
+                val intendedEnabled = before.filterValues { it }.keys + (after.keys - before.keys)
+                val trust = seal()
+                val restore = intendedEnabled.intersect(trust.releasableModuleIds)
+                val failed = restore.filterNot { toggleModule(it, enable = true) }
+                check(failed.isEmpty()) {
+                    "Unable to release sealed module isolation: ${failed.joinToString()}"
+                }
+            }
+            result
         }
+    } catch (error: Throwable) {
+        val message = error.message ?: error::class.java.simpleName
+        onStderr(message)
+        FlashResult(1, message, false)
     }
-    return FlashResult(0, "", true)
 }
 
-fun flashIt(
+private fun moduleEnabledStates(): Map<String, Boolean> {
+    val modules = JSONArray(listModules())
+    return buildMap {
+        for (index in 0 until modules.length()) {
+            val module = modules.getJSONObject(index)
+            put(module.getString("id"), module.getBoolean("enabled"))
+        }
+    }
+}
+
+suspend fun flashIt(
     flashIt: FlashIt,
     onStdout: (String) -> Unit,
     onStderr: (String) -> Unit

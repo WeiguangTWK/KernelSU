@@ -1,9 +1,16 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
+use std::collections::BTreeSet;
 use std::fs;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::utils;
+
+const CLIENT_QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
+const MODULE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const UNLOAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Find PIDs of processes running in the KernelSU su domain (u:r:ksu:s0).
 /// Returns a list of PIDs excluding our own.
@@ -36,7 +43,14 @@ fn find_su_domain_pids() -> Vec<i32> {
     pids
 }
 
-/// Find PIDs of processes holding ksu_driver or ksu_fdwrapper file descriptors.
+fn is_ksu_control_fd(target: &str) -> bool {
+    target.contains("[ksu_driver]")
+        || target.contains("[ksu_fdwrapper]")
+        || target.contains("[ksu_provenance_supervisor]")
+        || target.contains("[ksu_provenance_launch]")
+}
+
+/// Find PIDs of processes holding KernelSU control file descriptors.
 /// Returns a list of PIDs excluding our own.
 fn find_ksu_fd_holders() -> Vec<i32> {
     let my_pid = std::process::id() as i32;
@@ -64,7 +78,7 @@ fn find_ksu_fd_holders() -> Vec<i32> {
             let link_path = fd_entry.path();
             if let Ok(target) = fs::read_link(&link_path) {
                 let target_str = target.to_string_lossy();
-                if target_str.contains("[ksu_driver]") || target_str.contains("[ksu_fdwrapper]") {
+                if is_ksu_control_fd(&target_str) {
                     pids.push(pid);
                     break;
                 }
@@ -83,7 +97,38 @@ fn kill_pids(pids: &[i32], signal: i32) {
     }
 }
 
-/// Close all ksu_driver and ksu_fdwrapper fds held by the current process.
+fn remaining_ksu_client_pids() -> Vec<i32> {
+    find_su_domain_pids()
+        .into_iter()
+        .chain(find_ksu_fd_holders())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn terminate_ksu_clients() -> Result<()> {
+    let deadline = Instant::now() + CLIENT_QUIESCE_TIMEOUT;
+
+    loop {
+        let pids = remaining_ksu_client_pids();
+        if pids.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "unload: terminating {} remaining KernelSU client processes: {pids:?}",
+            pids.len()
+        );
+        kill_pids(&pids, libc::SIGKILL);
+
+        if Instant::now() >= deadline {
+            bail!("KernelSU client processes did not quiesce before timeout: {pids:?}");
+        }
+        thread::sleep(UNLOAD_POLL_INTERVAL);
+    }
+}
+
+/// Close all KernelSU control fds held by the current process.
 fn close_ksu_fds() {
     let Ok(entries) = fs::read_dir("/proc/self/fd") else {
         return;
@@ -95,7 +140,7 @@ fn close_ksu_fds() {
         };
         if let Ok(target) = fs::read_link(entry.path()) {
             let target_str = target.to_string_lossy();
-            if target_str.contains("[ksu_driver]") || target_str.contains("[ksu_fdwrapper]") {
+            if is_ksu_control_fd(&target_str) {
                 info!("unload: closing fd {fd} -> {target_str}");
                 unsafe {
                     libc::close(fd);
@@ -105,52 +150,97 @@ fn close_ksu_fds() {
     }
 }
 
+fn delete_kernelsu_module() -> Result<()> {
+    let deadline = Instant::now() + MODULE_UNLOAD_TIMEOUT;
+    let mut attempt = 1_u32;
+
+    loop {
+        match rustix::system::delete_module(c"kernelsu", 0) {
+            Ok(()) => return Ok(()),
+            Err(error) if error == rustix::io::Errno::AGAIN && Instant::now() < deadline => {
+                let pids = remaining_ksu_client_pids();
+                if pids.is_empty() {
+                    warn!(
+                        "unload: module is still referenced with no visible client; retrying attempt {}",
+                        attempt + 1
+                    );
+                } else {
+                    warn!(
+                        "unload: module is still referenced; terminating clients before attempt {}: {pids:?}",
+                        attempt + 1
+                    );
+                    kill_pids(&pids, libc::SIGKILL);
+                }
+                attempt += 1;
+                thread::sleep(UNLOAD_POLL_INTERVAL);
+            }
+            Err(error) => {
+                bail!("delete_module kernelsu failed after {attempt} attempt(s): {error}");
+            }
+        }
+    }
+}
+
+fn set_android_services(command: &str) -> Result<()> {
+    let status = Command::new(command)
+        .status()
+        .with_context(|| format!("run Android {command}"))?;
+    ensure!(status.success(), "Android {command} failed: {status}");
+    Ok(())
+}
+
+fn recover_services() {
+    info!("unload: restarting Android services after failed unload...");
+    if let Err(error) = set_android_services("start") {
+        warn!("unload: failed to restart Android services: {error:#}");
+    }
+}
+
 pub fn unload() -> Result<()> {
     info!("unload: starting KernelSU unload sequence");
 
     // 0. Switch cgroups so we don't get killed along with our parent shell
     utils::switch_cgroups();
 
-    // 1. stop (Android init stop command - stops all services)
+    // 1. Stop auditd explicitly. It is a disabled init service and is not
+    // covered reliably by Android's global stop/start commands.
+    info!("unload: stopping audit daemon...");
+    let auditd_shutdown = crate::auditd::stop_auditd_for_uninstall()
+        .context("stop audit daemon before unloading KernelSU")?;
+
+    // 2. stop (Android init stop command - stops all services)
     info!("unload: stopping Android services...");
-    let _ = Command::new("stop").status();
+    let unload_result = (|| -> Result<()> {
+        set_android_services("stop")?;
 
-    // 2. Kill all su domain processes and processes holding ksu fds (except ourselves)
-    info!("unload: killing su domain processes...");
-    let su_pids = find_su_domain_pids();
-    if !su_pids.is_empty() {
-        info!(
-            "unload: found {} su domain processes, sending SIGKILL",
-            su_pids.len()
-        );
-        kill_pids(&su_pids, libc::SIGKILL);
+        // 3. Close our visible driver descriptors before waiting for every
+        // other KernelSU client to exit.
+        info!("unload: closing all visible local ksu fds...");
+        close_ksu_fds();
+
+        info!("unload: quiescing KernelSU client processes...");
+        terminate_ksu_clients()?;
+
+        // 4. delete_module("kernelsu") with a bounded EAGAIN retry window.
+        info!("unload: removing kernelsu module...");
+        delete_kernelsu_module()
+    })();
+
+    if let Err(error) = unload_result {
+        recover_services();
+        auditd_shutdown.resume_after_failed_shutdown();
+        return Err(error);
     }
 
-    info!("unload: killing processes holding ksu fds...");
-    let fd_pids = find_ksu_fd_holders();
-    if !fd_pids.is_empty() {
-        info!(
-            "unload: found {} processes holding ksu fds, sending SIGKILL",
-            fd_pids.len()
-        );
-        kill_pids(&fd_pids, libc::SIGKILL);
-    }
-
-    // 3. Close all our own ksu_driver and ksu_fdwrapper fds
-    info!("unload: closing all ksu fds...");
-    close_ksu_fds();
-
-    // 4. delete_module("kernelsu")
-    info!("unload: removing kernelsu module...");
-    if let Err(e) = rustix::system::delete_module(c"kernelsu", 0) {
-        warn!("unload: delete_module kernelsu failed: {e}");
-    }
-
-    // 5. start (Android init start command - restarts all services)
+    // 5. start (Android init start command - restarts all services). Auditd
+    // remains stopped because its disabled service is not part of global start.
     info!("unload: restarting Android services...");
-    let _ = Command::new("start").status();
+    if let Err(error) = set_android_services("start") {
+        warn!("unload: KernelSU was removed but Android services failed to restart: {error:#}");
+    }
 
-    // 6. Exit
+    // 6. Exit without restarting auditd after the module has been removed.
+    drop(auditd_shutdown);
     info!("unload: done, exiting ksud");
-    std::process::exit(0);
+    Ok(())
 }

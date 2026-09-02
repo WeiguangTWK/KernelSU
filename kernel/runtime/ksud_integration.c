@@ -12,6 +12,7 @@
 #include <linux/version.h>
 #include <linux/input-event-codes.h>
 #include <linux/kprobes.h>
+#include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
@@ -28,9 +29,10 @@
 #include "selinux/selinux.h"
 #include "hook/syscall_hook.h"
 #include "hook/syscall_event_bridge.h"
+#include "provenance/eligibility.h"
 
 // clang-format off
-static const char KERNEL_SU_RC[] =
+static const char KERNEL_SU_RC_BASE[] =
     "\n"
     "on post-fs-data\n"
     "    start logd\n"
@@ -47,12 +49,45 @@ static const char KERNEL_SU_RC[] =
     "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " boot-completed\n"
     "\n"
     "\n";
+
+static const char KERNEL_SU_RC_PROVENANCE[] =
+    "\n"
+    "service ksu_provenance " KSUD_PATH " provenance-supervisor --boot-claim-nonce %s\n"
+    "    user root\n"
+    "    group root\n"
+    "    seclabel u:r:" KERNEL_SU_DOMAIN ":s0\n"
+    "    disabled\n"
+    "    oneshot\n"
+    "\n"
+    "on post-fs-data\n"
+    "    start logd\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " provenance-stage\n"
+    "    start ksu_provenance\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " post-fs-data\n"
+    "\n"
+    "on nonencrypted\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " services\n"
+    "\n"
+    "on property:vold.decrypt=trigger_restart_framework\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " services\n"
+    "\n"
+    "on property:sys.boot_completed=1\n"
+    "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " boot-completed\n"
+    "\n"
+    "\n";
 // clang-format on
+
+#define KSU_RC_MAX_SIZE 2048
+static char KERNEL_SU_RC[KSU_RC_MAX_SIZE];
 
 static void stop_init_rc_hook();
 static void stop_execve_hook();
+static void stop_input_hook_sync(void);
 
 static struct work_struct stop_input_hook_work;
+static DEFINE_MUTEX(input_hook_mutex);
+static atomic_t input_hook_stop_requested = ATOMIC_INIT(0);
+static bool input_hook_registered;
 
 #define MAX_ARG_STRINGS 0x7FFFFFFF
 struct user_arg_ptr {
@@ -183,7 +218,7 @@ static ssize_t (*orig_read)(struct file *, char __user *, size_t, loff_t *);
 static ssize_t (*orig_read_iter)(struct kiocb *, struct iov_iter *);
 static struct file_operations fops_proxy;
 static ssize_t ksu_rc_pos = 0;
-const size_t ksu_rc_len = sizeof(KERNEL_SU_RC) - 1;
+static size_t ksu_rc_len;
 
 // Prefer /metadata/watchdog/ when present, else /metadata.
 #define MODULE_RC_PATH_WATCHDOG "/metadata/watchdog/ksu/modules.rc"
@@ -470,6 +505,9 @@ static void ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *
 }
 
 static unsigned int volumedown_pressed_count = 0;
+static DEFINE_MUTEX(safe_mode_mutex);
+static bool safe_mode_checked;
+static bool safe_mode;
 
 static bool is_volumedown_enough(unsigned int count)
 {
@@ -495,28 +533,28 @@ int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *v
 
 bool ksu_is_safe_mode()
 {
-    static bool safe_mode = false;
-    if (safe_mode) {
-        // don't need to check again, userspace may call multiple times
-        return true;
-    }
-
     if (ksu_late_loaded) {
         return false;
     }
 
-    // stop hook first!
-    ksu_stop_input_hook_runtime();
+    mutex_lock(&safe_mode_mutex);
+    if (safe_mode_checked)
+        goto out;
+
+    /* Stop sampling before caching the immutable early-boot result. */
+    stop_input_hook_sync();
 
     pr_info("volumedown_pressed_count: %d\n", volumedown_pressed_count);
-    if (is_volumedown_enough(volumedown_pressed_count)) {
+    safe_mode = is_volumedown_enough(volumedown_pressed_count);
+    safe_mode_checked = true;
+    if (safe_mode) {
         // pressed over 3 times
         pr_info("KEY_VOLUMEDOWN pressed max times, safe mode detected!\n");
-        safe_mode = true;
-        return true;
     }
 
-    return false;
+out:
+    mutex_unlock(&safe_mode_mutex);
+    return safe_mode;
 }
 
 void ksu_execve_hook_ksud(const struct pt_regs *regs)
@@ -609,9 +647,27 @@ static struct kprobe input_event_kp = {
     .pre_handler = input_handle_event_handler_pre,
 };
 
+static void stop_input_hook(void)
+{
+    mutex_lock(&input_hook_mutex);
+    if (input_hook_registered) {
+        unregister_kprobe(&input_event_kp);
+        input_hook_registered = false;
+    }
+    mutex_unlock(&input_hook_mutex);
+}
+
+static void stop_input_hook_sync(void)
+{
+    atomic_set(&input_hook_stop_requested, 1);
+    stop_input_hook();
+    cancel_work_sync(&stop_input_hook_work);
+}
+
 static void do_stop_input_hook(struct work_struct *work)
 {
-    unregister_kprobe(&input_event_kp);
+    (void)work;
+    stop_input_hook();
 }
 
 static void stop_init_rc_hook()
@@ -623,11 +679,9 @@ static void stop_init_rc_hook()
 
 void ksu_stop_input_hook_runtime(void)
 {
-    static bool input_hook_stopped = false;
-    if (input_hook_stopped) {
+    if (atomic_xchg(&input_hook_stop_requested, 1)) {
         return;
     }
-    input_hook_stopped = true;
     bool ret = schedule_work(&stop_input_hook_work);
     pr_info("unregister input kprobe: %d!\n", ret);
 }
@@ -635,15 +689,36 @@ void ksu_stop_input_hook_runtime(void)
 // ksud: module support
 void __init ksu_ksud_init()
 {
+    char nonce[33];
     int ret;
+
+    if (ksu_provenance_get_boot_claim_nonce_hex(nonce)) {
+        ret = snprintf(KERNEL_SU_RC, sizeof(KERNEL_SU_RC),
+                       KERNEL_SU_RC_PROVENANCE, nonce);
+        if (ret < 0 || (size_t)ret >= sizeof(KERNEL_SU_RC)) {
+            pr_err("ksud: provenance rc exceeds fixed buffer\n");
+            strscpy(KERNEL_SU_RC, KERNEL_SU_RC_BASE,
+                    sizeof(KERNEL_SU_RC));
+        }
+    } else {
+        strscpy(KERNEL_SU_RC, KERNEL_SU_RC_BASE,
+                sizeof(KERNEL_SU_RC));
+    }
+    ksu_rc_len = strlen(KERNEL_SU_RC);
+
+    INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
+    atomic_set(&input_hook_stop_requested, 0);
+    safe_mode_checked = false;
+    safe_mode = false;
 
     ksu_syscall_table_hook(__NR_read, ksu_sys_read, &orig_sys_read);
     ksu_syscall_table_hook(__NR_fstat, ksu_sys_fstat, &orig_sys_fstat);
 
+    mutex_lock(&input_hook_mutex);
     ret = register_kprobe(&input_event_kp);
+    input_hook_registered = ret == 0;
+    mutex_unlock(&input_hook_mutex);
     pr_info("ksud: input_event_kp: %d\n", ret);
-
-    INIT_WORK(&stop_input_hook_work, do_stop_input_hook);
 }
 
 void __exit ksu_ksud_exit()
@@ -651,7 +726,8 @@ void __exit ksu_ksud_exit()
     // TODO:
     // this should be done before unregister vfs_read_kp
     // stop_init_rc_hook();
-    unregister_kprobe(&input_event_kp);
+    /* Block new stop requests, detach the hook, then drain queued work. */
+    stop_input_hook_sync();
 
     if (module_rc_buf) {
         free_module_rc();

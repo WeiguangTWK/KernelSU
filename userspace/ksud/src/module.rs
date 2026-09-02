@@ -1,7 +1,10 @@
 #[allow(clippy::wildcard_imports)]
 use crate::utils::*;
 use crate::{
-    assets, defs, ksucalls, metamodule,
+    assets, defs, ksucalls, metamodule, module_audit,
+    module_audit_action::AuditAction,
+    module_audit_log,
+    module_audit_transaction::{self, AuditTransaction},
     restorecon::{restore_syscon, setsyscon},
     sepolicy,
 };
@@ -138,6 +141,11 @@ pub fn foreach_module(
         _ => defs::MODULE_DIR,
     });
     let dir = std::fs::read_dir(modules_dir)?;
+    let audit_containment = if module_type == Active {
+        Some(crate::module_response::active_containment_ids()?)
+    } else {
+        None
+    };
     for entry in dir.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -148,6 +156,19 @@ pub fn foreach_module(
         if module_type == Active && path.join(defs::DISABLE_FILE_NAME).exists() {
             info!("{} is disabled, skip", path.display());
             continue;
+        }
+        if module_type == Active {
+            let module_id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            if audit_containment
+                .as_ref()
+                .is_some_and(|contained| contained.contains(module_id))
+            {
+                warn!("{} is audit-contained, skip", path.display());
+                continue;
+            }
         }
         if module_type == Active && path.join(defs::REMOVE_FILE_NAME).exists() {
             warn!("{} is removed, skip", path.display());
@@ -312,11 +333,23 @@ pub fn prune_modules() -> Result<()> {
             return Ok(());
         }
 
+        let module_id = module.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        match crate::module_response::intercept_unsafe_normal_uninstall(module) {
+            Ok(true) => {
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    "cannot verify whether module {module_id} is safe to uninstall: {error:#}; refusing uninstall scripts"
+                );
+                return Ok(());
+            }
+        }
+
         info!("remove module: {}", module.display());
 
         // Execute metamodule's metauninstall.sh first
-        let module_id = module.file_name().and_then(|n| n.to_str()).unwrap_or("");
-
         // Check if this is a metamodule
         let is_metamodule =
             read_module_prop(module).is_ok_and(|props| metamodule::is_metamodule(&props));
@@ -408,6 +441,26 @@ fn collect_rc_files<P: AsRef<Path>>(
     Ok(())
 }
 
+fn append_auditd_init_rc(out: &mut dyn Write) -> Result<()> {
+    writeln!(out, "# === KernelSU auditd service ===")?;
+    writeln!(out, "service ksud-auditd {} auditd", defs::DAEMON_PATH)?;
+    writeln!(out, "    class main")?;
+    writeln!(out, "    user root")?;
+    writeln!(out, "    group root")?;
+    writeln!(out, "    seclabel u:r:ksu:s0")?;
+    writeln!(out, "    disabled")?;
+    writeln!(out, "    restart_period 5")?;
+    writeln!(
+        out,
+        "    onrestart exec u:r:ksu:s0 root -- {} auditd-restart-notify",
+        defs::DAEMON_PATH
+    )?;
+    writeln!(out, "on post-fs-data")?;
+    writeln!(out, "    start ksud-auditd")?;
+    writeln!(out)?;
+    Ok(())
+}
+
 /// Rebuild PREINITDIR/modules.rc by concatenating *.rc from every enabled
 /// module. The kernel-side read hook splices this file into init.rc on the
 /// next boot.
@@ -458,6 +511,7 @@ pub fn regenerate_preinit_rc() -> Result<()> {
                 collect_rc_files(path.join(defs::MODULE_INIT_RC_DIR), Some(&id), &mut tmp)?;
             }
         }
+        append_auditd_init_rc(&mut tmp)?;
         tmp.sync_all()?;
     }
 
@@ -555,6 +609,7 @@ fn install_module_to_system(zip: &str) -> Result<()> {
     // Validate module_id format
     validate_module_id(module_id)
         .with_context(|| format!("Invalid module ID in module.prop: '{module_id}'"))?;
+    crate::module_response::ensure_action_allowed(module_id, "update")?;
 
     // Check if this module is a metamodule
     let is_metamodule = metamodule::is_metamodule(&module_prop);
@@ -619,51 +674,83 @@ fn install_module_to_system(zip: &str) -> Result<()> {
         humansize::format_size(zip_uncompressed_size, humansize::DECIMAL)
     );
 
-    // Ensure module directory exists and set SELinux context
-    ensure_dir_exists(defs::MODULE_UPDATE_DIR)?;
-    setsyscon(defs::MODULE_UPDATE_DIR)?;
+    // Audit the exact package before extracting or executing any module-controlled content.
+    let audit_report = module_audit::audit_before_install(zip)?;
+    let audit_receipt =
+        module_audit_log::begin_install(Path::new(defs::MODULE_AUDIT_DIR), audit_report)
+            .context("persist accepted module audit")?;
 
-    // Prepare target directory
-    println!("- Installing to {}", updated_dir.display());
-    ensure_clean_dir(&updated_dir)?;
-    info!("target dir: {}", updated_dir.display());
+    let install_result = (|| -> Result<()> {
+        // Ensure module directory exists and set SELinux context
+        ensure_dir_exists(defs::MODULE_UPDATE_DIR)?;
+        setsyscon(defs::MODULE_UPDATE_DIR)?;
 
-    // Extract zip to target directory
-    println!("- Extracting module files");
-    let file = File::open(zip)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    archive.extract(&updated_dir)?;
+        // Prepare target directory
+        println!("- Installing to {}", updated_dir.display());
+        ensure_clean_dir(&updated_dir)?;
+        info!("target dir: {}", updated_dir.display());
 
-    // Set permission and selinux context for $MOD/system
-    let module_system_dir = updated_dir.join("system");
-    if module_system_dir.exists() {
-        #[cfg(unix)]
-        set_permissions(&module_system_dir, Permissions::from_mode(0o755))?;
-        restore_syscon(&module_system_dir)?;
+        // Extract zip to target directory
+        println!("- Extracting module files");
+        let file = File::open(zip)?;
+        let mut archive = zip::ZipArchive::new(file)?;
+        archive.extract(&updated_dir)?;
+
+        // Set permission and selinux context for $MOD/system
+        let module_system_dir = updated_dir.join("system");
+        if module_system_dir.exists() {
+            #[cfg(unix)]
+            set_permissions(&module_system_dir, Permissions::from_mode(0o755))?;
+            restore_syscon(&module_system_dir)?;
+        }
+
+        // Execute install script
+        println!("- Running module installer");
+        exec_install_script(zip, is_metamodule, module_id)?;
+
+        let module_dir = Path::new(MODULE_DIR).join(module_id);
+        ensure_dir_exists(&module_dir)?;
+        copy(
+            updated_dir.join("module.prop"),
+            module_dir.join("module.prop"),
+        )?;
+        ensure_file_exists(module_dir.join(UPDATE_FILE_NAME))?;
+
+        // Create symlink for metamodule
+        if is_metamodule {
+            println!("- Creating metamodule symlink");
+            metamodule::ensure_symlink(&module_dir)?;
+        }
+
+        println!("- Module installed successfully!");
+        info!("Module {module_id} installed successfully!");
+
+        Ok(())
+    })();
+
+    let outcome = if install_result.is_ok() {
+        module_audit_log::InstallOutcome::Installed
+    } else {
+        module_audit_log::InstallOutcome::InstallationFailed
+    };
+    let install_error = install_result
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    let audit_log_result = module_audit_log::finish_install(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        audit_receipt,
+        outcome,
+        install_error,
+    );
+    match (install_result, audit_log_result) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Ok(()), Err(log_error)) => Err(log_error.context("persist accepted module audit")),
+        (Err(install_error), Ok(_)) => Err(install_error),
+        (Err(install_error), Err(log_error)) => Err(install_error.context(format!(
+            "additionally failed to persist accepted module audit: {log_error:#}"
+        ))),
     }
-
-    // Execute install script
-    println!("- Running module installer");
-    exec_install_script(zip, is_metamodule, module_id)?;
-
-    let module_dir = Path::new(MODULE_DIR).join(module_id);
-    ensure_dir_exists(&module_dir)?;
-    copy(
-        updated_dir.join("module.prop"),
-        module_dir.join("module.prop"),
-    )?;
-    ensure_file_exists(module_dir.join(UPDATE_FILE_NAME))?;
-
-    // Create symlink for metamodule
-    if is_metamodule {
-        println!("- Creating metamodule symlink");
-        metamodule::ensure_symlink(&module_dir)?;
-    }
-
-    println!("- Module installed successfully!");
-    info!("Module {module_id} installed successfully!");
-
-    Ok(())
 }
 
 pub fn install_module(zip: &str) -> Result<()> {
@@ -680,6 +767,7 @@ pub fn install_module(zip: &str) -> Result<()> {
 
 pub fn undo_uninstall_module(id: &str) -> Result<()> {
     validate_module_id(id)?;
+    crate::module_response::ensure_action_allowed(id, "undo uninstall")?;
 
     let module_path = Path::new(defs::MODULE_DIR).join(id);
     ensure!(module_path.exists(), "Module {id} not found");
@@ -701,6 +789,7 @@ pub fn undo_uninstall_module(id: &str) -> Result<()> {
 
 pub fn uninstall_module(id: &str) -> Result<()> {
     validate_module_id(id)?;
+    crate::module_response::ensure_action_allowed(id, "uninstall")?;
 
     let module_path = Path::new(defs::MODULE_DIR).join(id);
     ensure!(module_path.exists(), "Module {id} not found");
@@ -720,6 +809,7 @@ pub fn uninstall_module(id: &str) -> Result<()> {
 
 pub fn run_action(id: &str) -> Result<()> {
     validate_module_id(id)?;
+    crate::module_response::ensure_action_allowed(id, "run module action")?;
     ksucalls::ensure_uapi_version_matched()?;
 
     let action_script_path = format!("/data/adb/modules/{id}/action.sh");
@@ -731,6 +821,9 @@ pub fn enable_module(id: &str) -> Result<()> {
 
     let module_path = Path::new(defs::MODULE_DIR).join(id);
     ensure!(module_path.exists(), "Module {id} not found");
+
+    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+    crate::module_response::ensure_activation_allowed(id)?;
 
     let disable_path = module_path.join(defs::DISABLE_FILE_NAME);
     if disable_path.exists() {
@@ -965,6 +1058,229 @@ pub fn list_modules() -> Result<()> {
     let modules = list_module(defs::MODULE_DIR);
     println!("{}", serde_json::to_string_pretty(&modules)?);
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct InstalledAuditScanResult {
+    module_id: String,
+    success: bool,
+    finding_count: usize,
+    error: Option<String>,
+}
+
+pub fn audit_installed_modules(json: bool, authorization: &str) -> Result<()> {
+    let targets = audit_rescan_targets()?;
+    let arguments_hash = module_audit_transaction::arguments_hash(AuditAction::Rescan, &targets)?;
+    let mut transaction = AuditTransaction::begin(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        authorization,
+        AuditAction::Rescan,
+        &arguments_hash,
+        &targets,
+    )?;
+    let pending_targets = transaction
+        .pending_targets()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let operation_id = transaction.operation_id().to_owned();
+    let modules_root = Path::new(defs::MODULE_DIR);
+    let mut results = Vec::new();
+    for module_id in &pending_targets {
+        if !json {
+            println!("- Auditing installed module {module_id}");
+        }
+        let scan = ksu_module_audit::scan_directory_path(
+            modules_root.join(module_id),
+            &ksu_module_audit::AuditConfig::default(),
+        );
+        let (finding_count, record) = match scan {
+            Ok(report) if report.module_id.as_deref() == Some(module_id.as_str()) => {
+                (report.findings.len(), Ok(report))
+            }
+            Ok(_) => (
+                0,
+                Err("installed module directory does not match module.prop id".to_owned()),
+            ),
+            Err(error) => (0, Err(format!("{error:#}"))),
+        };
+        let record_error = record.as_ref().err().cloned();
+        let persisted = module_audit_log::record_installed_rescan(
+            Path::new(defs::MODULE_AUDIT_DIR),
+            &operation_id,
+            module_id,
+            record,
+        );
+        let error = match persisted {
+            Ok(_) => {
+                transaction.complete_target(module_id)?;
+                record_error
+            }
+            Err(error) => Some(format!("failed to persist rescan: {error:#}")),
+        };
+        results.push(InstalledAuditScanResult {
+            module_id: module_id.clone(),
+            success: error.is_none(),
+            finding_count,
+            error,
+        });
+    }
+    let receipt = transaction.commit()?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "transaction": receipt,
+                "result": results,
+            }))?
+        );
+    } else {
+        let failed = results.iter().filter(|result| !result.success).count();
+        println!(
+            "- Audited {} installed modules; {failed} failed",
+            results.len()
+        );
+    }
+    Ok(())
+}
+
+pub fn prune_module_audit_histories(
+    module_id: Option<&str>,
+    dry_run: bool,
+    json: bool,
+    authorization: Option<&str>,
+) -> Result<()> {
+    if let Some(module_id) = module_id {
+        validate_module_id(module_id)?;
+    }
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    let installed_root = Path::new(defs::MODULE_DIR);
+    let pending_root = Path::new(defs::MODULE_UPDATE_DIR);
+    if dry_run {
+        ensure!(
+            module_id.is_none(),
+            "--id cannot be combined with --dry-run"
+        );
+        let stale =
+            module_audit_log::list_stale_histories(audit_root, installed_root, pending_root)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&stale)?);
+        } else {
+            println!("- {} stale module audit histories", stale.len());
+            for history in stale {
+                println!(
+                    "  {}: events={}, integrity_risk={}",
+                    history.module_id, history.event_count, history.high_risk
+                );
+            }
+        }
+    } else {
+        let targets = audit_prune_targets(module_id)?;
+        let arguments_hash =
+            module_audit_transaction::arguments_hash(AuditAction::Prune, &targets)?;
+        let mut transaction = AuditTransaction::begin(
+            audit_root,
+            authorization.context("Manager authorization is required for audit cleanup")?,
+            AuditAction::Prune,
+            &arguments_hash,
+            &targets,
+        )?;
+        let pruned = if transaction.is_committed() {
+            Vec::new()
+        } else {
+            module_audit_log::prune_stale_histories(
+                audit_root,
+                installed_root,
+                pending_root,
+                transaction.operation_id(),
+            )?
+        };
+        for history in &pruned {
+            transaction.complete_target(&history.module_id)?;
+        }
+        let receipt = transaction.commit()?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "transaction": receipt,
+                    "result": pruned,
+                }))?
+            );
+        } else {
+            println!("- Cleared {} stale module audit histories", pruned.len());
+        }
+    }
+    Ok(())
+}
+
+pub fn audit_rescan_arguments_hash() -> Result<String> {
+    module_audit_transaction::arguments_hash(AuditAction::Rescan, &audit_rescan_targets()?)
+}
+
+fn audit_rescan_targets() -> Result<Vec<String>> {
+    if let Some(targets) = module_audit_transaction::active_targets(
+        Path::new(defs::MODULE_AUDIT_DIR),
+        AuditAction::Rescan,
+    )? {
+        return Ok(targets);
+    }
+    installed_module_ids()
+}
+
+pub fn audit_prune_arguments_hash(module_id: Option<&str>) -> Result<String> {
+    module_audit_transaction::arguments_hash(AuditAction::Prune, &audit_prune_targets(module_id)?)
+}
+
+fn audit_prune_targets(module_id: Option<&str>) -> Result<Vec<String>> {
+    let audit_root = Path::new(defs::MODULE_AUDIT_DIR);
+    if let Some(targets) = module_audit_transaction::active_targets(audit_root, AuditAction::Prune)?
+    {
+        if let Some(module_id) = module_id {
+            ensure!(
+                targets.iter().any(|target| target == module_id),
+                "requested module does not match the active cleanup operation"
+            );
+        }
+        return Ok(targets);
+    }
+    let installed_root = Path::new(defs::MODULE_DIR);
+    let pending_root = Path::new(defs::MODULE_UPDATE_DIR);
+    let mut targets =
+        module_audit_log::list_stale_histories(audit_root, installed_root, pending_root)?
+            .into_iter()
+            .map(|history| history.module_id)
+            .collect::<Vec<_>>();
+    if let Some(module_id) = module_id {
+        ensure!(
+            targets.iter().any(|candidate| candidate == module_id),
+            "module audit history is not eligible for cleanup"
+        );
+        targets.retain(|candidate| candidate == module_id);
+    }
+    Ok(targets)
+}
+
+fn installed_module_ids() -> Result<Vec<String>> {
+    let mut module_ids = Vec::new();
+    let entries = match std::fs::read_dir(defs::MODULE_DIR) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(module_ids),
+        Err(error) => return Err(error).context("read installed module directory"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || !entry.path().join("module.prop").is_file() {
+            continue;
+        }
+        let Some(module_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if validate_module_id(&module_id).is_ok() {
+            module_ids.push(module_id);
+        }
+    }
+    module_ids.sort();
+    Ok(module_ids)
 }
 
 /// Get all managed features from active modules

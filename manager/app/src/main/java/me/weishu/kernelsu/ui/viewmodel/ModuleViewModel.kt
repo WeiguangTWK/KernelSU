@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -21,7 +22,6 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import me.weishu.kernelsu.Natives
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.data.model.Module
 import me.weishu.kernelsu.data.model.ModuleUpdateInfo
@@ -30,6 +30,9 @@ import me.weishu.kernelsu.data.repository.ModuleRepositoryImpl
 import me.weishu.kernelsu.data.repository.SettingsRepository
 import me.weishu.kernelsu.data.repository.SettingsRepositoryImpl
 import me.weishu.kernelsu.ksuApp
+import me.weishu.kernelsu.security.AuditSnapshotPolicy
+import me.weishu.kernelsu.security.AuditModuleDisposition
+import me.weishu.kernelsu.security.ManagerAuditSnapshot
 import me.weishu.kernelsu.ui.component.SearchStatus
 import me.weishu.kernelsu.ui.screen.module.ModuleConfirmDialogState
 import me.weishu.kernelsu.ui.screen.module.ModuleConfirmRequest
@@ -40,6 +43,8 @@ import me.weishu.kernelsu.ui.util.hasMagisk
 import me.weishu.kernelsu.ui.util.module.fetchModuleDetail
 import me.weishu.kernelsu.ui.util.module.fetchReleaseDescriptionHtml
 import okhttp3.Request
+import org.json.JSONArray
+import org.json.JSONObject
 import java.text.Collator
 import java.util.Locale
 import kotlin.time.Duration.Companion.milliseconds
@@ -88,6 +93,12 @@ class ModuleViewModel(
 
     init {
         viewModelScope.launchSearchQueryCollector(searchQuery, ::applySearchText)
+        viewModelScope.launch {
+            ksuApp.auditCoordinator.commits.collect {
+                isNeedRefresh = true
+                fetchModuleList(checkUpdate = false, resort = false)
+            }
+        }
     }
 
     fun markNeedRefresh() {
@@ -122,11 +133,17 @@ class ModuleViewModel(
     fun refreshEnvironmentState() {
         viewModelScope.launch {
             val magiskInstalled = withContext(Dispatchers.IO) { hasMagisk() }
-            val isSafeMode = Natives.isSafeMode
+            val auditResponse = withContext(Dispatchers.IO) {
+                runCatching {
+                    ksuApp.auditCoordinator.snapshot(AuditSnapshotPolicy.ReuseVerified)
+                }
+            }
             _uiState.update {
                 it.copy(
                     magiskInstalled = magiskInstalled,
-                    isSafeMode = isSafeMode,
+                    isSafeMode = auditResponse.getOrNull()?.kernelSafeMode ?: false,
+                    auditResponseAvailable = auditResponse.isSuccess,
+                    auditEmergencyStatus = auditResponse.getOrNull()?.emergencyStatus,
                 )
             }
         }
@@ -233,17 +250,50 @@ class ModuleViewModel(
     }
 
     suspend fun loadModuleList(resort: Boolean = true) {
-        val parsedModules = withContext(Dispatchers.IO) {
-            repo.getModules().getOrElse {
-                Log.e(TAG, "fetchModuleList: ", it)
-                emptyList()
+        val (parsedModules, auditSnapshot) = coroutineScope {
+            val modules = async(Dispatchers.IO) {
+                repo.getModules().getOrElse {
+                    Log.e(TAG, "fetchModuleList: ", it)
+                    emptyList()
+                }
             }
+            val audit = async(Dispatchers.IO) {
+                runCatching {
+                    ksuApp.auditCoordinator.snapshot(AuditSnapshotPolicy.ReuseVerified)
+                }
+            }
+            modules.await() to audit.await()
         }
+        val restricted: Pair<Set<String>, Map<String, String>> =
+            runCatching<Pair<Set<String>, Map<String, String>>> {
+                val assessment = checkNotNull(auditSnapshot.getOrThrow().assessment) {
+                    "Module audit assessment is unavailable"
+                }
+                val restrictedModules = assessment.modules.filter { module ->
+                    module.disposition == AuditModuleDisposition.SecureRemovalRequired ||
+                        module.disposition == AuditModuleDisposition.SealedRecoveryRequired
+                }
+                restrictedModules.mapTo(mutableSetOf()) { it.moduleId } to
+                    restrictedModules.mapNotNull { module ->
+                        module.containmentState?.let { module.moduleId to it }
+                    }.toMap()
+            }.getOrElse { assessmentError ->
+                Log.e(TAG, "load module audit assessment: ", assessmentError)
+                emptySet<String>() to emptyMap<String, String>()
+            }
+        val secureRemovalModuleIds = restricted.first
+        val secureRemovalStates = restricted.second
+        val auditResponse = auditSnapshot.getOrNull()
 
         withContext(Dispatchers.Main) {
             _uiState.update {
                 it.copy(
                     modules = parsedModules,
+                    secureRemovalModuleIds = secureRemovalModuleIds,
+                    secureRemovalStates = secureRemovalStates,
+                    isSafeMode = auditResponse?.kernelSafeMode ?: it.isSafeMode,
+                    auditResponseAvailable = auditSnapshot.isSuccess,
+                    auditEmergencyStatus = auditResponse?.emergencyStatus,
                 )
             }
             // Trigger recalculation of moduleList
@@ -377,6 +427,30 @@ class ModuleViewModel(
     fun toggleModule(module: Module) {
         viewModelScope.launch {
             val res = ksuApp.resources
+            if (!module.enabled) {
+                val auditResponse = withContext(Dispatchers.IO) {
+                    runCatching {
+                        ksuApp.auditCoordinator.snapshot(AuditSnapshotPolicy.ReuseVerified)
+                    }
+                }
+                applyAuditSnapshot(auditResponse)
+                if (auditResponse.isFailure) {
+                    emitEffect(
+                        ModuleEffect.Toast(
+                            res.getString(R.string.module_enable_audit_status_unavailable, module.name),
+                        )
+                    )
+                    return@launch
+                }
+                if (auditResponse.getOrThrow().emergencyStatus?.active == true) {
+                    emitEffect(
+                        ModuleEffect.Toast(
+                            res.getString(R.string.module_enable_blocked_emergency, module.name),
+                        )
+                    )
+                    return@launch
+                }
+            }
             val success = withContext(Dispatchers.IO) {
                 toggleModuleUtil(module.id, !module.enabled)
             }
@@ -384,9 +458,37 @@ class ModuleViewModel(
                 fetchModuleList(checkUpdate = true, resort = false)
                 emitEffect(ModuleEffect.SnackBar(res.getString(R.string.reboot_to_apply)))
             } else {
+                if (!module.enabled) {
+                    ksuApp.auditCoordinator.invalidate()
+                    val auditResponse = withContext(Dispatchers.IO) {
+                        runCatching {
+                            ksuApp.auditCoordinator.snapshot(AuditSnapshotPolicy.Revalidate)
+                        }
+                    }
+                    applyAuditSnapshot(auditResponse)
+                    if (auditResponse.getOrNull()?.emergencyStatus?.active == true) {
+                        emitEffect(
+                            ModuleEffect.Toast(
+                                res.getString(R.string.module_enable_blocked_emergency, module.name),
+                            )
+                        )
+                        fetchModuleList(checkUpdate = true, resort = false)
+                        return@launch
+                    }
+                }
                 val message = if (module.enabled) R.string.module_failed_to_disable else R.string.module_failed_to_enable
                 emitEffect(ModuleEffect.SnackBar(res.getString(message).format(module.name)))
             }
+        }
+    }
+
+    private fun applyAuditSnapshot(result: Result<ManagerAuditSnapshot>) {
+        _uiState.update { state ->
+            state.copy(
+                isSafeMode = result.getOrNull()?.kernelSafeMode ?: state.isSafeMode,
+                auditResponseAvailable = result.isSuccess,
+                auditEmergencyStatus = result.getOrNull()?.emergencyStatus,
+            )
         }
     }
 

@@ -4,6 +4,7 @@ import android.net.Uri
 import androidx.compose.runtime.Immutable
 import me.weishu.kernelsu.data.model.Module
 import me.weishu.kernelsu.data.model.ModuleUpdateInfo
+import me.weishu.kernelsu.security.AuditEmergencyStatus
 import me.weishu.kernelsu.ui.component.SearchStatus
 
 sealed interface ModuleConfirmRequest {
@@ -52,7 +53,11 @@ data class ModuleUiState(
     val sortActionFirst: Boolean = false,
     val checkModuleUpdate: Boolean = true,
     val isSafeMode: Boolean = false,
+    val auditResponseAvailable: Boolean = false,
+    val auditEmergencyStatus: AuditEmergencyStatus? = null,
     val magiskInstalled: Boolean = false,
+    val secureRemovalModuleIds: Set<String> = emptySet(),
+    val secureRemovalStates: Map<String, String> = emptyMap(),
     val confirmDialogState: ModuleConfirmDialogState? = null,
 ) {
     val installButtonVisible: Boolean
@@ -70,6 +75,9 @@ data class ModuleActions(
     val onDismissConfirmRequest: () -> Unit,
     val onConfirmUpdate: (ModuleConfirmRequest.Update) -> Unit,
     val onOpenRepo: () -> Unit,
+    val onOpenSecurityAudit: () -> Unit,
+    val onOpenModuleAudit: (String) -> Unit,
+    val onRequestSecureRemoval: (String) -> Unit,
     val onToggleSortActionFirst: () -> Unit,
     val onToggleSortEnabledFirst: () -> Unit,
     val onOpenWebUi: (Module) -> Unit,

@@ -1,15 +1,18 @@
 use anyhow::{Context, Ok, Result};
 use clap::Parser;
+use std::io::Write;
 use std::path::PathBuf;
 
 use android_logger::Config;
 use log::{LevelFilter, error, info};
 
 use crate::boot_patch::{BootPatchArgs, BootRestoreArgs};
+use crate::lkm_image::BootPatchV2Args;
 use crate::module::regenerate_preinit_rc;
 use crate::{
-    apk_sign, assets, debug, defs, init_event, ksu_uapi, ksucalls, module, module_config, sulog,
-    utils,
+    apk_sign, assets, auditd, debug, defs, init_event, ksu_uapi, ksucalls, module,
+    module_audit_action::{self, AuditAction},
+    module_config, provenance_supervisor, sulog, utils,
 };
 
 /// KernelSU userspace cli
@@ -31,12 +34,57 @@ enum Commands {
     /// Trigger `post-fs-data` event
     PostFsData,
 
+    /// Report the authenticated post-fs-data provenance stage. Init only.
+    #[command(hide = true)]
+    ProvenanceStage,
+
+    /// Run the authenticated boot provenance supervisor. Init only.
+    #[command(hide = true)]
+    ProvenanceSupervisor {
+        #[arg(long)]
+        boot_claim_nonce: String,
+    },
+
+    /// Run one Phase 3 lifecycle self-test payload. Supervisor only.
+    #[command(hide = true)]
+    ProvenancePayload {
+        #[arg(long)]
+        generation: u64,
+        #[arg(long)]
+        cookie: u64,
+        #[arg(long, default_value_t = 0)]
+        depth: u8,
+        #[arg(long)]
+        supervisor_pid: i32,
+    },
+
     /// Trigger `service` event
     Services,
 
     /// Run sulog reader daemon. Not for user. Use `ksud debug sulogd` to launch daemon.
     #[command(hide = true)]
     Sulogd,
+
+    /// Run module audit watcher daemon. Not for user. Use `ksud debug auditd` to launch daemon.
+    #[command(hide = true)]
+    Auditd,
+
+    /// Record an auditd restart security event.
+    #[command(hide = true)]
+    AuditdRestartNotify,
+
+    /// Temporarily suspend auditd for a Manager-sealed module installation transaction.
+    #[command(hide = true)]
+    AuditInstallSession {
+        #[command(subcommand)]
+        command: AuditInstallSessionCommand,
+    },
+
+    /// Manage the KernelSU global security event audit store
+    GlobalAudit {
+        #[command(subcommand)]
+        command: GlobalAuditCommand,
+    },
 
     /// Trigger `boot-complete` event
     BootCompleted,
@@ -83,6 +131,10 @@ enum Commands {
 
         #[arg(long, default_value = None)]
         data_path: Option<PathBuf>,
+
+        /// Detached signed provenance manifest for this exact ksud image
+        #[arg(long, default_value = None)]
+        provenance_sidecar: Option<PathBuf>,
     },
 
     /// Unload KernelSU kernel module (LKM Only)
@@ -118,6 +170,11 @@ enum Commands {
     /// Restore boot or init_boot images patched by KernelSU
     BootRestore(BootRestoreArgs),
 
+    /// Patch KernelSU into a boot image
+    ///
+    /// Always operates on a boot image; never selects init_boot or vendor_boot.
+    BootPatchV2(BootPatchV2Args),
+
     /// Show boot information
     BootInfo {
         #[command(subcommand)]
@@ -146,6 +203,21 @@ enum Commands {
     Initrc {
         #[command(subcommand)]
         command: Initrc,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuditInstallSessionCommand {
+    Begin {
+        id: String,
+        #[arg(long, default_value_t = 180)]
+        timeout_seconds: u64,
+    },
+    Status {
+        id: String,
+    },
+    Release {
+        id: String,
     },
 }
 
@@ -219,8 +291,27 @@ enum Debug {
     /// Launch sulogd daemon manually
     Sulogd,
 
+    /// Launch auditd daemon manually
+    Auditd,
+
     /// Get kernel info
     Info,
+
+    /// Get read-only audit provenance capability and verifier diagnostics
+    ProvenanceInfo,
+
+    /// Get read-only Phase 2 hook and signed-exec eligibility diagnostics
+    ProvenanceEligibility,
+
+    /// Get read-only Phase 3 supervisor and context-map diagnostics
+    ProvenanceContext,
+
+    /// Verify that a zero-nonce supervisor claim is rejected
+    ProvenanceClaimTest {
+        /// Eligibility generation to place in the rejected request
+        #[arg(long)]
+        generation: Option<u64>,
+    },
 
     /// Print default package name
     Package,
@@ -282,6 +373,161 @@ enum Module {
         zip: String,
     },
 
+    /// Audit a module ZIP without installing it
+    Audit {
+        /// module zip file path
+        zip: String,
+        /// print the structured JSON report
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify persisted module audit history
+    AuditHistory {
+        /// limit verification to one module id
+        #[arg(long)]
+        id: Option<String>,
+        /// print structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify persisted module audit state without returning event payloads
+    AuditStatus {
+        /// print structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Reconcile global emergency response against the sealed audit inventory
+    AuditReconcileResponse,
+
+    /// Stream a consolidated Security & Audit Center dashboard as JSON Lines
+    AuditDashboard {
+        /// Active Manager installation session allowed to seal before containment.
+        #[arg(long)]
+        install_session: Option<String>,
+    },
+
+    /// Wait briefly for the audit store to change, then request re-verification
+    AuditWatch {
+        #[arg(long)]
+        baseline: String,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
+
+    /// Diagnose damage to events anchored by the Manager audit seal
+    AuditRecoveryStatus {
+        /// print structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export the canonical payload for a Manager Keystore checkpoint
+    AuditCheckpoint,
+
+    /// Manage Manager-signed authorization for audit mutations
+    AuditAuth {
+        #[command(subcommand)]
+        command: AuditAuth,
+    },
+
+    /// Persist and verify Manager Keystore-signed audit checkpoints
+    AuditSeal {
+        #[command(subcommand)]
+        command: AuditSeal,
+    },
+
+    /// Rescan every installed module and append authenticated audit events
+    AuditRescan {
+        /// print structured JSON results
+        #[arg(long)]
+        json: bool,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// List or clear audit histories whose modules are no longer installed
+    AuditPrune {
+        /// only clear one stale module history
+        #[arg(long)]
+        id: Option<String>,
+        /// list eligible histories without clearing them
+        #[arg(long)]
+        dry_run: bool,
+        /// print structured JSON results
+        #[arg(long)]
+        json: bool,
+        /// one-shot Manager authorization token (required unless --dry-run)
+        #[arg(long)]
+        authorization: Option<String>,
+    },
+
+    /// Disable an untrusted module and cancel its normal scripted uninstall
+    AuditContain {
+        /// untrusted module id
+        id: String,
+    },
+
+    /// Remove an untrusted module without executing module-controlled scripts
+    AuditSecureRemove {
+        /// untrusted module id
+        id: String,
+        /// print structured JSON result
+        #[arg(long)]
+        json: bool,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// Rebuild a damaged Manager-sealed module history in KernelSU safe mode
+    AuditRecoverSealed {
+        /// affected module id
+        id: String,
+        /// print structured JSON
+        #[arg(long)]
+        json: bool,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// Close one resolved module audit incident without deleting its evidence
+    AuditCloseIncident {
+        /// affected module id
+        id: String,
+        /// stable incident id
+        #[arg(long)]
+        incident: String,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// Permanently delete one regular file from emergency script quarantine
+    AuditDeleteQuarantinedScript {
+        /// stable quarantine entry id
+        entry: String,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// Retry moving one regular startup file into emergency quarantine
+    AuditRetryScriptContainment {
+        /// stable quarantine entry id
+        entry: String,
+        /// one-shot Manager authorization token
+        #[arg(long)]
+        authorization: String,
+    },
+
+    /// Query response prerequisites without reading the audit store
+    AuditResponseStatus,
+
     /// Undo module uninstall mark <id>
     UndoUninstall {
         /// module id
@@ -322,6 +568,98 @@ enum Module {
         internal: Option<String>,
         #[command(subcommand)]
         command: ModuleConfigCmd,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuditAuth {
+    /// Show the registered Manager key and current audit inventory
+    Status,
+    /// Trust the first Manager key for audit mutations
+    Register {
+        /// uncompressed P-256 public key encoded as hexadecimal
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Replace a missing or mismatched Manager key in kernel safe mode
+    Recover {
+        /// uncompressed P-256 public key encoded as hexadecimal
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Create a state-bound challenge for one audit mutation
+    Challenge {
+        /// audit mutation action
+        action: AuditAction,
+        /// optional stale module id for a targeted prune
+        #[arg(long)]
+        id: Option<String>,
+        /// stable incident or quarantine entry id
+        #[arg(long)]
+        incident: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuditSeal {
+    /// Show the latest verified Manager seal
+    Status,
+    /// Commit the current Manager checkpoint envelope as the next seal
+    Commit {
+        /// file containing the UTF-8 checkpoint envelope encoded as hexadecimal
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum GlobalAuditCommand {
+    /// Show the authenticated global audit status
+    Status,
+    /// Show the authenticated global audit history
+    History,
+    /// Show the canonical global audit checkpoint payload
+    Checkpoint,
+    /// Show the content-derived global audit store revision
+    StoreRevision,
+    /// Diagnose sealed global audit integrity failures
+    RecoveryStatus,
+    /// Wait for a change to the global audit store revision
+    Watch {
+        /// Baseline store revision
+        #[arg(long)]
+        baseline: String,
+        /// Maximum wait in seconds
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
+    /// Manage the Manager authorization key for global audit mutations
+    Auth {
+        #[command(subcommand)]
+        command: GlobalAuditAuth,
+    },
+    /// Manage the Manager-sealed global audit checkpoint
+    Seal {
+        #[command(subcommand)]
+        command: AuditSeal,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum GlobalAuditAuth {
+    /// Show the registered Manager key and current global audit inventory
+    Status,
+    /// Trust the first Manager key for global audit mutations
+    Register {
+        /// uncompressed P-256 public key encoded as hexadecimal
+        #[arg(long)]
+        public_key: String,
+    },
+    /// Replace a missing or mismatched Manager key in kernel safe mode
+    Recover {
+        /// uncompressed P-256 public key encoded as hexadecimal
+        #[arg(long)]
+        public_key: String,
     },
 }
 
@@ -483,6 +821,140 @@ enum Initrc {
     Refresh,
 }
 
+fn emit_audit_dashboard_line(value: &serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    std::io::stdout().flush()?;
+    Ok(())
+}
+
+fn stream_audit_dashboard(install_session: Option<&str>) -> Result<()> {
+    let root = std::path::Path::new(defs::MODULE_AUDIT_DIR);
+    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+    if let Some(id) = install_session {
+        anyhow::ensure!(
+            crate::auditd::install_session_active(id)?,
+            "audit installation session is not active"
+        );
+    }
+    if crate::module_audit_log::dashboard_store_uninitialized(root)? {
+        emit_audit_dashboard_line(&serde_json::json!({
+            "type": "start",
+            "total_modules": 0,
+        }))?;
+        return emit_audit_dashboard_line(&serde_json::json!({
+            "type": "complete",
+            "uninitialized": true,
+            "store_revision": crate::module_audit_log::dashboard_store_revision(root)?,
+            "response_status": {
+                "kernel_safe_mode": ksucalls::try_check_kernel_safemode()
+                    .context("query KernelSU safe mode for audit dashboard")?,
+                "emergency": crate::module_response::audit_emergency_status()?,
+            },
+        }));
+    }
+
+    let snapshot =
+        crate::module_audit_log::verified_audit_snapshot_with_progress(root, |progress| {
+            use crate::module_audit_log::VerifiedAuditProgress;
+            match progress {
+                VerifiedAuditProgress::Start { total_modules } => {
+                    emit_audit_dashboard_line(&serde_json::json!({
+                        "type": "start",
+                        "total_modules": total_modules,
+                    }))
+                }
+                VerifiedAuditProgress::Module {
+                    module_id,
+                    completed,
+                    total_modules,
+                } => emit_audit_dashboard_line(&serde_json::json!({
+                    "type": "progress",
+                    "phase": "history",
+                    "module_id": module_id,
+                    "completed": completed,
+                    "total_modules": total_modules,
+                })),
+                VerifiedAuditProgress::Checkpoint {
+                    completed,
+                    total_modules,
+                } => emit_audit_dashboard_line(&serde_json::json!({
+                    "type": "progress",
+                    "phase": "checkpoint",
+                    "completed": completed,
+                    "total_modules": total_modules,
+                })),
+            }
+        })?;
+    let assessed = crate::module_response::assess_current_audit_snapshot(snapshot)?;
+    let snapshot = assessed.snapshot;
+    let assessment = assessed.assessment;
+    let total_modules = snapshot.histories.len();
+
+    for (index, history) in snapshot.histories.iter().enumerate() {
+        emit_audit_dashboard_line(&serde_json::json!({
+            "type": "module",
+            "module_id": history.status.module_id.as_str(),
+            "completed": index + 1,
+            "total_modules": total_modules,
+            "history": history,
+        }))?;
+    }
+
+    emit_audit_dashboard_line(&serde_json::json!({
+        "type": "complete",
+        "checkpoint": snapshot.checkpoint,
+        "checkpoint_degraded": !snapshot.integrity_failures.is_empty(),
+        "integrity_failures": snapshot.integrity_failures,
+        "assessment": assessment,
+        "seal_status": snapshot.seal_status,
+        "authorization_status": snapshot.authorization_status,
+        "store_revision": snapshot.store_revision,
+        "response_status": {
+            "kernel_safe_mode": ksucalls::try_check_kernel_safemode()
+                .context("query KernelSU safe mode for audit dashboard")?,
+            "emergency": crate::module_response::audit_emergency_status()?,
+        },
+    }))
+}
+
+fn watch_audit_dashboard(baseline: &str, timeout_seconds: u64) -> Result<()> {
+    watch_audit_root(
+        std::path::Path::new(defs::MODULE_AUDIT_DIR),
+        baseline,
+        timeout_seconds,
+    )
+}
+
+fn watch_global_audit_dashboard(baseline: &str, timeout_seconds: u64) -> Result<()> {
+    watch_audit_root(
+        std::path::Path::new(defs::GLOBAL_AUDIT_DIR),
+        baseline,
+        timeout_seconds,
+    )
+}
+
+fn watch_audit_root(root: &std::path::Path, baseline: &str, timeout_seconds: u64) -> Result<()> {
+    anyhow::ensure!(
+        baseline.len() == 64 && baseline.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid audit dashboard revision"
+    );
+    anyhow::ensure!(timeout_seconds <= 60, "audit watch timeout is too large");
+    let started = std::time::Instant::now();
+    loop {
+        let revision = crate::module_audit_log::dashboard_store_revision(root)?;
+        if revision != baseline {
+            return emit_audit_dashboard_line(&serde_json::json!({
+                "type": "changed",
+                "store_revision": revision,
+            }));
+        }
+        if started.elapsed() >= std::time::Duration::from_secs(timeout_seconds) {
+            return emit_audit_dashboard_line(&serde_json::json!({ "type": "timeout" }));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
 pub fn run() -> Result<()> {
     android_logger::init_once(
         Config::default()
@@ -507,6 +979,16 @@ pub fn run() -> Result<()> {
 
     let result = match cli.command {
         Commands::PostFsData => init_event::on_post_data_fs(),
+        Commands::ProvenanceStage => provenance_supervisor::report_eligible_stage(),
+        Commands::ProvenanceSupervisor { boot_claim_nonce } => {
+            provenance_supervisor::run_supervisor(&boot_claim_nonce)
+        }
+        Commands::ProvenancePayload {
+            generation,
+            cookie,
+            depth,
+            supervisor_pid,
+        } => provenance_supervisor::run_payload(generation, cookie, depth, supervisor_pid),
         Commands::BootCompleted => {
             init_event::on_boot_completed();
             Ok(())
@@ -520,6 +1002,316 @@ pub fn run() -> Result<()> {
             utils::switch_mnt_ns(1)?;
             match command {
                 Module::Install { zip } => module::install_module(&zip),
+                Module::Audit { zip, json } => crate::module_audit::print_zip_report(&zip, json),
+                Module::AuditHistory { id, json } => {
+                    let snapshot = crate::module_response::current_audit_assessment()?.snapshot;
+                    let histories = if let Some(id) = id {
+                        crate::module::validate_module_id(&id)?;
+                        vec![
+                            snapshot
+                                .histories
+                                .into_iter()
+                                .find(|history| history.status.module_id == id)
+                                .context("module audit history is unavailable")?,
+                        ]
+                    } else {
+                        snapshot.histories
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&histories)?);
+                    } else {
+                        for history in histories {
+                            let status = history.status;
+                            println!(
+                                "{}: {:?}, events={}, high_risk={}, head={}",
+                                status.module_id,
+                                status.verification,
+                                status.event_count,
+                                status.high_risk,
+                                status.head_hash
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                Module::AuditStatus { json } => {
+                    let assessment = crate::module_response::current_audit_assessment()?.assessment;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&assessment)?);
+                    } else {
+                        for module in assessment.modules {
+                            println!("{}: {:?}", module.module_id, module.disposition);
+                        }
+                    }
+                    Ok(())
+                }
+                Module::AuditReconcileResponse => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    crate::module_audit_log::repair_audit_store(std::path::Path::new(
+                        crate::defs::MODULE_AUDIT_DIR,
+                    ))?;
+                    let outcome = crate::module_response::enforce_containment(false)?;
+                    anyhow::ensure!(
+                        outcome.audit_state
+                            == crate::module_response::AuditStateAvailability::Verified,
+                        "module audit response reconciliation did not reach verified state: {}",
+                        outcome
+                            .audit_error
+                            .as_deref()
+                            .unwrap_or("audit state is not initialized")
+                    );
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "verified": true,
+                            "contained_module_ids": outcome.module_ids,
+                        })
+                    );
+                    Ok(())
+                }
+                Module::AuditDashboard { install_session } => {
+                    stream_audit_dashboard(install_session.as_deref())
+                }
+                Module::AuditWatch {
+                    baseline,
+                    timeout_seconds,
+                } => watch_audit_dashboard(&baseline, timeout_seconds),
+                Module::AuditRecoveryStatus { json } => {
+                    let status = crate::module_audit_log::sealed_integrity_status(
+                        std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),
+                    )?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    } else if status.failures.is_empty() {
+                        println!("- Manager-sealed audit history is intact");
+                    } else {
+                        for failure in status.failures {
+                            println!(
+                                "{}: corrupted_from={}, {}",
+                                failure.module_id, failure.corrupted_from_sequence, failure.reason
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                Module::AuditCheckpoint => {
+                    let payload = crate::module_audit_log::checkpoint_payload(
+                        std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                    Ok(())
+                }
+                Module::AuditAuth { command } => {
+                    let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
+                    match command {
+                        AuditAuth::Status => {
+                            let status = crate::module_audit_log::manager_audit_auth_status(root)?;
+                            println!("{}", serde_json::to_string_pretty(&status)?);
+                            Ok(())
+                        }
+                        AuditAuth::Register { public_key } => {
+                            let _coordinator =
+                                crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                            let status = crate::module_audit_log::register_manager_audit_auth_key(
+                                root,
+                                &public_key,
+                                false,
+                            )?;
+                            println!("{}", serde_json::to_string_pretty(&status)?);
+                            Ok(())
+                        }
+                        AuditAuth::Recover { public_key } => {
+                            let _coordinator =
+                                crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                            anyhow::ensure!(
+                                ksucalls::try_check_kernel_safemode()
+                                    .context("query KernelSU safe mode for Manager key recovery")?,
+                                "Manager audit authorization recovery requires KernelSU safe mode"
+                            );
+                            let status = crate::module_audit_log::register_manager_audit_auth_key(
+                                root,
+                                &public_key,
+                                true,
+                            )?;
+                            println!("{}", serde_json::to_string_pretty(&status)?);
+                            Ok(())
+                        }
+                        AuditAuth::Challenge {
+                            action,
+                            id,
+                            incident,
+                        } => {
+                            let _coordinator =
+                                crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                            let challenge = module_audit_action::manager_authorization_challenge(
+                                root,
+                                action,
+                                id.as_deref(),
+                                incident.as_deref(),
+                            )?;
+                            println!("{}", serde_json::to_string_pretty(&challenge)?);
+                            Ok(())
+                        }
+                    }
+                }
+                Module::AuditSeal { command } => {
+                    let root = std::path::Path::new(crate::defs::MODULE_AUDIT_DIR);
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    let status = match command {
+                        AuditSeal::Status => {
+                            crate::module_audit_log::manager_audit_seal_status(root)?
+                        }
+                        AuditSeal::Commit { file } => {
+                            let metadata = std::fs::metadata(&file)?;
+                            anyhow::ensure!(metadata.is_file(), "audit seal input is not a file");
+                            anyhow::ensure!(
+                                metadata.len() <= 16 * 1024 * 1024,
+                                "audit seal input is too large"
+                            );
+                            let envelope = std::fs::read_to_string(file)?;
+                            crate::module_audit_log::commit_manager_audit_seal(
+                                root,
+                                envelope.trim(),
+                            )?
+                        }
+                    };
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                    Ok(())
+                }
+                Module::AuditRescan {
+                    json,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    module::audit_installed_modules(json, &authorization)
+                }
+                Module::AuditPrune {
+                    id,
+                    dry_run,
+                    json,
+                    authorization,
+                } => {
+                    let _coordinator = (!dry_run)
+                        .then(crate::auditd::AuditCoordinatorGuard::acquire_blocking)
+                        .transpose()?;
+                    module::prune_module_audit_histories(
+                        id.as_deref(),
+                        dry_run,
+                        json,
+                        authorization.as_deref(),
+                    )
+                }
+                Module::AuditContain { id } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    crate::module_response::contain_for_secure_removal(&id)
+                }
+                Module::AuditSecureRemove {
+                    id,
+                    json,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    let receipt = crate::module_response::secure_remove(&id, &authorization)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "transaction": receipt,
+                                "result": { "module_id": id, "removed": true },
+                            }))?
+                        );
+                    } else {
+                        println!("- Securely removed module {id}");
+                    }
+                    Ok(())
+                }
+                Module::AuditRecoverSealed {
+                    id,
+                    json,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    let (status, receipt) =
+                        crate::module_response::recover_manager_sealed_audit(&id, &authorization)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "transaction": receipt,
+                                "result": status,
+                            }))?
+                        );
+                    } else {
+                        println!("- Rebuilt Manager-sealed audit history for {id}");
+                    }
+                    Ok(())
+                }
+                Module::AuditCloseIncident {
+                    id,
+                    incident,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    let (status, receipt) = crate::module_audit_log::close_incident(
+                        std::path::Path::new(crate::defs::MODULE_AUDIT_DIR),
+                        &id,
+                        &incident,
+                        &authorization,
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "transaction": receipt,
+                            "result": status,
+                        }))?
+                    );
+                    Ok(())
+                }
+                Module::AuditDeleteQuarantinedScript {
+                    entry,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    let receipt =
+                        crate::module_response::delete_quarantined_script(&entry, &authorization)?;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "transaction": receipt,
+                            "result": { "entry_id": entry, "deleted": true },
+                        })
+                    );
+                    Ok(())
+                }
+                Module::AuditRetryScriptContainment {
+                    entry,
+                    authorization,
+                } => {
+                    let _coordinator = crate::auditd::AuditCoordinatorGuard::acquire_blocking()?;
+                    let receipt = crate::module_response::retry_quarantined_script_containment(
+                        &entry,
+                        &authorization,
+                    )?;
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "transaction": receipt,
+                            "result": { "entry_id": entry, "contained": true },
+                        })
+                    );
+                    Ok(())
+                }
+                Module::AuditResponseStatus => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "kernel_safe_mode": ksucalls::try_check_kernel_safemode()
+                                .context("query KernelSU safe mode for audit response")?,
+                            "emergency": crate::module_response::audit_emergency_status()?,
+                        })
+                    );
+                    Ok(())
+                }
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),
                 Module::Uninstall { id } => module::uninstall_module(&id),
                 Module::Enable { id } => module::enable_module(&id),
@@ -621,7 +1413,8 @@ pub fn run() -> Result<()> {
         Commands::Install {
             libadbroot,
             data_path,
-        } => utils::install(libadbroot, data_path),
+            provenance_sidecar,
+        } => utils::install(libadbroot, data_path, provenance_sidecar.as_deref()),
         Commands::Unload => crate::unload::unload(),
         Commands::Uninstall { package_name } => utils::uninstall(&package_name),
         Commands::Sepolicy { command } => match command {
@@ -660,6 +1453,116 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Commands::Sulogd => sulog::run_sulogd(),
+        Commands::Auditd => auditd::run_auditd(),
+        Commands::AuditdRestartNotify => {
+            auditd::record_restart_notify();
+            Ok(())
+        }
+        Commands::AuditInstallSession { command } => match command {
+            AuditInstallSessionCommand::Begin {
+                id,
+                timeout_seconds,
+            } => auditd::begin_install_session(&id, timeout_seconds),
+            AuditInstallSessionCommand::Status { id } => auditd::print_install_session_status(&id),
+            AuditInstallSessionCommand::Release { id } => auditd::release_install_session(&id),
+        },
+        Commands::GlobalAudit { command } => match command {
+            GlobalAuditCommand::Status => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::global_audit::status()?)?
+                );
+                Ok(())
+            }
+            GlobalAuditCommand::History => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::global_audit::history()?)?
+                );
+                Ok(())
+            }
+            GlobalAuditCommand::Checkpoint => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::global_audit::checkpoint()?)?
+                );
+                Ok(())
+            }
+            GlobalAuditCommand::StoreRevision => {
+                println!("{}", crate::global_audit::store_revision()?);
+                Ok(())
+            }
+            GlobalAuditCommand::RecoveryStatus => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::global_audit::recovery_status()?)?
+                );
+                Ok(())
+            }
+            GlobalAuditCommand::Watch {
+                baseline,
+                timeout_seconds,
+            } => watch_global_audit_dashboard(&baseline, timeout_seconds),
+            GlobalAuditCommand::Auth { command } => match command {
+                GlobalAuditAuth::Status => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::auth_status()?)?
+                    );
+                    Ok(())
+                }
+                GlobalAuditAuth::Register { public_key } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::register_auth_key(
+                            &public_key,
+                            false
+                        )?)?
+                    );
+                    Ok(())
+                }
+                GlobalAuditAuth::Recover { public_key } => {
+                    anyhow::ensure!(
+                        ksucalls::try_check_kernel_safemode()
+                            .context("query KernelSU safe mode for global audit key recovery")?,
+                        "Global audit authorization recovery requires KernelSU safe mode"
+                    );
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::register_auth_key(
+                            &public_key,
+                            true
+                        )?)?
+                    );
+                    Ok(())
+                }
+            },
+            GlobalAuditCommand::Seal { command } => match command {
+                AuditSeal::Status => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::seal_status()?)?
+                    );
+                    Ok(())
+                }
+                AuditSeal::Commit { file } => {
+                    let metadata = std::fs::metadata(&file)?;
+                    anyhow::ensure!(metadata.is_file(), "global audit seal input is not a file");
+                    anyhow::ensure!(
+                        metadata.len() <= 16 * 1024 * 1024,
+                        "global audit seal input is too large"
+                    );
+                    let envelope = std::fs::read_to_string(file)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&crate::global_audit::commit_seal(
+                            envelope.trim()
+                        )?)?
+                    );
+                    Ok(())
+                }
+            },
+        },
         Commands::Profile { command } => match command {
             Profile::GetSepolicy { package } => crate::profile::get_sepolicy(package),
             Profile::SetSepolicy { package, policy } => {
@@ -713,6 +1616,7 @@ pub fn run() -> Result<()> {
                 MarkCommand::Refresh => debug::mark_refresh(),
             },
             Debug::Sulogd => sulog::ensure_sulogd_running(),
+            Debug::Auditd => auditd::ensure_auditd_running(),
             Debug::Info => {
                 let info = ksucalls::get_info();
                 println!("version: {}", info.version);
@@ -726,6 +1630,105 @@ pub fn run() -> Result<()> {
                     "pr_build: {}",
                     (info.flags & ksu_uapi::KSU_GET_INFO_FLAG_PR_BUILD) != 0
                 );
+                Ok(())
+            }
+            Debug::ProvenanceInfo => {
+                let info = ksucalls::get_provenance_info()?;
+                println!("version: {}", info.version);
+                println!("provider_state: {}", info.provider_state);
+                println!("trust_tier: {}", info.trust_tier);
+                println!(
+                    "diagnostic_capabilities: 0x{:016x}",
+                    info.diagnostic_capabilities
+                );
+                println!(
+                    "operational_capabilities: 0x{:016x}",
+                    info.operational_capabilities
+                );
+                println!(
+                    "intent_operation_classes: 0x{:016x}",
+                    info.intent_operation_classes
+                );
+                println!(
+                    "result_operation_classes: 0x{:016x}",
+                    info.result_operation_classes
+                );
+                println!("event_schema_version: {}", info.event_schema_version);
+                println!("manifest_format_version: {}", info.manifest_format_version);
+                println!("uapi: {}..={}", info.uapi_min, info.uapi_max);
+                println!("verifier_state: {}", info.verifier_state);
+                println!("verifier_error: {}", info.verifier_error);
+                println!("minimum_security_epoch: {}", info.minimum_security_epoch);
+                println!(
+                    "signing_key_id: {}",
+                    base16ct::lower::encode_string(&info.signing_key_id)
+                );
+                Ok(())
+            }
+            Debug::ProvenanceEligibility => {
+                let info = ksucalls::get_provenance_eligibility_info()?;
+                println!("version: {}", info.version);
+                println!("core_hook_state: {}", info.core_hook_state);
+                println!("core_hook_error: {}", info.core_hook_error);
+                println!("eligibility_state: {}", info.eligibility_state);
+                println!("eligibility_error: {}", info.eligibility_error);
+                println!("eligibility_generation: {}", info.eligibility_generation);
+                println!("candidate_pid: {}", info.candidate_pid);
+                println!("candidate_tgid: {}", info.candidate_tgid);
+                println!("roles: 0x{:08x}", info.roles);
+                println!("verifier_error: {}", info.verifier_error);
+                println!("security_epoch: {}", info.security_epoch);
+                println!(
+                    "image_sha256: {}",
+                    base16ct::lower::encode_string(&info.image_sha256)
+                );
+                println!(
+                    "build_id: {}",
+                    base16ct::lower::encode_string(&info.build_id)
+                );
+                println!(
+                    "signing_key_id: {}",
+                    base16ct::lower::encode_string(&info.signing_key_id)
+                );
+                println!("uapi: {}..={}", info.uapi_min, info.uapi_max);
+                Ok(())
+            }
+            Debug::ProvenanceContext => {
+                let status = ksucalls::get_provenance_context_status()?;
+                println!("supervisor_state: {}", status.supervisor_state);
+                println!("last_gap_reason: {}", status.last_gap_reason);
+                println!("supervisor_generation: {}", status.supervisor_generation);
+                println!("active_contexts: {}", status.active_contexts);
+                println!("task_bindings: {}", status.task_bindings);
+                println!("credential_bindings: {}", status.credential_bindings);
+                println!("pending_launches: {}", status.pending_launches);
+                println!(
+                    "limits: contexts={} tasks={} credentials={} launches={}",
+                    status.max_contexts,
+                    status.max_task_bindings,
+                    status.max_credential_bindings,
+                    status.max_pending_launches
+                );
+                println!(
+                    "reconciliation_failures: {}",
+                    status.reconciliation_failures
+                );
+                println!("allocation_failures: {}", status.allocation_failures);
+                println!(
+                    "boot_epoch: {}",
+                    base16ct::lower::encode_string(&status.boot_epoch)
+                );
+                Ok(())
+            }
+            Debug::ProvenanceClaimTest { generation } => {
+                let generation = match generation {
+                    Some(generation) => generation,
+                    None => ksucalls::get_provenance_eligibility_info()?.eligibility_generation,
+                };
+                let result = ksucalls::expect_provenance_claim_not_ready(generation)?;
+                println!("result: {}", result.result);
+                println!("eligibility_state: {}", result.eligibility_state);
+                println!("eligibility_generation: {}", result.eligibility_generation);
                 Ok(())
             }
             Debug::Package => {
@@ -777,6 +1780,7 @@ pub fn run() -> Result<()> {
             }
         },
         Commands::BootRestore(boot_restore) => crate::boot_patch::restore(boot_restore),
+        Commands::BootPatchV2(patch) => crate::lkm_image::patch_boot(&patch),
         Commands::Resetprop { args } => {
             let mut full_args = vec!["resetprop".to_string()];
             full_args.extend(args);

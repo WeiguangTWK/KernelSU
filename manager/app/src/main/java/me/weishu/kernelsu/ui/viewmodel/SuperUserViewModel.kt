@@ -87,11 +87,30 @@ class SuperUserViewModel(
 
         private val appsLock = Any()
         private var cachedApps: List<AppInfo> = emptyList()
+        private val appListPreloadMutex = Mutex()
         private val groupedAppsLock = Any()
         private var cachedGroupedApps: List<GroupedApps> = emptyList()
 
         val apps: List<AppInfo>
             get() = synchronized(appsLock) { cachedApps }
+
+        suspend fun preloadAppList() {
+            if (apps.isNotEmpty()) return
+
+            appListPreloadMutex.withLock {
+                if (apps.isNotEmpty()) return@withLock
+
+                SuperUserRepositoryImpl().getAppList()
+                    .onSuccess { (newApps, _) ->
+                        synchronized(appsLock) {
+                            if (cachedApps.isEmpty()) cachedApps = newApps
+                        }
+                    }
+                    .onFailure { error ->
+                        Log.w(TAG, "Unable to preload app list for WebUI", error)
+                    }
+            }
+        }
 
         @JvmStatic
         fun getGroupedApp(uid: Int): GroupedApps? {
